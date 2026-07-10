@@ -1,0 +1,102 @@
+name: "Sync upstream release"
+
+# Keeps this fork's `development` branch up to date with the latest
+# published release of the upstream project (Maintainerr/Maintainerr),
+# rather than every upstream commit. Runs on a schedule, opens a PR with
+# the merge, and turns on GitHub's native auto-merge so it lands on its
+# own once the merge is conflict-free and any required checks pass. If
+# the merge conflicts, the job fails loudly instead of guessing.
+
+on:
+  schedule:
+    - cron: "17 4 * * *" # daily, 04:17 UTC
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: Maintainerr/Maintainerr
+  UPSTREAM_URL: https://github.com/Maintainerr/Maintainerr.git
+  TARGET_BRANCH: development
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout ${{ env.TARGET_BRANCH }}
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+
+      - name: Determine latest upstream release tag
+        id: latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="$(gh api "repos/${{ env.UPSTREAM_REPO }}/releases/latest" --jq .tag_name)"
+          if [ -z "$tag" ]; then
+            echo "::error::Could not resolve the latest release tag for ${{ env.UPSTREAM_REPO }}."
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Latest upstream release: $tag"
+
+      - name: Fetch upstream tag
+        run: |
+          git remote add upstream "${{ env.UPSTREAM_URL }}"
+          git fetch upstream "refs/tags/${{ steps.latest.outputs.tag }}:refs/tags/${{ steps.latest.outputs.tag }}"
+
+      - name: Skip if already in sync
+        id: check
+        run: |
+          if git merge-base --is-ancestor "${{ steps.latest.outputs.tag }}" HEAD; then
+            echo "up_to_date=true" >> "$GITHUB_OUTPUT"
+            echo "${{ env.TARGET_BRANCH }} already contains ${{ steps.latest.outputs.tag }}."
+          else
+            echo "up_to_date=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge release tag into a sync branch
+        if: steps.check.outputs.up_to_date == 'false'
+        id: merge
+        run: |
+          branch="sync/upstream-${{ steps.latest.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+
+          if ! git merge --no-edit "${{ steps.latest.outputs.tag }}" \
+              -m "chore: sync upstream release ${{ steps.latest.outputs.tag }}"; then
+            echo "::error::Merging ${{ steps.latest.outputs.tag }} into ${{ env.TARGET_BRANCH }} conflicts - resolve manually."
+            exit 1
+          fi
+
+          git push origin "$branch" --force
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Open sync PR and enable auto-merge
+        if: steps.check.outputs.up_to_date == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          branch="${{ steps.merge.outputs.branch }}"
+          tag="${{ steps.latest.outputs.tag }}"
+
+          pr_url="$(gh pr list --head "$branch" --base "${{ env.TARGET_BRANCH }}" --json url --jq '.[0].url')"
+          if [ -z "$pr_url" ]; then
+            pr_url="$(gh pr create \
+              --base "${{ env.TARGET_BRANCH }}" \
+              --head "$branch" \
+              --title "chore: sync upstream release $tag" \
+              --body "Automated merge of upstream release [$tag](https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/$tag) into \`${{ env.TARGET_BRANCH }}\`.")"
+          fi
+
+          echo "Sync PR: $pr_url"
+
+          # Non-fatal: requires "Allow auto-merge" enabled in repo settings.
+          # Without it, the PR is still created and can be merged by hand.
+          gh pr merge "$branch" --auto --merge || \
+            echo "::warning::Could not enable auto-merge (enable 'Allow auto-merge' in repo settings, or merge $pr_url manually)."
