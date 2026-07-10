@@ -8,15 +8,24 @@ import {
 } from '@maintainerr/contracts';
 import { Injectable } from '@nestjs/common';
 import { JellyfinAdapterService } from '../../api/media-server/jellyfin/jellyfin-adapter.service';
-import { IOverlayProvider } from './overlay-provider.interface';
+import {
+  IOverlayProvider,
+  OverlayImageSlot,
+} from './overlay-provider.interface';
+
+const IMAGE_TYPE_BY_SLOT: Record<OverlayImageSlot, ImageType> = {
+  poster: ImageType.Primary,
+  landscape: ImageType.Thumb,
+};
 
 /**
  * Jellyfin implementation of IOverlayProvider.
  *
- * Reads/writes only the `Primary` image: movies and shows have their poster
- * there, and episodes have their still there (Jellyfin's `Thumb` is mostly
- * unpopulated for episodes and shows a 16:9 series banner for
- * continue-watching fallback - neither is what an overlay should target).
+ * `poster` reads/writes the `Primary` image: movies and shows have their
+ * poster there, and episodes have their still there. `landscape` reads/writes
+ * the `Thumb` image, which Jellyfin's grid "Tile" layout uses for movies/shows
+ * (gated by MediaServerFeature.OVERLAY_LANDSCAPE_IMAGE - only ever requested
+ * for non-episode collections).
  */
 @Injectable()
 export class JellyfinOverlayProvider implements IOverlayProvider {
@@ -58,15 +67,24 @@ export class JellyfinOverlayProvider implements IOverlayProvider {
     return { itemId: ep.Id, title };
   }
 
-  async downloadImage(itemId: string): Promise<Buffer | null> {
-    return this.jf.getItemImageBuffer(itemId, ImageType.Primary);
+  async downloadImage(
+    itemId: string,
+    slot: OverlayImageSlot = 'poster',
+  ): Promise<Buffer | null> {
+    return this.jf.getItemImageBuffer(itemId, IMAGE_TYPE_BY_SLOT[slot]);
   }
 
   async uploadImage(
     itemId: string,
     buffer: Buffer,
     contentType: string,
+    slot: OverlayImageSlot = 'poster',
   ): Promise<void> {
-    await this.jf.setItemImage(itemId, ImageType.Primary, buffer, contentType);
+    await this.jf.setItemImage(
+      itemId,
+      IMAGE_TYPE_BY_SLOT[slot],
+      buffer,
+      contentType,
+    );
   }
 }

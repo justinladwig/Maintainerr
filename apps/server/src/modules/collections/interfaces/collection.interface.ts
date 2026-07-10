@@ -37,4 +37,6 @@ export interface ICollection {
   mediaServerSort?: MediaServerCollectionSort | null;
   overlayEnabled?: boolean;
   overlayTemplateId?: number | null;
+  overlayLandscapeEnabled?: boolean;
+  overlayLandscapeTemplateId?: number | null;
 }

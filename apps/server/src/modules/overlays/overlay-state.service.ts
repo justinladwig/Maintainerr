@@ -3,6 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { MaintainerrLogger } from '../logging/logs.service';
 import { OverlayItemStateEntity } from './entities/overlay-item-state.entities';
+import { OverlayImageSlot } from './providers/overlay-provider.interface';
 
 @Injectable()
 export class OverlayStateService {
@@ -26,19 +27,27 @@ export class OverlayStateService {
     mediaServerId: string,
     originalPosterPath: string | null,
     daysLeftShown: number | null,
+    slot: OverlayImageSlot = 'poster',
   ): Promise<OverlayItemStateEntity> {
     let entity = await this.getItemState(collectionId, mediaServerId);
 
     if (entity) {
-      entity.originalPosterPath =
-        originalPosterPath ?? entity.originalPosterPath;
+      if (slot === 'landscape') {
+        entity.originalLandscapePosterPath =
+          originalPosterPath ?? entity.originalLandscapePosterPath;
+      } else {
+        entity.originalPosterPath =
+          originalPosterPath ?? entity.originalPosterPath;
+      }
       entity.daysLeftShown = daysLeftShown;
       entity.processedAt = new Date();
     } else {
       entity = this.repo.create({
         collectionId,
         mediaServerId,
-        originalPosterPath,
+        originalPosterPath: slot === 'poster' ? originalPosterPath : null,
+        originalLandscapePosterPath:
+          slot === 'landscape' ? originalPosterPath : null,
         daysLeftShown,
         processedAt: new Date(),
       });

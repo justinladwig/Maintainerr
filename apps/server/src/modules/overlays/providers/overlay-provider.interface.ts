@@ -4,6 +4,18 @@ import {
 } from '@maintainerr/contracts';
 
 /**
+ * Which image slot on the item an overlay operation targets.
+ *
+ * `poster` is the existing `Primary` image (poster for movies/shows, still
+ * for episodes). `landscape` is the 16:9 image Jellyfin/Emby's grid "Tile"
+ * layout shows for movies/shows (Jellyfin/Emby's `Thumb` image type). Plex
+ * has no equivalent per-item asset, so `landscape` is unreachable there -
+ * gated by `MediaServerFeature.OVERLAY_LANDSCAPE_IMAGE` before any caller
+ * requests it.
+ */
+export type OverlayImageSlot = 'poster' | 'landscape';
+
+/**
  * Server-agnostic contract for overlay-specific media-server interactions.
  *
  * Intentionally narrower than IMediaServerService - overlays are a feature,
@@ -41,21 +53,24 @@ export interface IOverlayProvider {
   getRandomEpisode(sectionKeys?: string[]): Promise<OverlayPreviewItem | null>;
 
   /**
-   * Download the artwork for `itemId`. Both Plex and Jellyfin expose the
-   * correct image on the item itself - poster for movies/shows, still for
-   * episodes - so providers don't need a kind hint. Returns null when no
-   * artwork exists for the item.
+   * Download the artwork for `itemId` in the given slot (defaults to
+   * `poster`, the existing behavior). Returns null when no artwork exists
+   * for the item/slot.
    */
-  downloadImage(itemId: string): Promise<Buffer | null>;
+  downloadImage(
+    itemId: string,
+    slot?: OverlayImageSlot,
+  ): Promise<Buffer | null>;
 
   /**
-   * Replace the item's artwork. Upload semantics are a provider detail
-   * (Plex: upload + diff + select with content-addressed dedup;
-   * Jellyfin: atomic single-call replace).
+   * Replace the item's artwork in the given slot (defaults to `poster`).
+   * Upload semantics are a provider detail (Plex: upload + diff + select
+   * with content-addressed dedup; Jellyfin: atomic single-call replace).
    */
   uploadImage(
     itemId: string,
     buffer: Buffer,
     contentType: string,
+    slot?: OverlayImageSlot,
   ): Promise<void>;
 }

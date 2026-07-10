@@ -127,6 +127,19 @@ export class Collection {
   @JoinColumn({ name: 'overlayTemplateId' })
   overlayTemplate: Relation<OverlayTemplateEntity> | null;
 
+  @Column({ nullable: false, default: false })
+  overlayLandscapeEnabled: boolean;
+
+  @Column({ nullable: true, default: null })
+  overlayLandscapeTemplateId: number | null;
+
+  @ManyToOne(() => OverlayTemplateEntity, {
+    nullable: true,
+    onDelete: 'SET NULL',
+  })
+  @JoinColumn({ name: 'overlayLandscapeTemplateId' })
+  overlayLandscapeTemplate: Relation<OverlayTemplateEntity> | null;
+
   @Column({ nullable: true })
   radarrQualityProfileId: number;
 

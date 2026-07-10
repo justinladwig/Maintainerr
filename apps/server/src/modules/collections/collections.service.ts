@@ -3288,6 +3288,10 @@ export class CollectionsService {
             mediaServerSort: collection.mediaServerSort ?? null,
             overlayEnabled: collection.overlayEnabled ?? false,
             overlayTemplateId: collection.overlayTemplateId ?? null,
+            overlayLandscapeEnabled:
+              collection.overlayLandscapeEnabled ?? false,
+            overlayLandscapeTemplateId:
+              collection.overlayLandscapeTemplateId ?? null,
           },
         ])
         .execute();

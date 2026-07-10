@@ -1345,4 +1345,265 @@ describe('OverlayProcessorService', () => {
 
     expect(eventEmitter.emit).not.toHaveBeenCalled();
   });
+
+  it('also applies a landscape overlay when enabled and the media server supports it', async () => {
+    const settingsService = {
+      getSettings: jest.fn().mockResolvedValue({ enabled: true }),
+    };
+    const stateService = {
+      getItemState: jest.fn().mockResolvedValue(null),
+    };
+    const posterTemplate = makeTemplate({ mode: 'poster' });
+    const landscapeTemplate = makeTemplate({
+      id: 2,
+      name: 'Title Card Pill',
+      mode: 'titlecard',
+    });
+    const templateService = {
+      resolveForCollection: jest
+        .fn()
+        .mockImplementation((_id, mode) =>
+          Promise.resolve(
+            mode === 'titlecard' ? landscapeTemplate : posterTemplate,
+          ),
+        ),
+    };
+    const provider = makeProvider();
+    const providerFactory = makeProviderFactory(provider);
+    const mediaServer = makeMediaServer({
+      supportsFeature: jest.fn().mockReturnValue(true),
+    });
+
+    const service = new OverlayProcessorService(
+      providerFactory as any,
+      makeMediaServerFactory(mediaServer) as any,
+      {} as any,
+      settingsService as any,
+      stateService as any,
+      {} as any,
+      templateService as any,
+      { emit: jest.fn() } as any,
+      createMockLogger(),
+    );
+
+    const collection = createCollection({
+      id: 1,
+      title: 'Landscape overlay',
+      type: 'movie',
+      deleteAfterDays: 0,
+      overlayTemplateId: null,
+      overlayLandscapeEnabled: true,
+      overlayLandscapeTemplateId: null,
+    });
+    collection.collectionMedia = [
+      createCollectionMedia(collection, {
+        mediaServerId: 'media-1',
+        addDate: new Date('2026-04-01T00:00:00.000Z'),
+      }),
+    ];
+
+    jest.spyOn(service, 'applyTemplateOverlay').mockResolvedValue(true);
+
+    const result = await service.processCollection(collection as any);
+
+    expect(templateService.resolveForCollection).toHaveBeenCalledWith(
+      null,
+      'titlecard',
+    );
+    expect(service.applyTemplateOverlay).toHaveBeenCalledWith(
+      'media-1',
+      collection.id,
+      expect.any(Date),
+      posterTemplate,
+      provider,
+    );
+    expect(service.applyTemplateOverlay).toHaveBeenCalledWith(
+      'media-1',
+      collection.id,
+      expect.any(Date),
+      landscapeTemplate,
+      provider,
+      'landscape',
+    );
+    expect(result.processed).toBe(1);
+    expect(result.errors).toBe(0);
+  });
+
+  it('does not apply a landscape overlay when the media server does not support it', async () => {
+    const settingsService = {
+      getSettings: jest.fn().mockResolvedValue({ enabled: true }),
+    };
+    const stateService = {
+      getItemState: jest.fn().mockResolvedValue(null),
+    };
+    const template = makeTemplate();
+    const templateService = {
+      resolveForCollection: jest.fn().mockResolvedValue(template),
+    };
+    const provider = makeProvider();
+    const providerFactory = makeProviderFactory(provider);
+    const mediaServer = makeMediaServer({
+      supportsFeature: jest.fn().mockReturnValue(false),
+    });
+
+    const service = new OverlayProcessorService(
+      providerFactory as any,
+      makeMediaServerFactory(mediaServer) as any,
+      {} as any,
+      settingsService as any,
+      stateService as any,
+      {} as any,
+      templateService as any,
+      { emit: jest.fn() } as any,
+      createMockLogger(),
+    );
+
+    const collection = createCollection({
+      id: 1,
+      title: 'No landscape support',
+      type: 'movie',
+      deleteAfterDays: 0,
+      overlayTemplateId: null,
+      overlayLandscapeEnabled: true,
+      overlayLandscapeTemplateId: null,
+    });
+    collection.collectionMedia = [
+      createCollectionMedia(collection, {
+        mediaServerId: 'media-1',
+        addDate: new Date('2026-04-01T00:00:00.000Z'),
+      }),
+    ];
+
+    jest.spyOn(service, 'applyTemplateOverlay').mockResolvedValue(true);
+
+    await service.processCollection(collection as any);
+
+    expect(templateService.resolveForCollection).not.toHaveBeenCalledWith(
+      null,
+      'titlecard',
+    );
+    expect(service.applyTemplateOverlay).toHaveBeenCalledTimes(1);
+    expect(service.applyTemplateOverlay).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+      'landscape',
+    );
+  });
+
+  it('does not apply a landscape overlay to episode collections even when enabled', async () => {
+    const settingsService = {
+      getSettings: jest.fn().mockResolvedValue({ enabled: true }),
+    };
+    const stateService = {
+      getItemState: jest.fn().mockResolvedValue(null),
+    };
+    const template = makeTemplate({ mode: 'titlecard' });
+    const templateService = {
+      resolveForCollection: jest.fn().mockResolvedValue(template),
+    };
+    const provider = makeProvider();
+    const providerFactory = makeProviderFactory(provider);
+    const mediaServer = makeMediaServer({
+      supportsFeature: jest.fn().mockReturnValue(true),
+    });
+
+    const service = new OverlayProcessorService(
+      providerFactory as any,
+      makeMediaServerFactory(mediaServer) as any,
+      {} as any,
+      settingsService as any,
+      stateService as any,
+      {} as any,
+      templateService as any,
+      { emit: jest.fn() } as any,
+      createMockLogger(),
+    );
+
+    const collection = createCollection({
+      id: 1,
+      title: 'Episode with landscape flag set',
+      type: 'episode',
+      deleteAfterDays: 7,
+      overlayTemplateId: null,
+      overlayLandscapeEnabled: true,
+      overlayLandscapeTemplateId: null,
+    });
+    collection.collectionMedia = [
+      createCollectionMedia(collection, {
+        mediaServerId: 'ep-1',
+        addDate: new Date('2026-04-01T00:00:00.000Z'),
+      }),
+    ];
+
+    jest.spyOn(service, 'applyTemplateOverlay').mockResolvedValue(true);
+
+    await service.processCollection(collection as any);
+
+    expect(templateService.resolveForCollection).toHaveBeenCalledTimes(1);
+    expect(service.applyTemplateOverlay).toHaveBeenCalledTimes(1);
+  });
+
+  it('restores the landscape backup on revert and keeps it for retry if that upload fails, without failing the overall revert', async () => {
+    const stateService = {
+      getCollectionStates: jest
+        .fn()
+        .mockResolvedValue([{ mediaServerId: 'media-1' }]),
+      removeState: jest.fn().mockResolvedValue(undefined),
+    };
+    const provider = makeProvider({
+      uploadImage: jest.fn().mockImplementation((_id, _buf, _ct, slot) => {
+        if (slot === 'landscape') {
+          return Promise.reject(new Error('landscape upload failed'));
+        }
+        return Promise.resolve(undefined);
+      }),
+    });
+    const providerFactory = makeProviderFactory(provider);
+    const eventEmitter = { emit: jest.fn() };
+    const collectionsService = {
+      getCollection: jest
+        .fn()
+        .mockResolvedValue({ type: 'movie', title: 'Dual-slot collection' }),
+    };
+
+    const service = new OverlayProcessorService(
+      providerFactory as any,
+      makeMediaServerFactory() as any,
+      collectionsService as any,
+      {} as any,
+      stateService as any,
+      {} as any,
+      {} as any,
+      eventEmitter as any,
+      createMockLogger(),
+    );
+
+    jest
+      .spyOn(service as any, 'loadOriginalPoster')
+      .mockImplementation((...args: unknown[]) =>
+        Buffer.from(args[1] === 'landscape' ? 'landscape' : 'poster'),
+      );
+    const deleteSpy = jest
+      .spyOn(service as any, 'deleteOriginalPoster')
+      .mockImplementation(() => {});
+
+    await service.revertCollection(42);
+
+    // Poster restore succeeded → its backup is cleared.
+    expect(deleteSpy).toHaveBeenCalledWith('media-1');
+    // Landscape restore failed → its backup is kept for a later retry.
+    expect(deleteSpy).not.toHaveBeenCalledWith('media-1', 'landscape');
+    // Landscape being additive: its failure doesn't block the poster revert
+    // from being reported as successful.
+    expect(stateService.removeState).toHaveBeenCalledWith(42, 'media-1');
+    expect(eventEmitter.emit).toHaveBeenCalledWith(
+      MaintainerrEvent.Overlay_Reverted,
+      expect.objectContaining({
+        mediaItems: [{ mediaServerId: 'media-1' }],
+      }),
+    );
+  });
 });

@@ -110,4 +110,22 @@ describe('PlexOverlayProvider', () => {
       expect(plexApi.setThumb).toHaveBeenCalledWith('42', buf, 'image/jpeg');
     });
   });
+
+  describe('landscape slot (unsupported on Plex)', () => {
+    it('rejects downloadImage for the landscape slot without calling PlexApiService', async () => {
+      await expect(provider.downloadImage('42', 'landscape')).rejects.toThrow(
+        /not supported on Plex/,
+      );
+      expect(plexApi.getBestPosterUrl).not.toHaveBeenCalled();
+    });
+
+    it('rejects uploadImage for the landscape slot without calling PlexApiService', async () => {
+      const buf = Buffer.from('jpeg-bytes');
+
+      await expect(
+        provider.uploadImage('42', buf, 'image/jpeg', 'landscape'),
+      ).rejects.toThrow(/not supported on Plex/);
+      expect(plexApi.setThumb).not.toHaveBeenCalled();
+    });
+  });
 });

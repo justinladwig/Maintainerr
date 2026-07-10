@@ -125,4 +125,30 @@ describe('JellyfinOverlayProvider', () => {
       );
     });
   });
+
+  describe('landscape image I/O', () => {
+    it('reads the Thumb image on downloadImage', async () => {
+      const buf = Buffer.from('jpeg');
+      jf.getItemImageBuffer.mockResolvedValue(buf);
+
+      await expect(provider.downloadImage('42', 'landscape')).resolves.toBe(
+        buf,
+      );
+      expect(jf.getItemImageBuffer).toHaveBeenCalledWith('42', ImageType.Thumb);
+    });
+
+    it('writes the Thumb image on uploadImage', async () => {
+      const buf = Buffer.from('jpeg');
+      jf.setItemImage.mockResolvedValue(undefined);
+
+      await provider.uploadImage('42', buf, 'image/jpeg', 'landscape');
+
+      expect(jf.setItemImage).toHaveBeenCalledWith(
+        '42',
+        ImageType.Thumb,
+        buf,
+        'image/jpeg',
+      );
+    });
+  });
 });

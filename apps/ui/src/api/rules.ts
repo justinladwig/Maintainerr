@@ -73,6 +73,8 @@ export interface RuleGroupCollectionPayload {
   visibleOnHome: boolean
   overlayEnabled?: boolean
   overlayTemplateId?: number | null
+  overlayLandscapeEnabled?: boolean
+  overlayLandscapeTemplateId?: number | null
   deleteAfterDays?: number
   manualCollection?: boolean
   manualCollectionName?: string

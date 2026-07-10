@@ -64,4 +64,12 @@ export enum MediaServerFeature {
    * bound to one library. Gates the cross-library lookup for manual collections.
    */
   CROSS_LIBRARY_COLLECTIONS = 'cross_library_collections',
+  /**
+   * A distinct landscape (16:9) image slot exists on movie/show items,
+   * separate from the poster - Jellyfin/Emby's `Thumb` image, used by
+   * Jellyfin's grid "Tile" layout. Plex has no equivalent per-item asset for
+   * library-grid tiles (its `art` is a background/fanart image, not a tile
+   * image).
+   */
+  OVERLAY_LANDSCAPE_IMAGE = 'overlay_landscape_image',
 }

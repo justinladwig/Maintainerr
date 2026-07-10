@@ -1,5 +1,6 @@
 import {
   MaintainerrEvent,
+  MediaServerFeature,
   OverlayProcessorRunResult,
   OverlayResult,
   OverlayTemplate,
@@ -24,7 +25,10 @@ import { OverlaySettingsService } from './overlay-settings.service';
 import { OverlayStateService } from './overlay-state.service';
 import { OverlayTemplateService } from './overlay-template.service';
 import { OverlayProviderFactory } from './providers/overlay-provider.factory';
-import { IOverlayProvider } from './providers/overlay-provider.interface';
+import {
+  IOverlayProvider,
+  OverlayImageSlot,
+} from './providers/overlay-provider.interface';
 
 export type ProcessorStatus = 'idle' | 'running' | 'error';
 
@@ -95,33 +99,44 @@ export class OverlayProcessorService {
 
   // ── Poster backup helpers ─────────────────────────────────────────────────
 
-  private getOriginalPosterPath(mediaServerId: string): string {
+  private getOriginalPosterPath(
+    mediaServerId: string,
+    slot: OverlayImageSlot = 'poster',
+  ): string {
+    const suffix = slot === 'landscape' ? '.landscape.jpg' : '.jpg';
     return path.join(
       this.dataDir,
       'overlays',
       'originals',
-      `${mediaServerId}.jpg`,
+      `${mediaServerId}${suffix}`,
     );
   }
 
   private async saveOriginalPoster(
     mediaServerId: string,
     buffer: Buffer,
+    slot: OverlayImageSlot = 'poster',
   ): Promise<string> {
-    const filePath = this.getOriginalPosterPath(mediaServerId);
+    const filePath = this.getOriginalPosterPath(mediaServerId, slot);
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
     fs.writeFileSync(filePath, buffer);
     return filePath;
   }
 
-  private loadOriginalPoster(mediaServerId: string): Buffer | null {
-    const p = this.getOriginalPosterPath(mediaServerId);
+  private loadOriginalPoster(
+    mediaServerId: string,
+    slot: OverlayImageSlot = 'poster',
+  ): Buffer | null {
+    const p = this.getOriginalPosterPath(mediaServerId, slot);
     if (fs.existsSync(p)) return fs.readFileSync(p);
     return null;
   }
 
-  private deleteOriginalPoster(mediaServerId: string): void {
-    const p = this.getOriginalPosterPath(mediaServerId);
+  private deleteOriginalPoster(
+    mediaServerId: string,
+    slot: OverlayImageSlot = 'poster',
+  ): void {
+    const p = this.getOriginalPosterPath(mediaServerId, slot);
     if (fs.existsSync(p)) fs.unlinkSync(p);
   }
 
@@ -148,11 +163,18 @@ export class OverlayProcessorService {
     provider: IOverlayProvider,
   ): Promise<RevertItemResult> {
     const originalBuf = this.loadOriginalPoster(mediaServerId);
+    const originalLandscapeBuf = this.loadOriginalPoster(
+      mediaServerId,
+      'landscape',
+    );
 
     if (!originalBuf) {
       this.logger.warn(
         `No saved original poster for ${mediaServerId}, cannot restore`,
       );
+      if (originalLandscapeBuf) {
+        this.deleteOriginalPoster(mediaServerId, 'landscape');
+      }
       await this.stateService.removeState(collectionId, mediaServerId);
       return 'no-backup';
     }
@@ -175,6 +197,7 @@ export class OverlayProcessorService {
         `Item ${mediaServerId} no longer exists on the media server, dropping overlay state and backup`,
       );
       this.deleteOriginalPoster(mediaServerId);
+      this.deleteOriginalPoster(mediaServerId, 'landscape');
       await this.stateService.removeState(collectionId, mediaServerId);
       return 'item-gone';
     }
@@ -191,6 +214,30 @@ export class OverlayProcessorService {
 
     this.logger.log(`Restored original poster for item ${mediaServerId}`);
     this.deleteOriginalPoster(mediaServerId);
+
+    // Landscape restore is additive - a failure here doesn't strand the item
+    // the way a failed poster restore would, so it's logged and retried on a
+    // later run rather than flipping this call's overall verdict.
+    if (originalLandscapeBuf) {
+      try {
+        await provider.uploadImage(
+          mediaServerId,
+          originalLandscapeBuf,
+          'image/jpeg',
+          'landscape',
+        );
+        this.deleteOriginalPoster(mediaServerId, 'landscape');
+        this.logger.log(
+          `Restored original landscape image for item ${mediaServerId}`,
+        );
+      } catch (error) {
+        this.logger.warn(
+          `Failed to restore original landscape image for ${mediaServerId}; keeping backup for retry`,
+        );
+        this.logger.debug(error);
+      }
+    }
+
     await this.stateService.removeState(collectionId, mediaServerId);
     return 'restored';
   }
@@ -314,6 +361,33 @@ export class OverlayProcessorService {
       `Collection "${collection.title}" using template "${template.name}" (${mode})`,
     );
 
+    // Optionally apply a second, independent titlecard-mode overlay to the
+    // landscape (Jellyfin/Emby `Thumb`) image slot for movie/show
+    // collections. Episode collections already use their titlecard template
+    // on `Primary` (the episode still), so there's no second slot for them.
+    let landscapeTemplate: OverlayTemplate | null = null;
+    if (collection.type !== 'episode' && collection.overlayLandscapeEnabled) {
+      const mediaServer = await this.mediaServerFactory.getService();
+      if (
+        mediaServer.supportsFeature(MediaServerFeature.OVERLAY_LANDSCAPE_IMAGE)
+      ) {
+        landscapeTemplate = await this.templateService.resolveForCollection(
+          collection.overlayLandscapeTemplateId ?? null,
+          'titlecard',
+        );
+        if (!landscapeTemplate) {
+          this.logger.warn(
+            `No titlecard overlay template found for landscape overlay on collection "${collection.title}". ` +
+              `Set a default titlecard template or assign one to this collection.`,
+          );
+        } else {
+          this.logger.log(
+            `Collection "${collection.title}" also applying landscape template "${landscapeTemplate.name}"`,
+          );
+        }
+      }
+    }
+
     for (const mediaItem of collection.collectionMedia) {
       const itemId = mediaItem.mediaServerId;
       const deleteDate = this.getDeleteDate(
@@ -348,6 +422,23 @@ export class OverlayProcessorService {
           this.addUniqueMediaItem(processedMediaItems, itemId);
         } else {
           result.errors++;
+        }
+
+        if (landscapeTemplate) {
+          const landscapeSuccess = await this.applyTemplateOverlay(
+            itemId,
+            collection.id,
+            deleteDate,
+            landscapeTemplate,
+            provider,
+            'landscape',
+          );
+          if (!landscapeSuccess) {
+            this.logger.warn(
+              `Failed to apply landscape overlay to item ${itemId}`,
+            );
+            result.errors++;
+          }
         }
       } else {
         result.skipped++;
@@ -580,27 +671,28 @@ export class OverlayProcessorService {
     deleteDate: Date,
     template: OverlayTemplate,
     provider: IOverlayProvider,
+    slot: OverlayImageSlot = 'poster',
   ): Promise<boolean> {
     let posterBuf: Buffer;
-    const savedOriginal = this.loadOriginalPoster(itemId);
+    const savedOriginal = this.loadOriginalPoster(itemId, slot);
     if (savedOriginal) {
       posterBuf = savedOriginal;
     } else {
       try {
-        const downloaded = await provider.downloadImage(itemId);
+        const downloaded = await provider.downloadImage(itemId, slot);
         if (!downloaded) {
           this.logger.warn(
-            `No ${template.mode} artwork available for item ${itemId}, skipping`,
+            `No ${template.mode} artwork available for item ${itemId} (${slot}), skipping`,
           );
           return false;
         }
         posterBuf = downloaded;
       } catch (error) {
-        this.logger.warn(`Failed to download poster for ${itemId}`);
+        this.logger.warn(`Failed to download poster for ${itemId} (${slot})`);
         this.logger.debug(error);
         return false;
       }
-      await this.saveOriginalPoster(itemId, posterBuf);
+      await this.saveOriginalPoster(itemId, posterBuf, slot);
     }
 
     // Build render context - raw data; per-element formatting is done by the render service
@@ -632,16 +724,20 @@ export class OverlayProcessorService {
         itemId,
         Buffer.from(result.buffer),
         result.contentType,
+        slot,
       );
       await this.stateService.markProcessed(
         collectionId,
         itemId,
-        this.getOriginalPosterPath(itemId),
+        this.getOriginalPosterPath(itemId, slot),
         daysLeft,
+        slot,
       );
       return true;
     } catch (error) {
-      this.logger.warn(`Failed to apply template overlay for ${itemId}`);
+      this.logger.warn(
+        `Failed to apply template overlay for ${itemId} (${slot})`,
+      );
       this.logger.debug(error);
       return false;
     }

@@ -31,6 +31,9 @@ export class OverlayItemStateEntity {
   @Column({ type: 'varchar', nullable: true })
   originalPosterPath: string | null;
 
+  @Column({ type: 'varchar', nullable: true })
+  originalLandscapePosterPath: string | null;
+
   @Column({ type: 'integer', nullable: true })
   daysLeftShown: number | null;
 

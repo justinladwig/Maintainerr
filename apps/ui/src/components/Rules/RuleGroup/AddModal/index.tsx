@@ -296,6 +296,8 @@ export const ruleGroupFormSchema = z
     showHome: z.boolean(),
     overlayEnabled: z.boolean(),
     overlayTemplateId: z.number().int().nullable().optional(),
+    overlayLandscapeEnabled: z.boolean(),
+    overlayLandscapeTemplateId: z.number().int().nullable().optional(),
     listExclusions: z.boolean(),
     forceSeerr: z.boolean(),
     manualCollection: z.boolean(),
@@ -380,6 +382,10 @@ const buildFormDefaults = (editData?: IRuleGroup): RuleGroupFormValues => ({
   showHome: editData?.collection?.visibleOnHome ?? true,
   overlayEnabled: editData?.collection?.overlayEnabled ?? false,
   overlayTemplateId: editData?.collection?.overlayTemplateId ?? null,
+  overlayLandscapeEnabled:
+    editData?.collection?.overlayLandscapeEnabled ?? false,
+  overlayLandscapeTemplateId:
+    editData?.collection?.overlayLandscapeTemplateId ?? null,
   listExclusions: editData?.collection?.listExclusions ?? true,
   forceSeerr: editData?.collection?.forceSeerr ?? false,
   manualCollection: editData?.collection?.manualCollection ?? false,
@@ -435,6 +441,10 @@ const AddModal = (props: AddModal) => {
     mediaServerType,
     MediaServerFeature.COLLECTION_SORT,
   )
+  const supportsLandscapeOverlay = supportsFeature(
+    mediaServerType,
+    MediaServerFeature.OVERLAY_LANDSCAPE_IMAGE,
+  )
   // Both Plex and Jellyfin call them "Collections" in their GUI
   // (Jellyfin's internal API type is "BoxSet" but the user-facing term is "Collection")
   const collectionTerm = 'collection'
@@ -479,6 +489,14 @@ const AddModal = (props: AddModal) => {
   const overlayTemplateId = useWatch({
     control,
     name: 'overlayTemplateId',
+  }) as number | null | undefined
+  const overlayLandscapeEnabled = useWatch({
+    control,
+    name: 'overlayLandscapeEnabled',
+  })
+  const overlayLandscapeTemplateId = useWatch({
+    control,
+    name: 'overlayLandscapeTemplateId',
   }) as number | null | undefined
   const useRulesEnabled = useWatch({ control, name: 'useRules' })
   const arrActionValue = useWatch({ control, name: 'arrAction' }) as
@@ -528,6 +546,9 @@ const AddModal = (props: AddModal) => {
   const availableOverlayTemplates = overlayTemplates.filter(
     (template) => template.mode === overlayTemplateMode,
   )
+  const availableLandscapeTemplates = overlayTemplates.filter(
+    (template) => template.mode === 'titlecard',
+  )
 
   const {
     data: libraries,
@@ -573,6 +594,25 @@ const AddModal = (props: AddModal) => {
     overlayTemplatesLoaded,
     availableOverlayTemplates,
     overlayTemplateId,
+    setValue,
+  ])
+
+  useEffect(() => {
+    if (!overlayTemplatesLoaded || overlayLandscapeTemplateId == null) {
+      return
+    }
+
+    const hasMatchingTemplate = availableLandscapeTemplates.some(
+      (template) => template.id === overlayLandscapeTemplateId,
+    )
+
+    if (!hasMatchingTemplate) {
+      setValue('overlayLandscapeTemplateId', null)
+    }
+  }, [
+    overlayTemplatesLoaded,
+    availableLandscapeTemplates,
+    overlayLandscapeTemplateId,
     setValue,
   ])
 
@@ -818,6 +858,8 @@ const AddModal = (props: AddModal) => {
         visibleOnHome: data.showHome,
         overlayEnabled: data.overlayEnabled,
         overlayTemplateId: data.overlayTemplateId ?? null,
+        overlayLandscapeEnabled: data.overlayLandscapeEnabled,
+        overlayLandscapeTemplateId: data.overlayLandscapeTemplateId ?? null,
         deleteAfterDays:
           data.arrAction === undefined ||
           data.arrAction === ServarrAction.DO_NOTHING ||
@@ -1306,6 +1348,88 @@ const AddModal = (props: AddModal) => {
                         </div>
                       </div>
                     )}
+
+                    {overlayEnabled &&
+                      selectedType !== 'episode' &&
+                      supportsLandscapeOverlay && (
+                        <div className="flex flex-row items-center justify-between py-4">
+                          <label
+                            htmlFor="overlay_landscape_enabled"
+                            className="text-label"
+                          >
+                            Also apply to landscape/tile image
+                            <p className="text-xs font-normal">
+                              Apply a second overlay to the landscape image
+                              Jellyfin&apos;s grid tile view uses, so the
+                              overlay is visible there too
+                            </p>
+                          </label>
+                          <div className="form-input">
+                            <div className="form-input-field">
+                              <input
+                                type="checkbox"
+                                id="overlay_landscape_enabled"
+                                className="checkbox"
+                                {...register('overlayLandscapeEnabled')}
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                    {overlayEnabled &&
+                      selectedType !== 'episode' &&
+                      supportsLandscapeOverlay &&
+                      overlayLandscapeEnabled && (
+                        <div className="form-row items-center">
+                          <label
+                            htmlFor="overlay_landscape_template_id"
+                            className="text-label"
+                          >
+                            Landscape overlay template
+                            <p className="text-xs font-normal">
+                              Leave unset to use the default title card template
+                            </p>
+                          </label>
+                          <div className="form-input">
+                            <div className="form-input-field">
+                              <Controller
+                                name="overlayLandscapeTemplateId"
+                                control={control}
+                                render={({ field }) => (
+                                  <Select
+                                    id="overlay_landscape_template_id"
+                                    value={field.value ?? ''}
+                                    onChange={(event) => {
+                                      const value = event.target.value
+                                      field.onChange(
+                                        value === '' ? null : Number(value),
+                                      )
+                                    }}
+                                  >
+                                    <option value="">
+                                      Default title card template
+                                    </option>
+                                    {availableLandscapeTemplates.map(
+                                      (template) => (
+                                        <option
+                                          key={template.id}
+                                          value={template.id}
+                                        >
+                                          {template.name}
+                                          {template.isDefault
+                                            ? ' (default)'
+                                            : ''}
+                                        </option>
+                                      ),
+                                    )}
+                                  </Select>
+                                )}
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      )}
 
                     {(radarrSettingsId != null ||
                       (sonarrSettingsId != null &&

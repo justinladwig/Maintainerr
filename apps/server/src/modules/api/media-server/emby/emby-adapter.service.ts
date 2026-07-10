@@ -1211,15 +1211,20 @@ export class EmbyAdapterService implements IMediaServerService {
     collectionId: string,
     buffer: Buffer,
     contentType: string,
+    imageType = 'Primary',
   ): Promise<void> {
     if (!this.http) throw new Error('Emby not initialized');
     try {
       // Emby accepts POST /Items/{id}/Images/{type} with base64-encoded body
       // and a Content-Type header on the body matching the image MIME type.
       const base64 = buffer.toString('base64');
-      await this.http.post(`/Items/${collectionId}/Images/Primary`, base64, {
-        headers: { 'Content-Type': contentType },
-      });
+      await this.http.post(
+        `/Items/${collectionId}/Images/${imageType}`,
+        base64,
+        {
+          headers: { 'Content-Type': contentType },
+        },
+      );
     } catch (error) {
       const message = formatConnectionFailureMessage(
         error,

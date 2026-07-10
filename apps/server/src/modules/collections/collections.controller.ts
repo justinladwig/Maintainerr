@@ -155,6 +155,8 @@ const collectionBaseShape = {
   mediaServerSort: collectionMediaSortKeySchema.optional().nullable(),
   overlayEnabled: z.boolean().optional(),
   overlayTemplateId: z.coerce.number().int().optional().nullable(),
+  overlayLandscapeEnabled: z.boolean().optional(),
+  overlayLandscapeTemplateId: z.coerce.number().int().optional().nullable(),
 };
 
 export const collectionBodySchema = z.object({

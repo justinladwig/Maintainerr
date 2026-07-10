@@ -15,6 +15,8 @@ export interface ICollection {
   visibleOnHome?: boolean
   overlayEnabled?: boolean
   overlayTemplateId?: number | null
+  overlayLandscapeEnabled?: boolean
+  overlayLandscapeTemplateId?: number | null
   deleteAfterDays?: number
   listExclusions?: boolean
   forceSeerr?: boolean

@@ -4,15 +4,24 @@ import {
 } from '@maintainerr/contracts';
 import { Injectable } from '@nestjs/common';
 import { EmbyAdapterService } from '../../api/media-server/emby/emby-adapter.service';
-import { IOverlayProvider } from './overlay-provider.interface';
+import {
+  IOverlayProvider,
+  OverlayImageSlot,
+} from './overlay-provider.interface';
+
+const IMAGE_TYPE_BY_SLOT: Record<OverlayImageSlot, string> = {
+  poster: 'Primary',
+  landscape: 'Thumb',
+};
 
 /**
  * Emby implementation of IOverlayProvider.
  *
- * Reads/writes the `Primary` image (poster for movies/shows, still for
- * episodes), mirroring the Jellyfin provider's choice. Emby's image endpoint
- * surface matches Jellyfin's (same .NET ancestor): GET/POST/DELETE
- * /Items/{id}/Images/{imageType}.
+ * `poster` reads/writes the `Primary` image (poster for movies/shows, still
+ * for episodes), mirroring the Jellyfin provider's choice. `landscape`
+ * reads/writes the `Thumb` image, used by Emby's grid tile layout for
+ * movies/shows. Emby's image endpoint surface matches Jellyfin's (same .NET
+ * ancestor): GET/POST/DELETE /Items/{id}/Images/{imageType}.
  */
 @Injectable()
 export class EmbyOverlayProvider implements IOverlayProvider {
@@ -54,17 +63,26 @@ export class EmbyOverlayProvider implements IOverlayProvider {
     return { itemId: ep.Id, title };
   }
 
-  async downloadImage(itemId: string): Promise<Buffer | null> {
-    return this.emby.getItemImageBuffer(itemId, 'Primary');
+  async downloadImage(
+    itemId: string,
+    slot: OverlayImageSlot = 'poster',
+  ): Promise<Buffer | null> {
+    return this.emby.getItemImageBuffer(itemId, IMAGE_TYPE_BY_SLOT[slot]);
   }
 
   async uploadImage(
     itemId: string,
     buffer: Buffer,
     contentType: string,
+    slot: OverlayImageSlot = 'poster',
   ): Promise<void> {
     // Reuse the collection-image upload path: Emby's image upload endpoint
     // accepts a base64 body with the original Content-Type on POST.
-    await this.emby.setCollectionImage(itemId, buffer, contentType);
+    await this.emby.setCollectionImage(
+      itemId,
+      buffer,
+      contentType,
+      IMAGE_TYPE_BY_SLOT[slot],
+    );
   }
 }

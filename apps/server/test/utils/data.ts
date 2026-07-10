@@ -91,6 +91,9 @@ export const createCollection = (
     handledMediaSizeBytes: 0,
     overlayTemplateId: null,
     overlayTemplate: null,
+    overlayLandscapeEnabled: false,
+    overlayLandscapeTemplateId: null,
+    overlayLandscapeTemplate: null,
     mediaServerSort: null,
     ...properties,
   };

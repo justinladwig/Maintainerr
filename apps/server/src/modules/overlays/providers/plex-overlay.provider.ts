@@ -4,7 +4,10 @@ import {
 } from '@maintainerr/contracts';
 import { Injectable } from '@nestjs/common';
 import { PlexApiService } from '../../api/plex-api/plex-api.service';
-import { IOverlayProvider } from './overlay-provider.interface';
+import {
+  IOverlayProvider,
+  OverlayImageSlot,
+} from './overlay-provider.interface';
 
 /**
  * Plex implementation of IOverlayProvider.
@@ -13,6 +16,11 @@ import { IOverlayProvider } from './overlay-provider.interface';
  * concept (`thumb` URL, `upload://posters/` URI scheme, X-Plex-Token,
  * type=4 episode filter, content-addressed dedup, eventual-consistency
  * retry loop) stays inside PlexApiService. This class adds no Plex logic.
+ *
+ * Plex has no distinct landscape/tile asset for movies/shows (its `art` is a
+ * background/fanart image, not a grid-tile image), so
+ * MediaServerFeature.OVERLAY_LANDSCAPE_IMAGE is never enabled for Plex and
+ * the `landscape` slot below should be unreachable in practice.
  */
 @Injectable()
 export class PlexOverlayProvider implements IOverlayProvider {
@@ -47,7 +55,15 @@ export class PlexOverlayProvider implements IOverlayProvider {
     return r ? { itemId: r.plexId, title: r.title } : null;
   }
 
-  async downloadImage(itemId: string): Promise<Buffer | null> {
+  async downloadImage(
+    itemId: string,
+    slot: OverlayImageSlot = 'poster',
+  ): Promise<Buffer | null> {
+    if (slot === 'landscape') {
+      throw new Error(
+        'Landscape overlay images are not supported on Plex - gated by MediaServerFeature.OVERLAY_LANDSCAPE_IMAGE, this should be unreachable',
+      );
+    }
     const thumb = await this.plex.getBestPosterUrl(itemId);
     if (!thumb) return null;
     return this.plex.downloadPoster(thumb);
@@ -57,7 +73,13 @@ export class PlexOverlayProvider implements IOverlayProvider {
     itemId: string,
     buffer: Buffer,
     contentType: string,
+    slot: OverlayImageSlot = 'poster',
   ): Promise<void> {
+    if (slot === 'landscape') {
+      throw new Error(
+        'Landscape overlay images are not supported on Plex - gated by MediaServerFeature.OVERLAY_LANDSCAPE_IMAGE, this should be unreachable',
+      );
+    }
     await this.plex.setThumb(itemId, buffer, contentType);
   }
 }
