@@ -9,7 +9,7 @@ name: "Sync upstream release"
 
 on:
   schedule:
-    - cron: "17 4 * * *" # daily, 04:17 UTC
+    - cron: "17 4 * * *"  # daily, 04:17 UTC
   workflow_dispatch:
 
 env:
@@ -87,11 +87,17 @@ jobs:
 
           pr_url="$(gh pr list --head "$branch" --base "${{ env.TARGET_BRANCH }}" --json url --jq '.[0].url')"
           if [ -z "$pr_url" ]; then
-            pr_url="$(gh pr create \
+            pr_body="Automated merge of upstream release [$tag](https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/$tag) "
+            pr_body+="into \`${{ env.TARGET_BRANCH }}\`."
+            if ! pr_url="$(gh pr create \
               --base "${{ env.TARGET_BRANCH }}" \
               --head "$branch" \
               --title "chore: sync upstream release $tag" \
-              --body "Automated merge of upstream release [$tag](https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/$tag) into \`${{ env.TARGET_BRANCH }}\`.")"
+              --body "$pr_body")"; then
+              echo "::warning::Could not create sync PR automatically (check token and repository Actions permissions)."
+              echo "::warning::Create one manually from $branch into ${{ env.TARGET_BRANCH }}."
+              exit 0
+            fi
           fi
 
           echo "Sync PR: $pr_url"
