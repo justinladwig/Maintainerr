@@ -21,6 +21,7 @@ export interface ICollection {
   visibleOnRecommended?: boolean;
   visibleOnHome?: boolean;
   listExclusions?: boolean;
+  cleanupLeftoverFolders?: boolean;
   forceSeerr?: boolean;
   deleteAfterDays?: number; // amount of days after add
   media?: CollectionMedia[];
@@ -30,8 +31,10 @@ export interface ICollection {
   tautulliWatchedPercentOverride?: number;
   radarrSettingsId?: number;
   sonarrSettingsId?: number;
+  sportarrSettingsId?: number;
   radarrQualityProfileId?: number;
   sonarrQualityProfileId?: number;
+  sportarrQualityProfileId?: number;
   tagInArr?: boolean;
   sortTitle?: string;
   mediaServerSort?: MediaServerCollectionSort | null;

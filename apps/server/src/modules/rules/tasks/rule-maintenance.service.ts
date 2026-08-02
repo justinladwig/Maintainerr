@@ -40,13 +40,18 @@ export class RuleMaintenanceService extends TaskBase {
         await this.removeLeftoverExclusions();
         // remove collection media entries for items deleted from media server
         await this.collectionsService.removeStaleCollectionMedia();
+        // Only prune orphaned collection rows against a reachable server. This
+        // drops the row without touching the media server (by design since
+        // f5826cc1), so running it during an outage can strand a collection
+        // whose delete had just failed. The guard was lost when the task moved
+        // to the media-server abstraction (174a5cb2).
+        await this.removeCollectionsWithoutRule();
       } else {
         this.logger.warn(
           'Skipping media server cleanup; media server was not reachable.',
         );
       }
 
-      await this.removeCollectionsWithoutRule();
       this.logger.log('Maintenance done');
     } catch (error) {
       this.logger.error('Rule Maintenance failed');
@@ -55,15 +60,22 @@ export class RuleMaintenanceService extends TaskBase {
   }
 
   private async removeLeftoverExclusions() {
-    // get all exclusions
     const exclusions = await this.rulesService.getAllExclusions();
     const mediaServer = await this.mediaServerFactory.getService();
-    // loop through exclusions
     for (const exclusion of exclusions) {
-      // check if media still exists
-      const resp = await mediaServer.getMetadata(exclusion.mediaServerId);
-      // remove when not
-      if (!resp?.id) {
+      // Only drop an exclusion when the media server *confirms* the item is
+      // gone. `itemExists` returns false solely on a 404/empty result and
+      // throws on an inconclusive check, unlike `getMetadata` which returns
+      // undefined for both absent and failed reads - a transient blip must
+      // not delete the protection an exclusion provides.
+      let exists = true;
+      try {
+        exists = await mediaServer.itemExists(exclusion.mediaServerId);
+      } catch (error) {
+        this.logger.debug(error);
+      }
+
+      if (!exists) {
         await this.rulesService.removeExclusion(exclusion.id);
       }
     }

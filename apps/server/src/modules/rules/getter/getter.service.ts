@@ -16,6 +16,7 @@ import { PlexGetterService } from './plex-getter.service';
 import { RadarrGetterService } from './radarr-getter.service';
 import { SeerrGetterService } from './seerr-getter.service';
 import { SonarrGetterService } from './sonarr-getter.service';
+import { SportarrGetterService } from './sportarr-getter.service';
 import { StreamystatsGetterService } from './streamystats-getter.service';
 import { TautulliGetterService } from './tautulli-getter.service';
 
@@ -25,6 +26,7 @@ export class ValueGetterService {
     private readonly plexGetter: PlexGetterService,
     private readonly radarrGetter: RadarrGetterService,
     private readonly sonarrGetter: SonarrGetterService,
+    private readonly sportarrGetter: SportarrGetterService,
     private readonly seerrGetter: SeerrGetterService,
     private readonly tautulliGetter: TautulliGetterService,
     private readonly streamystatsGetter: StreamystatsGetterService,
@@ -32,6 +34,15 @@ export class ValueGetterService {
     private readonly embyGetter: EmbyGetterService,
     private readonly mediaServerFactory: MediaServerFactory,
   ) {}
+
+  /**
+   * The media server every media-server rule value is actually read from.
+   * Exposed so callers that describe a value (rule statistics, missing-value
+   * diagnostics) can name the same property `get` resolved it against.
+   */
+  async getConfiguredServerType(): Promise<MediaServerType | null> {
+    return this.mediaServerFactory.getConfiguredServerType();
+  }
 
   async get(
     [val1, val2]: [number, number],
@@ -82,8 +93,23 @@ export class ValueGetterService {
           arrLookupCache,
         );
       }
+      case Application.SPORTARR: {
+        return await this.sportarrGetter.get(
+          val2,
+          libItem,
+          dataType,
+          ruleGroup,
+          currentRule,
+          arrLookupCache,
+        );
+      }
       case Application.SEERR: {
-        return await this.seerrGetter.get(val2, libItem, dataType);
+        return await this.seerrGetter.get(
+          val2,
+          libItem,
+          dataType,
+          arrLookupCache,
+        );
       }
       case Application.TAUTULLI: {
         return await this.tautulliGetter.get(

@@ -2,6 +2,7 @@ import {
   createMockLogger,
   createMockServarrTagService,
 } from '../../../test/utils/data';
+import { ServarrAction } from '../collections/interfaces/collection.interface';
 import { Application, RulePossibility } from './constants/rules.constants';
 import { RulesService } from './rules.service';
 
@@ -18,6 +19,7 @@ describe('RulesService.setRules', () => {
       settingsRepo: unknown;
       radarrSettingsRepo: unknown;
       sonarrSettingsRepo: unknown;
+      sportarrSettingsRepo: unknown;
       collectionService: unknown;
       mediaServerFactory: unknown;
       connection: unknown;
@@ -36,6 +38,7 @@ describe('RulesService.setRules', () => {
       (overrides.settingsRepo ?? {}) as any,
       (overrides.radarrSettingsRepo ?? {}) as any,
       (overrides.sonarrSettingsRepo ?? {}) as any,
+      (overrides.sportarrSettingsRepo ?? {}) as any,
       (overrides.collectionService ?? {}) as any,
       (overrides.mediaServerFactory ?? {}) as any,
       (overrides.connection ?? {}) as any,
@@ -58,13 +61,34 @@ describe('RulesService.setRules', () => {
     },
   ];
 
-  const createMediaServerFactory = () => ({
+  const createMediaServerFactory = (
+    libraries: unknown[] = [{ id: '1', title: 'Movies', type: 'movie' }],
+  ) => ({
     getService: jest.fn().mockReturnValue({
-      getLibraries: jest
-        .fn()
-        .mockResolvedValue([{ id: '1', title: 'Movies', type: 'movie' }]),
+      getLibraries: jest.fn().mockResolvedValue(libraries),
     }),
   });
+
+  const setRulesFor = (libraryId: unknown, libraries?: unknown[]) => {
+    const service = createRulesService({
+      collectionService: {
+        createCollection: jest
+          .fn()
+          .mockResolvedValue({ dbCollection: { id: 9 } }),
+      },
+      mediaServerFactory: createMediaServerFactory(libraries),
+    });
+
+    return service.setRules({
+      libraryId,
+      name: 'Library probe',
+      description: '',
+      useRules: true,
+      isActive: true,
+      rules: validRules,
+      collection: { keepLogsForMonths: 6 },
+    } as any);
+  };
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -100,6 +124,97 @@ describe('RulesService.setRules', () => {
       result: 'Success',
       message: 'Success',
     });
+  });
+
+  // The UI submits the leftover-folder cleanup opt-in on the rule-group payload,
+  // so setRules is the only path that can turn it on. It used to be missing from
+  // RulesDto and from the createCollection call, which silently dropped it.
+  it('persists the leftover-folder cleanup opt-in for an action that strands a folder', async () => {
+    const createCollection = jest
+      .fn()
+      .mockResolvedValue({ dbCollection: { id: 99 } });
+
+    const service = createRulesService({
+      rulesRepository: { save: jest.fn().mockResolvedValue(undefined) },
+      collectionService: { createCollection },
+      mediaServerFactory: createMediaServerFactory(),
+    });
+
+    jest.spyOn(service as any, 'createOrUpdateGroup').mockResolvedValue(7);
+
+    await service.setRules({
+      libraryId: '1',
+      name: 'Cleanup on',
+      description: '',
+      useRules: true,
+      isActive: true,
+      rules: validRules,
+      arrAction: ServarrAction.UNMONITOR_DELETE_ALL,
+      cleanupLeftoverFolders: true,
+    } as any);
+
+    expect(createCollection).toHaveBeenCalledWith(
+      expect.objectContaining({ cleanupLeftoverFolders: true }),
+    );
+  });
+
+  // Mirrors the forceSeerr clamp: the checkbox is hidden for an action that
+  // strands nothing, so a value left over from switching action after ticking it
+  // must not be stored - a filesystem delete may not end up enabled unseen.
+  it('clears the cleanup opt-in for an action that strands no folder', async () => {
+    const createCollection = jest
+      .fn()
+      .mockResolvedValue({ dbCollection: { id: 99 } });
+
+    const service = createRulesService({
+      rulesRepository: { save: jest.fn().mockResolvedValue(undefined) },
+      collectionService: { createCollection },
+      mediaServerFactory: createMediaServerFactory(),
+    });
+
+    jest.spyOn(service as any, 'createOrUpdateGroup').mockResolvedValue(7);
+
+    await service.setRules({
+      libraryId: '1',
+      name: 'Cleanup stale',
+      description: '',
+      useRules: true,
+      isActive: true,
+      rules: validRules,
+      // Radarr removes the movie folder itself on a whole-entity delete.
+      arrAction: ServarrAction.DELETE,
+      cleanupLeftoverFolders: true,
+    } as any);
+
+    expect(createCollection).toHaveBeenCalledWith(
+      expect.objectContaining({ cleanupLeftoverFolders: false }),
+    );
+  });
+
+  it('rejects a payload that binds both Sonarr and Sportarr', async () => {
+    // A show-library collection is managed by exactly one arr; the UI
+    // enforces this, so the guard exists for raw API payloads.
+    const createCollection = jest.fn();
+    const service = createRulesService({
+      collectionService: { createCollection },
+      mediaServerFactory: createMediaServerFactory(),
+    });
+
+    const result = await service.setRules({
+      libraryId: '1',
+      name: 'Both managers',
+      description: '',
+      useRules: true,
+      isActive: true,
+      rules: validRules,
+      collection: { keepLogsForMonths: 6 },
+      sonarrSettingsId: 1,
+      sportarrSettingsId: 2,
+    } as any);
+
+    expect(result.code).toBe(0);
+    expect(result.result).toContain('either Sonarr or Sportarr');
+    expect(createCollection).not.toHaveBeenCalled();
   });
 
   // Regression for #3044: an incomplete payload that omits the `collection`
@@ -140,9 +255,9 @@ describe('RulesService.setRules', () => {
 
   // Regression for #3044: when collection creation fails, setRules used to
   // `return undefined`, which NestJS serialized as a silent HTTP 201 with an
-  // empty body - indistinguishable from success to the client. It must now
-  // return a structured failure the UI can surface.
-  it('returns a structured failure (not undefined) when collection creation fails', async () => {
+  // empty body - indistinguishable from success to the client. A returned
+  // failure was still a 201, so it now answers with a status code (#3384).
+  it('fails with a server error when collection creation fails', async () => {
     const service = createRulesService({
       collectionService: {
         createCollection: jest
@@ -152,24 +267,48 @@ describe('RulesService.setRules', () => {
       mediaServerFactory: createMediaServerFactory(),
     });
 
-    const result = await service.setRules({
-      libraryId: '1',
-      name: 'Collection fails',
-      description: '',
-      useRules: true,
-      isActive: true,
-      rules: validRules,
-      collection: { keepLogsForMonths: 6 },
-    } as any);
-
-    expect(result).toEqual({
-      code: 0,
-      result: 'Failed to create collection',
+    await expect(
+      service.setRules({
+        libraryId: '1',
+        name: 'Collection fails',
+        description: '',
+        useRules: true,
+        isActive: true,
+        rules: validRules,
+        collection: { keepLogsForMonths: 6 },
+      } as any),
+    ).rejects.toMatchObject({
+      status: 500,
       message: 'Failed to create collection',
     });
   });
 
-  it('returns a structured failure (not undefined) when saving throws', async () => {
+  // A library the caller never named, or named wrongly, is a bad request - not
+  // the 500 a dereferenced library used to produce (#3384).
+  it.each([
+    ['no library', undefined],
+    ['an empty library', ''],
+  ])('rejects a rule group with %s', async (_name, libraryId) => {
+    await expect(setRulesFor(libraryId)).rejects.toMatchObject({
+      status: 400,
+      message: 'A library is required',
+    });
+  });
+
+  it('rejects a library the media server does not have', async () => {
+    await expect(setRulesFor('999')).rejects.toMatchObject({
+      status: 400,
+      message: 'Library 999 does not exist on the media server',
+    });
+  });
+
+  // Every getLibraries path answers [] when the media server is unreachable, so
+  // an empty list must not be read as "the caller named a bad library".
+  it('blames the media server, not the caller, when no library can be read', async () => {
+    await expect(setRulesFor('1', [])).rejects.toMatchObject({ status: 502 });
+  });
+
+  it('fails with a server error, and logs the cause, when saving throws', async () => {
     const service = createRulesService({
       collectionService: {
         createCollection: jest
@@ -179,20 +318,22 @@ describe('RulesService.setRules', () => {
       mediaServerFactory: createMediaServerFactory(),
     });
 
-    const result = await service.setRules({
-      libraryId: '1',
-      name: 'Throws',
-      description: '',
-      useRules: true,
-      isActive: true,
-      rules: validRules,
-      collection: { keepLogsForMonths: 6 },
-    } as any);
-
-    expect(result).toEqual({
-      code: 0,
-      result: 'Failed to save the rule group',
+    await expect(
+      service.setRules({
+        libraryId: '1',
+        name: 'Throws',
+        description: '',
+        useRules: true,
+        isActive: true,
+        rules: validRules,
+        collection: { keepLogsForMonths: 6 },
+      } as any),
+    ).rejects.toMatchObject({
+      status: 500,
       message: 'Failed to save the rule group',
     });
+    // Short reason at error, the stack behind debug.
+    expect(logger.error).toHaveBeenCalledWith('Failed to save the rule group');
+    expect(logger.debug).toHaveBeenCalledWith(expect.any(Error));
   });
 });

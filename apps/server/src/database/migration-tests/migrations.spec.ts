@@ -94,18 +94,61 @@ describe('database migrations', () => {
       await ds.runMigrations();
       const collection = byName(await columns(ds, 'collection'));
       const overlayItemState = byName(await columns(ds, 'overlay_item_state'));
+      const settings = byName(await columns(ds, 'settings'));
 
       // Must match the @Column definitions exactly; a hand-edited migration that
       // drifted (wrong type/default/nullability) would not.
       const bool = { type: 'boolean', notnull: 1, dflt_value: '0' };
       const nullableVarchar = { type: 'varchar', notnull: 0, dflt_value: null };
       const nullableInt = { type: 'INTEGER', notnull: 0, dflt_value: null };
+      const dnd = { type: 'varchar', notnull: 1, dflt_value: "'dnd'" };
       expect(collection.tagInArr).toMatchObject(bool);
       expect(collection.overlayLandscapeEnabled).toMatchObject(bool);
       expect(collection.overlayLandscapeTemplateId).toMatchObject(nullableInt);
       expect(overlayItemState.originalLandscapePosterPath).toMatchObject(
         nullableVarchar,
       );
+      expect(settings.radarr_tag_exclusions).toMatchObject(bool);
+      expect(settings.radarr_exclusion_tag).toMatchObject(dnd);
+      expect(settings.radarr_untag_on_unexclude).toMatchObject(bool);
+      expect(settings.sonarr_tag_exclusions).toMatchObject(bool);
+      expect(settings.sonarr_exclusion_tag).toMatchObject(dnd);
+      expect(settings.sonarr_untag_on_unexclude).toMatchObject(bool);
+
+      // AddCollectionMediaRuleRemoval: the rule-removal marker table columns.
+      const ruleRemoval = byName(
+        await columns(ds, 'collection_media_rule_removal'),
+      );
+      // SQLite upper-cases the `integer` storage-class keyword in PRAGMA,
+      // while non-storage-class types (varchar) stay as declared.
+      expect(ruleRemoval.collectionId).toMatchObject({
+        type: 'INTEGER',
+        notnull: 1,
+      });
+      expect(ruleRemoval.mediaServerId).toMatchObject({
+        type: 'varchar',
+        notnull: 1,
+      });
+
+      // AddSportarrSettings: the Sportarr connection columns.
+      expect(collection.sportarrSettingsId).toMatchObject(nullableInt);
+      expect(collection.sportarrQualityProfileId).toMatchObject(nullableInt);
+      const sportarrSettings = byName(await columns(ds, 'sportarr_settings'));
+      expect(sportarrSettings.serverName).toMatchObject({
+        type: 'varchar',
+        notnull: 1,
+      });
+      expect(sportarrSettings.url).toMatchObject({
+        type: 'varchar',
+        notnull: 0,
+      });
+      expect(sportarrSettings.apiKey).toMatchObject({
+        type: 'varchar',
+        notnull: 0,
+      });
+
+      // Column added by the newest migration (AddCollectionLeftoverCleanup).
+      expect(collection.cleanupLeftoverFolders).toMatchObject(bool);
     } finally {
       await ds.destroy();
     }
@@ -117,9 +160,9 @@ describe('database migrations', () => {
     // SQLite can't ALTER most columns in place, so `migration:generate` always
     // emits a full create-temporary-table / copy / drop / rename rebuild for the
     // changed tables. A hand-written ALTER shortcut lacks it - this is the
-    // cheapest signal the migration was generated rather than authored.
+    // cheapest signal the migration was generated rather than authored. The
+    // newest migration adds a `collection` column, so it rebuilds that table.
     expect(src).toContain('CREATE TABLE "temporary_collection"');
-    expect(src).toContain('CREATE TABLE "temporary_overlay_item_state"');
   });
 
   // We don't revert the whole chain: several pre-existing migrations have
@@ -132,7 +175,7 @@ describe('database migrations', () => {
       await ds.runMigrations();
       const has = async () =>
         (await columns(ds, 'collection')).some(
-          (c) => c.name === 'overlayLandscapeEnabled',
+          (c) => c.name === 'cleanupLeftoverFolders',
         );
       expect(await has()).toBe(true);
 

@@ -51,6 +51,11 @@ export class PlexGetterService {
     try {
       const prop = this.plexProperties.find((el) => el.id === id);
 
+      // Which library's prefetched watch-history snapshot may answer the reads
+      // below. Absent (a single-item rule test) means every watch read goes
+      // live rather than risk another library's snapshot.
+      const libraryId = ruleGroup?.libraryId;
+
       // fetch metadata, parent & grandparent from cache, this data is more complete
       // libItem.id maps to Plex's ratingKey
       const metadata: PlexMetadata = await this.plexApi.getMetadata(
@@ -93,6 +98,7 @@ export class PlexGetterService {
             metadata.ratingKey,
             true,
             metadata.type,
+            libraryId,
           );
           const viewerIds = viewers.map((el) => +el.accountID);
           return mapMatchingRuleUsersToNames(
@@ -123,8 +129,6 @@ export class PlexGetterService {
           const watchState = await this.plexAdapter.getWatchState(
             metadata.ratingKey,
             libItem.viewCount,
-            libItem.title,
-            metadata.type,
           );
           return watchState.viewCount;
         }
@@ -132,8 +136,6 @@ export class PlexGetterService {
           const watchState = await this.plexAdapter.getWatchState(
             metadata.ratingKey,
             libItem.viewCount,
-            libItem.title,
-            metadata.type,
           );
           return watchState.isWatched;
         }
@@ -260,16 +262,16 @@ export class PlexGetterService {
             metadata.ratingKey,
             true,
             metadata.type,
+            libraryId,
           );
-          if (seenby && seenby.length > 0) {
-            return new Date(
-              +seenby
-                .map((el) => el.viewedAt)
-                .sort()
-                .reverse()[0] * 1000,
-            );
-          }
-          return null;
+          // Marking something played by hand, or a scrobble from an external
+          // tracker, moves the item's own lastViewedAt without writing a
+          // history row - so start from that and let any newer view win.
+          const newest = (seenby ?? []).reduce(
+            (latest, el) => Math.max(latest, el.viewedAt * 1000),
+            libItem.lastViewedAt?.getTime() ?? 0,
+          );
+          return newest > 0 ? new Date(newest) : null;
         }
         case 'fileVideoResolution': {
           return metadata.Media[0].videoResolution
@@ -313,6 +315,7 @@ export class PlexGetterService {
                 episode.ratingKey,
                 true,
                 'episode',
+                libraryId,
               );
 
               const arrLength = allViewers.length - 1;
@@ -353,6 +356,7 @@ export class PlexGetterService {
             metadata.ratingKey,
             true,
             metadata.type,
+            libraryId,
           );
 
           const viewers = watchHistory
@@ -375,6 +379,7 @@ export class PlexGetterService {
             metadata.ratingKey,
             true,
             metadata.type,
+            libraryId,
           );
           // getWatchHistory returns [] for a confirmed-empty history (it throws
           // on a real outage). [] is truthy and the sort/filter below index
@@ -415,6 +420,7 @@ export class PlexGetterService {
                 episode.ratingKey,
                 true,
                 'episode',
+                libraryId,
               );
               if (views?.length > 0) {
                 viewCount++;
@@ -439,6 +445,7 @@ export class PlexGetterService {
               metadata.ratingKey,
               true,
               metadata.type,
+              libraryId,
             );
             viewCount =
               views?.length > 0 ? viewCount + views.length : viewCount;
@@ -457,6 +464,7 @@ export class PlexGetterService {
                   episode.ratingKey,
                   true,
                   'episode',
+                  libraryId,
                 );
                 viewCount =
                   views?.length > 0 ? viewCount + views.length : viewCount;
@@ -516,8 +524,10 @@ export class PlexGetterService {
           const plexUsers: SimplePlexUser[] =
             await this.plexApi.getCorrectedUsers();
 
-          // When plex.tv is unreachable, no users will have UUIDs.
-          // Return null to skip the rule rather than falsely report an empty watchlist.
+          // When plex.tv is unreachable, no users will have UUIDs. This is a
+          // transient transport failure, so return `undefined` - `null` would
+          // read as "confirmed absent" and let the executor remove protected
+          // items (#3307).
           if (
             plexUsers.length > 0 &&
             !plexUsers.some((u) => u.uuid !== undefined)
@@ -525,7 +535,7 @@ export class PlexGetterService {
             this.logger.warn(
               'Unable to check watchlists: no user UUIDs available (plex.tv may be unreachable)',
             );
-            return null;
+            return undefined;
           }
 
           const usernames: string[] = [];
@@ -536,7 +546,12 @@ export class PlexGetterService {
               u.uuid,
               u.username,
             );
-            if (watchlist?.find((i) => i.id === media_uuid[1]) !== undefined) {
+            // A failed fetch would silently understate the list, so surface
+            // it as transient instead of a confirmed answer.
+            if (watchlist === undefined) {
+              return undefined;
+            }
+            if (watchlist.find((i) => i.id === media_uuid[1]) !== undefined) {
               usernames.push(u.username);
             }
           }
@@ -556,8 +571,10 @@ export class PlexGetterService {
           const plexUsers: SimplePlexUser[] =
             await this.plexApi.getCorrectedUsers();
 
-          // When plex.tv is unreachable, no users will have UUIDs.
-          // Return null to skip the rule rather than falsely report an empty watchlist.
+          // When plex.tv is unreachable, no users will have UUIDs. This is a
+          // transient transport failure, so return `undefined` - `null` would
+          // read as "confirmed absent" and let the executor remove protected
+          // items (#3307).
           if (
             plexUsers.length > 0 &&
             !plexUsers.some((u) => u.uuid !== undefined)
@@ -565,7 +582,7 @@ export class PlexGetterService {
             this.logger.warn(
               'Unable to check watchlists: no user UUIDs available (plex.tv may be unreachable)',
             );
-            return null;
+            return undefined;
           }
 
           for (const u of plexUsers.filter(
@@ -575,7 +592,12 @@ export class PlexGetterService {
               u.uuid,
               u.username,
             );
-            if (watchlist?.find((i) => i.id === media_uuid[1]) !== undefined) {
+            // A failed fetch cannot confirm "not watchlisted", so surface it
+            // as transient instead of a false negative.
+            if (watchlist === undefined) {
+              return undefined;
+            }
+            if (watchlist.find((i) => i.id === media_uuid[1]) !== undefined) {
               return true;
             }
           }
@@ -856,6 +878,7 @@ export class PlexGetterService {
                 child.ratingKey,
                 true,
                 child.type,
+                libraryId,
               );
               for (const entry of history) {
                 if (entry.viewedAt && +entry.viewedAt > latest) {

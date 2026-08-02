@@ -40,6 +40,8 @@ describe('CollectionsController', () => {
     getCollectionRecord: jest.fn(),
     getCollectionMediaRecord: jest.fn(),
     MediaCollectionActionWithContext: jest.fn(),
+    postponeCollectionMedia: jest.fn(),
+    logPostponedCollectionMedia: jest.fn(),
   } as unknown as jest.Mocked<CollectionsService>;
 
   const collectionWorkerService = {
@@ -53,6 +55,7 @@ describe('CollectionsController', () => {
 
   const executionLock = {
     tryAcquire: jest.fn(),
+    acquireWithin: jest.fn(),
   } as unknown as jest.Mocked<ExecutionLockService>;
 
   const collectionHandler = {
@@ -205,7 +208,7 @@ describe('CollectionsController', () => {
         action: 0,
       },
     ],
-  ])('rejects invalid %s payloads', (_name, schema, payload) => {
+  ])('rejects invalid %s payloads', (name, schema, payload) => {
     const pipe = new ZodValidationPipe(schema);
 
     expect(() =>
@@ -218,9 +221,11 @@ describe('CollectionsController', () => {
   });
 
   it('allows manual removal actions without a collection id', async () => {
-    collectionsService.MediaCollectionActionWithContext.mockResolvedValue(
-      createCollection(),
-    );
+    collectionsService.MediaCollectionActionWithContext.mockResolvedValue({
+      collection: createCollection(),
+      serverRejectedIds: [],
+      resolvedCount: 1,
+    });
 
     await controller.ManualActionOnCollection({
       mediaId: '10',
@@ -242,6 +247,54 @@ describe('CollectionsController', () => {
       { mediaServerId: '10' },
       'remove',
     );
+  });
+
+  // A rejected add used to answer 201, so the modal closed as though it had
+  // worked and the 400 only appeared in the debug log (#3381).
+  describe('manual add failures', () => {
+    const addRequest = {
+      mediaId: '10',
+      context: { id: '10', type: 'show' as const },
+      collectionId: 7,
+      action: 0 as const,
+    };
+
+    it('reports the items the media server refused', async () => {
+      collectionsService.MediaCollectionActionWithContext.mockResolvedValue({
+        collection: createCollection(),
+        serverRejectedIds: ['10'],
+        resolvedCount: 1,
+      });
+
+      await expect(
+        controller.ManualActionOnCollection(addRequest),
+      ).rejects.toThrow('refused 1 of 1');
+    });
+
+    it('reports a context that resolves to nothing', async () => {
+      collectionsService.MediaCollectionActionWithContext.mockResolvedValue({
+        collection: createCollection(),
+        serverRejectedIds: [],
+        resolvedCount: 0,
+      });
+
+      await expect(
+        controller.ManualActionOnCollection(addRequest),
+      ).rejects.toThrow('cannot be applied');
+    });
+
+    it('returns the collection when every item lands', async () => {
+      const collection = createCollection();
+      collectionsService.MediaCollectionActionWithContext.mockResolvedValue({
+        collection,
+        serverRejectedIds: [],
+        resolvedCount: 1,
+      });
+
+      await expect(
+        controller.ManualActionOnCollection(addRequest),
+      ).resolves.toBe(collection);
+    });
   });
 
   it('accepts a hex-GUID context.id for manual season/episode actions (Jellyfin/Emby, #3185)', () => {
@@ -407,6 +460,81 @@ describe('CollectionsController', () => {
         mediaId: media.mediaServerId,
       }),
     ).resolves.not.toThrow();
+  });
+
+  describe('postponeCollectionMedia', () => {
+    const body = { collectionId: 3, mediaId: '5', days: 14 };
+
+    it('postpones under the execution lock and returns the result', async () => {
+      const release = jest.fn();
+      executionLock.acquireWithin.mockResolvedValue(release);
+      const result = {
+        collectionId: 3,
+        mediaServerId: '5',
+        addDate: new Date(2026, 6, 8),
+        deleteAfterDays: 30,
+        deletionDate: new Date(2026, 7, 7),
+      };
+      (
+        collectionsService.postponeCollectionMedia as jest.Mock
+      ).mockResolvedValue(result);
+
+      await expect(controller.postponeCollectionMedia(body)).resolves.toBe(
+        result,
+      );
+      expect(collectionsService.postponeCollectionMedia).toHaveBeenCalledWith(
+        3,
+        '5',
+        14,
+      );
+      expect(release).toHaveBeenCalled();
+    });
+
+    it('logs the postpone only after the lock is released', async () => {
+      const releaseOrder: string[] = [];
+      const release = jest.fn(() => releaseOrder.push('release'));
+      executionLock.acquireWithin.mockResolvedValue(release);
+      (
+        collectionsService.postponeCollectionMedia as jest.Mock
+      ).mockResolvedValue({ collectionId: 3, mediaServerId: '5' });
+      (
+        collectionsService.logPostponedCollectionMedia as jest.Mock
+      ).mockImplementation(async () => {
+        releaseOrder.push('log');
+      });
+
+      await controller.postponeCollectionMedia(body);
+
+      expect(releaseOrder).toEqual(['release', 'log']);
+      expect(
+        collectionsService.logPostponedCollectionMedia,
+      ).toHaveBeenCalledWith(3, '5', 14);
+    });
+
+    it('throws ConflictException when the execution lock stays held', async () => {
+      executionLock.acquireWithin.mockResolvedValue(null);
+
+      await expect(controller.postponeCollectionMedia(body)).rejects.toThrow(
+        ConflictException,
+      );
+      expect(collectionsService.postponeCollectionMedia).not.toHaveBeenCalled();
+    });
+
+    it('throws NotFoundException and releases the lock when the item is missing', async () => {
+      const release = jest.fn();
+      executionLock.acquireWithin.mockResolvedValue(release);
+      (
+        collectionsService.postponeCollectionMedia as jest.Mock
+      ).mockResolvedValue(undefined);
+
+      await expect(controller.postponeCollectionMedia(body)).rejects.toThrow(
+        NotFoundException,
+      );
+      expect(release).toHaveBeenCalled();
+      expect(
+        collectionsService.logPostponedCollectionMedia,
+      ).not.toHaveBeenCalled();
+    });
   });
 
   describe('uploadCollectionPoster', () => {

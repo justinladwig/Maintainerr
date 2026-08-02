@@ -1,17 +1,22 @@
 import {
   MediaItem,
   ServarrAction,
+  SPORTARR_TVDB_ALIAS_LEAGUE_OFFSET,
+  SPORTARR_TVDB_ALIAS_RANGE,
   type MaintainerrMediaStatusDetails,
   type MaintainerrMediaStatusEntry,
+  type MediaItemType,
   type MediaProviderIds,
 } from '@maintainerr/contracts'
 import React, { memo, useEffect, useMemo, useState } from 'react'
+import { useMetadataOverview } from '../../../../api/metadata'
 import { useLockBodyScroll } from '../../../../hooks/useLockBodyScroll'
 import { useMediaServerType } from '../../../../hooks/useMediaServerType'
 import GetApiHandler from '../../../../utils/ApiHandler'
 import { logClientError } from '../../../../utils/ClientLogger'
 import {
-  buildMetadataImagePath,
+  buildMetadataPath,
+  mediaTypeLabel,
   toApiMediaType,
 } from '../../../../utils/mediaTypeUtils'
 import Button from '../../Button'
@@ -24,6 +29,7 @@ import {
   rememberMaintainerrStatusDetails,
 } from '../maintainerrStatus'
 import type { ICollection } from '../../../Collection'
+import PostponeButton from '../../../Collection/CollectionDetail/PostponeButton'
 import TriggerRuleButton from '../../../Collection/CollectionDetail/TriggerRuleActionButton'
 
 interface ModalContentProps {
@@ -31,8 +37,10 @@ interface ModalContentProps {
   id: number | string
   summary?: string
   year?: string
-  mediaType: 'movie' | 'show' | 'season' | 'episode'
+  mediaType: MediaItemType
   title: string
+  seasonNumber?: number
+  episodeNumber?: number
   providerIds?: MediaProviderIds
   exclusionType?: 'global' | 'specific'
   collection?: ICollection
@@ -40,6 +48,7 @@ interface ModalContentProps {
   forceStatusLoad?: boolean
   onStatusLink?: (targetPath: string) => void
   onCollectionItemRemoved?: () => void
+  onCollectionItemPostponed?: (addDate: string) => void
 }
 
 const mergeProviderIds = (
@@ -141,6 +150,8 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
     summary,
     year,
     title,
+    seasonNumber,
+    episodeNumber,
     providerIds: fallbackProviderIds,
     exclusionType,
     collection,
@@ -148,6 +159,7 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
     forceStatusLoad = false,
     onStatusLink,
     onCollectionItemRemoved,
+    onCollectionItemPostponed,
   }) => {
     useLockBodyScroll(true)
 
@@ -215,6 +227,14 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
       collection.arrAction !== ServarrAction.DO_NOTHING &&
       !isManual &&
       exclusionType == null
+    // Postpone only makes sense when the item is actually on a deletion
+    // countdown: the collection has a grace period and an action to run, and the
+    // item isn't excluded from it.
+    const canPostpone =
+      collection != null &&
+      collection.deleteAfterDays != null &&
+      collection.arrAction !== ServarrAction.DO_NOTHING &&
+      exclusionType == null
     const providerIds = useMemo(
       () => mergeProviderIds(metadata?.providerIds, fallbackProviderIds),
       [metadata?.providerIds, fallbackProviderIds],
@@ -238,7 +258,7 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
       return season != null ? `${base}?season=${season}` : base
     }, [seerrConfigured, providerIds, metadata])
 
-    const backdropRequestPath = buildMetadataImagePath(
+    const backdropRequestPath = buildMetadataPath(
       'backdrop',
       mediaType,
       providerIds,
@@ -246,6 +266,22 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
     )
     const isCurrentBackdrop = backdropResult.requestKey === backdropRequestPath
     const resolvedBackdrop = isCurrentBackdrop ? backdropResult.url : null
+    const mediaServerSummary = metadata?.summary || summary
+    // Media servers rarely fill in a season description, so ask the metadata
+    // provider for one instead of leaving the season with no text at all.
+    const overviewRequestPath =
+      loading || mediaServerSummary
+        ? undefined
+        : buildMetadataPath('overview', mediaType, providerIds, id)
+    const { data: providerOverview, isPending: overviewRequestPending } =
+      useMetadataOverview(overviewRequestPath)
+    const isOverviewPending = !!overviewRequestPath && overviewRequestPending
+    // Nothing rather than a placeholder while a description is still in flight,
+    // so the text does not swap out from under the reader.
+    const summaryText =
+      mediaServerSummary ||
+      providerOverview ||
+      (loading || isOverviewPending ? '' : 'No summary available.')
     const providerLogo = useMemo(() => {
       if (!isCurrentBackdrop || !backdropResult.provider) return null
       const cfg = metadataProviderLogos[backdropResult.provider]
@@ -254,6 +290,17 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
         backdropResult.providerId?.toString() ??
         providerIds?.[cfg.providerIdKey]?.[0]
       if (!linkId) return null
+      // Sportarr stamps numeric aliases in the tvdb namespace on its items;
+      // no real TVDB page exists for those, so don't render a dead link.
+      if (cfg.providerIdKey === 'tvdb') {
+        const numericId = Number(linkId)
+        if (
+          numericId >= SPORTARR_TVDB_ALIAS_LEAGUE_OFFSET &&
+          numericId <
+            SPORTARR_TVDB_ALIAS_LEAGUE_OFFSET + SPORTARR_TVDB_ALIAS_RANGE
+        )
+          return null
+      }
       return { ...cfg, linkId }
     }, [isCurrentBackdrop, backdropResult, providerIds])
 
@@ -525,7 +572,7 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
                             : 'bg-rose-900/70'
                     }`}
                   >
-                    {mediaType}
+                    {mediaTypeLabel(mediaType, { seasonNumber, episodeNumber })}
                   </div>
                   {metadata?.contentRating && (
                     <div className="pointer-events-none mt-1 rounded-lg bg-black/70 p-2 text-xs font-medium text-zinc-200 uppercase">
@@ -701,7 +748,7 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
             </div>
 
             <div className="mt-2 text-gray-300">
-              <p>{metadata?.summary || summary || 'No summary available.'}</p>
+              <p>{summaryText}</p>
             </div>
 
             {requestedBy.length > 0 ? (
@@ -823,6 +870,13 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
                   </div>
                 )}
               <div className="ml-auto flex space-x-3">
+                {canPostpone ? (
+                  <PostponeButton
+                    collection={collection}
+                    mediaServerId={id}
+                    onPostponed={onCollectionItemPostponed}
+                  />
+                ) : null}
                 {canTriggerRuleAction ? (
                   <TriggerRuleButton
                     collection={collection}

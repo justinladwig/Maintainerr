@@ -2,7 +2,7 @@ import type {
   CollectionPosterDeleteResponse,
   CollectionPosterUploadResponse,
 } from '@maintainerr/contracts'
-import { useQuery, UseQueryOptions } from '@tanstack/react-query'
+import { QueryClient, useQuery, UseQueryOptions } from '@tanstack/react-query'
 import type { ICollection } from '../components/Collection'
 import GetApiHandler, {
   API_BASE_PATH,
@@ -62,6 +62,42 @@ export const triggerCollectionItemAction = async (
     collectionId,
     mediaId: String(mediaId),
   })
+}
+
+export interface PostponeCollectionItemResponse {
+  collectionId: number
+  mediaServerId: string
+  addDate: string
+  deleteAfterDays: number | null
+  deletionDate: string | null
+}
+
+export const postponeCollectionItem = async (
+  collectionId: number,
+  mediaId: string | number,
+  days: number,
+) => {
+  return await PostApiHandler<PostponeCollectionItemResponse>(
+    '/collections/media/postpone',
+    {
+      collectionId,
+      mediaId: String(mediaId),
+      days,
+    },
+  )
+}
+
+// Refresh every view whose data depends on collection membership or deletion
+// timing after an item-level action (handle, postpone, ...).
+export const invalidateCollectionQueries = async (queryClient: QueryClient) => {
+  // Invalidation prefix-matches from the start of a key, so these two cover
+  // every collection-derived query: ['collections', 'overlay-data'] (what the
+  // calendar renders) sits under the first, and the calendar's own
+  // ['calendar', 'details', ...] under the second.
+  await Promise.all([
+    queryClient.invalidateQueries({ queryKey: ['collections'] }),
+    queryClient.invalidateQueries({ queryKey: ['calendar'] }),
+  ])
 }
 
 // ── Custom collection poster ───────────────────────────────────────────────

@@ -11,6 +11,7 @@ import {
   MaintainerrLogger,
   MaintainerrLoggerFactory,
 } from '../../logging/logs.service';
+import { createPrefetchProgressReporter } from '../../../utils/prefetch-progress';
 import cacheManager from '../lib/cache';
 import {
   SEERR_REQUESTS_CACHE_ID,
@@ -341,6 +342,15 @@ export class SeerrApiService {
       let skip = 0;
 
       const requests: SeerrRequest[] = [];
+      // Bracket the sweep like the media-server ones do: with only the decile
+      // lines, a sweep that fits in one page said nothing at all, and a slow
+      // one had no line to attribute the wait to.
+      this.logger.log('Prefetching Seerr requests...');
+      const reportProgress = createPrefetchProgressReporter(
+        (message) => this.logger.log(message),
+        'Prefetching Seerr requests',
+        'requests',
+      );
 
       while (hasNext) {
         // Seerr has no `added` sort value (only `modified` → request.updatedAt;
@@ -359,6 +369,7 @@ export class SeerrApiService {
         }
 
         requests.push(...(resp.results ?? []));
+        reportProgress(requests.length, resp.pageInfo.results);
 
         if (resp.pageInfo.page < resp.pageInfo.pages) {
           skip = skip + size;
@@ -366,6 +377,9 @@ export class SeerrApiService {
           hasNext = false;
         }
       }
+      // The completion line belongs to buildRequestIndex, this method's only
+      // caller: it reports the same sweep plus the title count, so logging it
+      // here too reads as two prefetches.
       return requests;
     } catch (error) {
       this.logger.warn(

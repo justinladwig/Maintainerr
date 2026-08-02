@@ -429,13 +429,25 @@ describe('PlexAdapterService', () => {
       await service.getLibraryContents('1', { offset: 0, limit: 50 });
       expect(plexApi.getLibraryContents).toHaveBeenCalled();
     });
+
+    it('propagates page read failures so callers never mistake a failed read for an empty library', async () => {
+      plexApi.getLibraryContents.mockRejectedValue(new Error('boom'));
+
+      await expect(
+        service.getLibraryContents('1', { offset: 0, limit: 50 }),
+      ).rejects.toThrow('boom');
+    });
   });
 
   describe('prefetchWatchHistory', () => {
     it('delegates to plexApi.prefetchWatchHistory', async () => {
       plexApi.prefetchWatchHistory = jest.fn().mockResolvedValue(undefined);
-      await service.prefetchWatchHistory();
-      expect(plexApi.prefetchWatchHistory).toHaveBeenCalledTimes(1);
+      const abortSignal = new AbortController().signal;
+      await service.prefetchWatchHistory({ libraryId: '7', abortSignal });
+      expect(plexApi.prefetchWatchHistory).toHaveBeenCalledWith(
+        '7',
+        abortSignal,
+      );
     });
   });
 
@@ -479,38 +491,51 @@ describe('PlexAdapterService', () => {
         viewCount: 1,
         isWatched: true,
       });
-      expect(plexApi.getWatchHistory).toHaveBeenCalledWith(
-        'item123',
-        false,
-        undefined,
-      );
+      // Never served from the run snapshot (#3352): this is the current-state
+      // read that feeds deletions.
+      expect(plexApi.getWatchHistory).toHaveBeenCalledWith('item123', false);
     });
 
-    it('should return unwatched state when history is empty', async () => {
+    it('keeps the native view count as a floor when history is empty', async () => {
+      // Plex writes no history row for a manual "mark as played" or a scrobble.
       plexApi.getWatchHistory.mockResolvedValue([]);
 
-      const watchState = await service.getWatchState('item123');
+      const watchState = await service.getWatchState('item123', 3);
 
-      expect(watchState).toEqual({
-        viewCount: 0,
-        isWatched: false,
-      });
-      expect(plexApi.getWatchHistory).toHaveBeenCalledWith(
-        'item123',
-        false,
-        undefined,
-      );
+      expect(watchState).toEqual({ viewCount: 3, isWatched: true });
     });
 
-    it('should fall back to nativeViewCount for isWatched when history is empty', async () => {
+    it('should keep the server-wide history count when a single account has fewer native views', async () => {
+      plexApi.getWatchHistory.mockResolvedValue([
+        createPlexSeenBy(),
+        createPlexSeenBy(),
+      ]);
+
+      const watchState = await service.getWatchState('item123', 1);
+
+      expect(watchState).toEqual({
+        viewCount: 2,
+        isWatched: true,
+      });
+    });
+
+    it('should count native views that left no history row', async () => {
       plexApi.getWatchHistory.mockResolvedValue([]);
 
       const watchState = await service.getWatchState('item123', 2);
 
       expect(watchState).toEqual({
-        viewCount: 0,
+        viewCount: 2,
         isWatched: true,
       });
+    });
+
+    it('should propagate a failed history read instead of reporting never watched', async () => {
+      plexApi.getWatchHistory.mockRejectedValue(new Error('Plex unreachable'));
+
+      await expect(service.getWatchState('item123', 0)).rejects.toThrow(
+        'Plex unreachable',
+      );
     });
 
     it('should not mark as watched when nativeViewCount is 0 and history is empty', async () => {
@@ -526,10 +551,33 @@ describe('PlexAdapterService', () => {
   });
 
   describe('getCollections', () => {
-    it('should return empty array when PlexApiService returns undefined', async () => {
-      plexApi.getCollections.mockResolvedValue(undefined);
-      const collections = await service.getCollections('lib123');
-      expect(collections).toEqual([]);
+    // #3344: [] is reserved for a confirmed-empty library. A failed
+    // enumeration must reach the caller, or the link lookup reads it as
+    // "no collection with that title" and creates a duplicate.
+    it('should propagate an enumeration failure', async () => {
+      const failure = new Error('Plex unreachable');
+      plexApi.getCollections.mockRejectedValue(failure);
+
+      await expect(service.getCollections('lib123')).rejects.toBe(failure);
+    });
+
+    // #3344: existence decisions must read live; per-item rule reads stay cached.
+    it('should forward the cache preference', async () => {
+      plexApi.getCollections.mockResolvedValue([]);
+
+      await service.getCollections('lib123');
+      expect(plexApi.getCollections).toHaveBeenCalledWith(
+        'lib123',
+        undefined,
+        true,
+      );
+
+      await service.getCollections('lib123', false);
+      expect(plexApi.getCollections).toHaveBeenLastCalledWith(
+        'lib123',
+        undefined,
+        false,
+      );
     });
   });
 
@@ -726,9 +774,73 @@ describe('PlexAdapterService', () => {
     });
 
     it('should delegate deleteCollection to PlexApiService', async () => {
-      plexApi.deleteCollection.mockResolvedValue(undefined);
+      plexApi.deleteCollection.mockResolvedValue({
+        status: 'OK',
+        code: 1,
+        message: 'Success',
+      });
       await service.deleteCollection('col123');
       expect(plexApi.deleteCollection).toHaveBeenCalledWith('col123');
+    });
+
+    // #3344: plexApi reports a refused delete as NOK instead of throwing.
+    // Resolving anyway told callers the collection was gone, so they dropped
+    // the link and left a live Plex collection behind for good.
+    it('should throw when Plex refuses the delete and the collection survives', async () => {
+      plexApi.deleteCollection.mockResolvedValue({
+        status: 'NOK',
+        code: 0,
+        message: 'Plex Server denied request',
+      });
+      plexApi.getCollection.mockResolvedValue(
+        createPlexCollection({ ratingKey: 'col123', title: 'Still here' }),
+      );
+
+      await expect(service.deleteCollection('col123')).rejects.toThrow(
+        'Plex Server denied request',
+      );
+    });
+
+    it('should succeed when the delete failed because the collection is already gone', async () => {
+      plexApi.deleteCollection.mockResolvedValue({
+        status: 'NOK',
+        code: 0,
+        message: 'not found',
+      });
+      plexApi.getCollection.mockResolvedValue(undefined);
+
+      await expect(service.deleteCollection('col123')).resolves.toBeUndefined();
+    });
+
+    // Existence unknown must not read as "already gone", or an unreachable
+    // server would silently swallow the failure again.
+    it('should throw when the delete failed and existence cannot be verified', async () => {
+      plexApi.deleteCollection.mockResolvedValue({
+        status: 'NOK',
+        code: 0,
+        message: 'Plex unreachable',
+      });
+      plexApi.getCollection.mockRejectedValue(new Error('Plex unreachable'));
+
+      await expect(service.deleteCollection('col123')).rejects.toThrow(
+        'Plex unreachable',
+      );
+    });
+
+    it('should delete an automatic collection on library cleanup', async () => {
+      plexApi.deleteCollection.mockResolvedValue(undefined);
+
+      await service.cleanupCollectionForLibrary('col123', 'lib1', false);
+
+      expect(plexApi.deleteCollection).toHaveBeenCalledWith('col123');
+    });
+
+    // A manual collection belongs to the user; moving the rule group off it
+    // must not destroy it, matching Jellyfin/Emby and the interface contract.
+    it('should leave a manual collection standing on library cleanup', async () => {
+      await service.cleanupCollectionForLibrary('col123', 'lib1', true);
+
+      expect(plexApi.deleteCollection).not.toHaveBeenCalled();
     });
 
     it('should delegate setCollectionImage to PlexApiService.setThumb', async () => {
@@ -788,7 +900,7 @@ describe('PlexAdapterService', () => {
         message: 'batch failed',
       } as any);
       plexApi.addChildToCollection.mockImplementation(
-        async (_collectionId, itemId) => {
+        async (collectionId, itemId) => {
           if (itemId === 'bad') {
             throw new Error('boom');
           }
@@ -833,13 +945,23 @@ describe('PlexAdapterService', () => {
 
     it('should treat 404 removes as successful in batch remove', async () => {
       plexApi.deleteChildFromCollection.mockImplementation(
-        async (_collectionId, itemId) => {
+        async (collectionId, itemId) => {
           if (itemId === 'missing') {
-            throw new Error('404 Not Found');
+            throw new Error(
+              'DELETE /library/collections/col123/items/missing failed with exception: response code: 404',
+            );
           }
 
           if (itemId === 'bad') {
             throw new Error('boom');
+          }
+
+          // A ratingKey can contain 404 without the request having 404'd, and
+          // the failure message carries the request URL.
+          if (itemId === '1404') {
+            throw new Error(
+              'DELETE /library/collections/col123/items/1404 failed with exception: response code: 500',
+            );
           }
 
           return { status: 'OK' } as any;
@@ -847,8 +969,13 @@ describe('PlexAdapterService', () => {
       );
 
       await expect(
-        service.removeBatchFromCollection('col123', ['good', 'missing', 'bad']),
-      ).resolves.toEqual(['bad']);
+        service.removeBatchFromCollection('col123', [
+          'good',
+          'missing',
+          'bad',
+          '1404',
+        ]),
+      ).resolves.toEqual(['bad', '1404']);
     });
 
     it('should default optional visibility flags to false', async () => {
@@ -931,7 +1058,7 @@ describe('PlexAdapterService', () => {
       ]);
       plexApi.setCollectionCustomSort.mockResolvedValue(undefined);
       plexApi.moveCollectionItem.mockImplementation(
-        async (_collectionId, itemId) => {
+        async (collectionId, itemId) => {
           if (itemId === 'b') {
             throw new Error('plex move 409');
           }

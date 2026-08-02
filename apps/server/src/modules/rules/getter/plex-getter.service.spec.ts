@@ -174,15 +174,17 @@ describe('PlexGetterService', () => {
         isWatched: true,
       });
 
-      const result = await service.get(VIEWCOUNT_PROP_ID, libItem);
+      const result = await service.get(
+        VIEWCOUNT_PROP_ID,
+        libItem,
+        'movie',
+        createRulesDto({ dataType: 'movie' }),
+      );
 
       expect(result).toBe(7);
-      expect(plexAdapter.getWatchState).toHaveBeenCalledWith(
-        '12345',
-        0,
-        libItem.title,
-        'movie',
-      );
+      // Watch state is never served from the run snapshot (#3352) - it is the
+      // current-state read that feeds deletions.
+      expect(plexAdapter.getWatchState).toHaveBeenCalledWith('12345', 0);
     });
 
     it('should return the adapter watched state for the isWatched rule', async () => {
@@ -191,15 +193,15 @@ describe('PlexGetterService', () => {
         isWatched: false,
       });
 
-      const result = await service.get(ISWATCHED_PROP_ID, libItem);
+      const result = await service.get(
+        ISWATCHED_PROP_ID,
+        libItem,
+        'movie',
+        createRulesDto({ dataType: 'movie' }),
+      );
 
       expect(result).toBe(false);
-      expect(plexAdapter.getWatchState).toHaveBeenCalledWith(
-        '12345',
-        0,
-        libItem.title,
-        'movie',
-      );
+      expect(plexAdapter.getWatchState).toHaveBeenCalledWith('12345', 0);
     });
   });
 
@@ -278,6 +280,40 @@ describe('PlexGetterService', () => {
       });
     });
 
+    it('returns the item lastViewedAt when no history row records that view (id 7)', async () => {
+      const lastViewedAt = new Date(1_730_000_000 * 1000);
+      plexApi.getMetadata.mockResolvedValue(makeMetadata());
+      plexApi.getWatchHistory.mockResolvedValue([]);
+
+      const result = await service.get(
+        7,
+        createMediaItem({ type: 'movie', lastViewedAt }),
+        'movie',
+        createRulesDto({ dataType: 'movie' }),
+      );
+
+      expect(result).toEqual(lastViewedAt);
+    });
+
+    it('prefers a newer history date over the item lastViewedAt (id 7)', async () => {
+      plexApi.getMetadata.mockResolvedValue(makeMetadata());
+      plexApi.getWatchHistory.mockResolvedValue([
+        makeWatchEntry({ viewedAt: 1_740_000_000 }),
+      ]);
+
+      const result = await service.get(
+        7,
+        createMediaItem({
+          type: 'movie',
+          lastViewedAt: new Date(1_730_000_000 * 1000),
+        }),
+        'movie',
+        createRulesDto({ dataType: 'movie' }),
+      );
+
+      expect(result).toEqual(new Date(1_740_000_000 * 1000));
+    });
+
     it('returns the newest direct watch-history date for lastViewedAt (id 7)', async () => {
       plexApi.getMetadata.mockResolvedValue(makeMetadata());
       plexApi.getWatchHistory.mockResolvedValue([
@@ -286,11 +322,12 @@ describe('PlexGetterService', () => {
         makeWatchEntry({ viewedAt: 1_710_000_000 }),
       ]);
 
+      const ruleGroup = createRulesDto({ dataType: 'movie' });
       const result = await service.get(
         7,
         createMediaItem({ type: 'movie' }),
         'movie',
-        createRulesDto({ dataType: 'movie' }),
+        ruleGroup,
       );
 
       expect(result).toEqual(new Date(1_720_000_000 * 1000));
@@ -298,6 +335,7 @@ describe('PlexGetterService', () => {
         '12345',
         true,
         'movie',
+        ruleGroup.libraryId,
       );
     });
 
@@ -445,11 +483,12 @@ describe('PlexGetterService', () => {
         }),
       ]);
 
+      const ruleGroup = createRulesDto({ dataType: 'show' });
       const result = await service.get(
         13,
         createMediaItem({ type: 'show' }),
         'show',
-        createRulesDto({ dataType: 'show' }),
+        ruleGroup,
       );
 
       expect(result).toEqual(new Date(1_710_000_000 * 1000));
@@ -457,6 +496,7 @@ describe('PlexGetterService', () => {
         'show-1',
         true,
         'show',
+        ruleGroup.libraryId,
       );
     });
 
@@ -590,11 +630,12 @@ describe('PlexGetterService', () => {
         makeWatchEntry({ accountID: 1 }),
       ]);
 
+      const ruleGroup = createRulesDto({ dataType: 'show' });
       const result = await service.get(
         18,
         createMediaItem({ type: 'show' }),
         'show',
-        createRulesDto({ dataType: 'show' }),
+        ruleGroup,
       );
 
       expect(result).toEqual(['bob', 'alice']);
@@ -602,6 +643,7 @@ describe('PlexGetterService', () => {
         'show-1',
         true,
         'show',
+        ruleGroup.libraryId,
       );
     });
 
@@ -713,6 +755,60 @@ describe('PlexGetterService', () => {
         'uuid-a',
         'alice',
       );
+    });
+
+    it('returns undefined for watchlist properties when no user has a plex.tv uuid (ids 28 and 30)', async () => {
+      // plex.tv unreachable: getCorrectedUsers falls back to local accounts
+      // without uuids. Must be transient (undefined), not a confirmed
+      // empty/false answer (#3307).
+      plexApi.getMetadata.mockResolvedValue(
+        makeMetadata({
+          ratingKey: 'movie-1',
+          type: 'movie',
+          guid: 'plex://movie/movieuuid',
+        }),
+      );
+      plexApi.getCorrectedUsers.mockResolvedValue([
+        makePlexUser({ plexId: 1, username: 'alice' }),
+        makePlexUser({ plexId: 2, username: 'bob' }),
+      ]);
+
+      const libItem = createMediaItem({ id: 'movie-1', type: 'movie' });
+      const ruleGroup = createRulesDto({ dataType: 'movie' });
+
+      await expect(
+        service.get(28, libItem, 'movie', ruleGroup),
+      ).resolves.toBeUndefined();
+      await expect(
+        service.get(30, libItem, 'movie', ruleGroup),
+      ).resolves.toBeUndefined();
+      expect(plexApi.getWatchlistIdsForUser).not.toHaveBeenCalled();
+    });
+
+    it('returns undefined for watchlist properties when a watchlist read fails (ids 28 and 30)', async () => {
+      // getWatchlistIdsForUser resolves undefined on a failed community API
+      // fetch; that must not collapse into "not watchlisted" (#3307).
+      plexApi.getMetadata.mockResolvedValue(
+        makeMetadata({
+          ratingKey: 'movie-1',
+          type: 'movie',
+          guid: 'plex://movie/movieuuid',
+        }),
+      );
+      plexApi.getCorrectedUsers.mockResolvedValue([
+        makePlexUser({ plexId: 1, username: 'alice', uuid: 'uuid-a' }),
+      ]);
+      plexApi.getWatchlistIdsForUser.mockResolvedValue(undefined);
+
+      const libItem = createMediaItem({ id: 'movie-1', type: 'movie' });
+      const ruleGroup = createRulesDto({ dataType: 'movie' });
+
+      await expect(
+        service.get(28, libItem, 'movie', ruleGroup),
+      ).resolves.toBeUndefined();
+      await expect(
+        service.get(30, libItem, 'movie', ruleGroup),
+      ).resolves.toBeUndefined();
     });
 
     it.each([
@@ -1168,16 +1264,19 @@ describe('PlexGetterService', () => {
         '12345',
         true,
         'movie',
+        'lib-1',
       );
       expect(plexApi.getWatchHistory).toHaveBeenCalledWith(
         'sibling-a',
         true,
         'movie',
+        'lib-1',
       );
       expect(plexApi.getWatchHistory).toHaveBeenCalledWith(
         'sibling-b',
         true,
         'movie',
+        'lib-1',
       );
     });
 
@@ -1322,9 +1421,12 @@ describe('PlexGetterService', () => {
         makeWatchEntry({ accountID: 2 }),
       ]);
 
+      const ruleGroup = createRulesDto({ dataType: 'movie' });
       const result = await service.get(
         SEEN_BY_PROP_ID,
         createMediaItem({ type: 'movie' }),
+        'movie',
+        ruleGroup,
       );
 
       expect(result).toEqual(['bob', 'alice']);
@@ -1332,6 +1434,7 @@ describe('PlexGetterService', () => {
         '12345',
         true,
         'movie',
+        ruleGroup.libraryId,
       );
     });
 
@@ -1356,6 +1459,23 @@ describe('PlexGetterService', () => {
         makePlexUser({ plexId: 1, username: 'alice' }),
       ]);
       plexApi.getWatchHistory.mockRejectedValue(new Error('plex unreachable'));
+
+      const result = await service.get(
+        SEEN_BY_PROP_ID,
+        createMediaItem({ type: 'movie' }),
+      );
+
+      expect(result).toBeUndefined();
+    });
+
+    it('returns undefined when the plex.tv username enrichment fails so degraded names never mis-evaluate rules (#3307)', async () => {
+      plexApi.getMetadata.mockResolvedValue(makeMetadata());
+      plexApi.getCorrectedUsers.mockRejectedValue(
+        new Error('plex.tv user data unavailable'),
+      );
+      plexApi.getWatchHistory.mockResolvedValue([
+        makeWatchEntry({ accountID: 1 }),
+      ]);
 
       const result = await service.get(
         SEEN_BY_PROP_ID,

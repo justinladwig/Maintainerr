@@ -1,6 +1,8 @@
 import { Injectable } from '@nestjs/common';
 import { DownloadClientApiService } from '../api/download-client-api/download-client-api.service';
+import { leftoverCleanupScope } from '@maintainerr/contracts';
 import { MediaServerFactory } from '../api/media-server/media-server.factory';
+import { RadarrMovie } from '../api/servarr-api/interfaces/radarr.interface';
 import { ServarrService } from '../api/servarr-api/servarr.service';
 import { Collection } from '../collections/entities/collection.entities';
 import { CollectionMedia } from '../collections/entities/collection_media.entities';
@@ -12,6 +14,10 @@ import {
 } from '../metadata/metadata-lookup.util';
 import { MetadataService } from '../metadata/metadata.service';
 import { SettingsDataService } from '../settings/settings-data.service';
+import {
+  LeftoverCleanupInput,
+  LeftoverFolderCleanupService,
+} from './leftover-folder-cleanup.service';
 
 @Injectable()
 export class RadarrActionHandler {
@@ -21,6 +27,7 @@ export class RadarrActionHandler {
     private readonly metadataService: MetadataService,
     private readonly settings: SettingsDataService,
     private readonly downloadClient: DownloadClientApiService,
+    private readonly folderCleanup: LeftoverFolderCleanupService,
     private readonly logger: MaintainerrLogger,
   ) {
     logger.setContext(RadarrActionHandler.name);
@@ -77,6 +84,18 @@ export class RadarrActionHandler {
             ? await radarrApiClient.getDownloadIdsForMovie(radarrMedia.id)
             : [];
 
+        // Leftover-folder cleanup inputs, captured before the delete (the file
+        // list is gone afterwards). Only UNMONITOR_DELETE_ALL strands a folder:
+        // it removes the files one by one, whereas deleteMovie removes the whole
+        // movie folder in Radarr itself. Only fetched when the feature is on, to
+        // keep the common path free of extra calls.
+        const cleanupScope = collection.cleanupLeftoverFolders
+          ? leftoverCleanupScope(collection.type, collection.arrAction)
+          : undefined;
+        const cleanupInputs = cleanupScope
+          ? await this.collectCleanupInputs(radarrApiClient, radarrMedia)
+          : undefined;
+
         switch (collection.arrAction) {
           case ServarrAction.DELETE:
           case ServarrAction.UNMONITOR_DELETE_EXISTING:
@@ -96,10 +115,12 @@ export class RadarrActionHandler {
             return true;
           case ServarrAction.UNMONITOR:
             if (
-              !(await radarrApiClient.updateMovie(radarrMedia.id, {
-                monitored: false,
-                addImportExclusion: collection.listExclusions,
-              }))
+              !(
+                await radarrApiClient.updateMovie(radarrMedia.id, {
+                  monitored: false,
+                  addImportExclusion: collection.listExclusions,
+                })
+              ).ok
             ) {
               return false;
             }
@@ -107,21 +128,40 @@ export class RadarrActionHandler {
               `Unmonitored movie with ${matchedProvider} ID ${matchedId}${collection.listExclusions ? ' & added to import exclusion list' : ''} in Radarr`,
             );
             return true;
-          case ServarrAction.UNMONITOR_DELETE_ALL:
-            if (
-              !(await radarrApiClient.updateMovie(radarrMedia.id, {
+          case ServarrAction.UNMONITOR_DELETE_ALL: {
+            const updateResult = await radarrApiClient.updateMovie(
+              radarrMedia.id,
+              {
                 monitored: false,
                 deleteFiles: true,
                 addImportExclusion: collection.listExclusions,
-              }))
-            ) {
+              },
+            );
+
+            if (!updateResult.ok) {
               return false;
             }
+            // Say what was actually removed: Radarr holding no file records for
+            // the movie deletes nothing, and claiming otherwise leaves a later
+            // "it kept my file" report with no way to tell the two apart.
             this.logger.log(
-              `Unmonitored movie with ${matchedProvider} ID ${matchedId}${collection.listExclusions ? ', added to import exclusion list' : ''} & removed files from filesystem in Radarr`,
+              `Unmonitored movie with ${matchedProvider} ID ${matchedId}${collection.listExclusions ? ', added to import exclusion list' : ''}${
+                updateResult.deletedFileCount > 0
+                  ? ` & removed ${updateResult.deletedFileCount} file(s) from filesystem in Radarr`
+                  : ' in Radarr; it had no files to remove'
+              }`,
             );
             await this.downloadClient.removeDownloads(downloadIds);
+            if (cleanupScope && cleanupInputs) {
+              await this.folderCleanup.cleanupAfterDelete({
+                ...cleanupInputs,
+                folderPath: radarrMedia.path,
+                scope: cleanupScope,
+                label: radarrMedia.title,
+              });
+            }
             return true;
+          }
           case ServarrAction.CHANGE_QUALITY_PROFILE: {
             const targetProfileId = collection.radarrQualityProfileId;
 
@@ -144,9 +184,11 @@ export class RadarrActionHandler {
             }
 
             if (
-              !(await radarrApiClient.updateMovie(radarrMedia.id, {
-                qualityProfileId: targetProfileId,
-              }))
+              !(
+                await radarrApiClient.updateMovie(radarrMedia.id, {
+                  qualityProfileId: targetProfileId,
+                })
+              ).ok
             ) {
               return false;
             }
@@ -175,6 +217,14 @@ export class RadarrActionHandler {
           this.logger.log(
             `Couldn't find movie in Radarr using resolved external IDs [${attemptedIds}] for media server ID ${media.mediaServerId}. Attempting to remove from the filesystem via media server.`,
           );
+          if (
+            collection.cleanupLeftoverFolders &&
+            leftoverCleanupScope(collection.type, collection.arrAction)
+          ) {
+            this.folderCleanup.logNotApplicableForUntrackedItem(
+              media.mediaServerId,
+            );
+          }
           const mediaServer = await this.mediaServerFactory.getService();
           await mediaServer.deleteFromDisk(media.mediaServerId);
           return true;
@@ -193,5 +243,57 @@ export class RadarrActionHandler {
     }
 
     return false;
+  }
+
+  /**
+   * The fences the leftover-folder cleanup needs, read before the delete: the
+   * root folders it may act inside, the file paths that prove the folder is the
+   * one just emptied, and the other movie folders it must not touch.
+   *
+   * Every read here is uncached: these fence a filesystem delete, and a movie
+   * that the cached snapshot predates would leave the fence blind to it.
+   */
+  private async collectCleanupInputs(
+    radarrApiClient: Awaited<ReturnType<ServarrService['getRadarrApiClient']>>,
+    radarrMedia: RadarrMovie,
+  ): Promise<
+    | Pick<
+        LeftoverCleanupInput,
+        'rootFolderPaths' | 'deletedFilePaths' | 'otherItemPaths'
+      >
+    | undefined
+  > {
+    try {
+      const [rootFolders, movieFiles, movies] = await Promise.all([
+        radarrApiClient.getRootFolders({ fresh: true }),
+        radarrApiClient.getMovieFiles(radarrMedia.id),
+        radarrApiClient.getMovies(),
+      ]);
+
+      // undefined = the listing failed, so what it would have fenced is
+      // unknown - not "nothing". Skip rather than fence on a guess: an empty
+      // deleted-file list drops the proof that this is the folder the delete
+      // emptied, and an empty movie list drops the fence that keeps the
+      // cleanup off another tracked item's folder.
+      if (movieFiles === undefined || movies === undefined) {
+        return undefined;
+      }
+
+      return {
+        rootFolderPaths: (rootFolders ?? [])
+          .map((folder) => folder.path)
+          .filter((p): p is string => !!p),
+        deletedFilePaths: movieFiles
+          .map((file) => file.path)
+          .filter((p): p is string => !!p),
+        otherItemPaths: movies
+          .filter((movie) => movie.id !== radarrMedia.id)
+          .map((movie) => movie.path)
+          .filter((p): p is string => !!p),
+      };
+    } catch (error) {
+      this.logger.debug(error);
+      return undefined;
+    }
   }
 }

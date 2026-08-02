@@ -23,6 +23,7 @@ import { MaintainerrLogger } from '../../../logging/logs.service';
 import { SettingsDataService } from '../../../settings/settings-data.service';
 import { EmbyApi } from '../../emby-api/emby-api.helper';
 import cacheManager, { type Cache } from '../../lib/cache';
+import { resolveContextActionIds } from '../context-action.util';
 import { supportsFeature } from '../media-server.constants';
 import type {
   IMediaServerService,
@@ -68,6 +69,11 @@ export class EmbyAdapterService implements IMediaServerService {
   private embyUserId: string | undefined;
   private deviceId: string;
   private readonly cache: Cache;
+  // Shared in-flight metadata reads, keyed by item id. See getMetadata.
+  private readonly metadataRequests = new Map<
+    string,
+    Promise<MediaItem | undefined>
+  >();
 
   constructor(
     private readonly settings: SettingsDataService,
@@ -319,7 +325,7 @@ export class EmbyAdapterService implements IMediaServerService {
     options?: LibraryQueryOptions,
   ): Promise<PagedResult<MediaItem>> {
     if (!this.http) {
-      return { items: [], totalSize: 0, offset: 0, limit: 0 };
+      throw new Error('Emby not initialized');
     }
     const limit = options?.limit ?? EMBY_BATCH_SIZE.DEFAULT_PAGE_SIZE;
     const offset = options?.offset ?? 0;
@@ -350,7 +356,10 @@ export class EmbyAdapterService implements IMediaServerService {
       this.logger.warn(
         `Emby getLibraryContents(${libraryId}) failed: ${formatConnectionFailureMessage(error, 'Connection failed')}`,
       );
-      return { items: [], totalSize: 0, offset, limit };
+      // A fabricated empty page reads as end-of-library downstream, which
+      // truncates rule evaluation and mass-removes the unevaluated tail from
+      // collections (#3307). Fail closed like getCollectionChildren.
+      throw error;
     }
   }
 
@@ -376,7 +385,9 @@ export class EmbyAdapterService implements IMediaServerService {
       this.logger.debug(
         `Emby getLibraryContentCount(${libraryId}) failed: ${formatConnectionFailureMessage(error, 'Connection failed')}`,
       );
-      return 0;
+      // Same contract as getLibraryContents: a fabricated count masks a
+      // failed read from callers that gate work on it.
+      throw error;
     }
   }
 
@@ -412,8 +423,37 @@ export class EmbyAdapterService implements IMediaServerService {
   // Metadata
   // ============================================================================
 
+  /**
+   * Cached for the same reason as the Jellyfin adapter's: every rule condition
+   * re-reads the evaluated item and its parents through here, so an uncached
+   * read costs one wide request per condition per item (#3355), and
+   * concurrently evaluated siblings all miss the cold key together so they
+   * share the in-flight read. See there for why only a resolved item is
+   * stored, and why a MediaItem's UserData-derived fields must not feed a
+   * watch or deletion decision.
+   */
   async getMetadata(itemId: string): Promise<MediaItem | undefined> {
     if (!this.http) return undefined;
+
+    const cacheKey = `${EMBY_CACHE_KEYS.METADATA}:${itemId}`;
+    const cached = this.cache.data.get<MediaItem>(cacheKey);
+    if (cached !== undefined) return cached;
+
+    const inFlight = this.metadataRequests.get(itemId);
+    if (inFlight !== undefined) return inFlight;
+
+    const pending = this.fetchMetadata(itemId, cacheKey).finally(() => {
+      this.metadataRequests.delete(itemId);
+    });
+    this.metadataRequests.set(itemId, pending);
+
+    return pending;
+  }
+
+  private async fetchMetadata(
+    itemId: string,
+    cacheKey: string,
+  ): Promise<MediaItem | undefined> {
     try {
       // Emby's /Users/{userId}/Items/{itemId} returns user-specific data.
       // When no user context, fall back to /Items/{itemId}.
@@ -426,7 +466,9 @@ export class EmbyAdapterService implements IMediaServerService {
             'ProviderIds,DateCreated,Overview,Tags,MediaSources,Genres,People',
         },
       });
-      return EmbyMapper.toMediaItem(data);
+      const mediaItem = EmbyMapper.toMediaItem(data);
+      this.cache.data.set(cacheKey, mediaItem, EMBY_CACHE_TTL.METADATA);
+      return mediaItem;
     } catch (error) {
       this.logger.debug(
         `Emby getMetadata(${itemId}) failed: ${formatConnectionFailureMessage(error, 'Connection failed')}`,
@@ -435,11 +477,26 @@ export class EmbyAdapterService implements IMediaServerService {
     }
   }
 
+  /**
+   * Cached like the Jellyfin adapter's (#3355) - see there for why only a
+   * completed read is stored.
+   */
   async getChildrenMetadata(
     parentId: string,
     childType?: MediaItemType,
+    throwOnError = false,
   ): Promise<MediaItem[]> {
-    if (!this.http) return [];
+    if (!this.http) {
+      if (throwOnError) {
+        throw new Error('Emby API not initialized');
+      }
+      return [];
+    }
+
+    const cacheKey = `${EMBY_CACHE_KEYS.CHILDREN}:${parentId}:${childType ?? 'any'}`;
+    const cached = this.cache.data.get<MediaItem[]>(cacheKey);
+    if (cached !== undefined) return cached;
+
     try {
       // Seasons of a series live under /Shows/{seriesId}/Seasons, not under
       // /Items?ParentId= (ParentId of a season points to the library folder,
@@ -455,7 +512,10 @@ export class EmbyAdapterService implements IMediaServerService {
             },
           },
         );
-        return (data.Items ?? []).map(EmbyMapper.toMediaItem);
+        return this.cacheChildren(
+          cacheKey,
+          (data.Items ?? []).map(EmbyMapper.toMediaItem),
+        );
       }
 
       const { data } = await this.http.get<EmbyItemsQueryResponse>('/Items', {
@@ -471,13 +531,30 @@ export class EmbyAdapterService implements IMediaServerService {
           Limit: EMBY_BATCH_SIZE.MAX_PAGE_SIZE,
         },
       });
-      return (data.Items ?? []).map(EmbyMapper.toMediaItem);
+      return this.cacheChildren(
+        cacheKey,
+        (data.Items ?? []).map(EmbyMapper.toMediaItem),
+      );
     } catch (error) {
+      if (throwOnError) {
+        // Worded like the Plex adapter's: the raw client error reaches the user
+        // as "Request failed with status code 404", which names nothing.
+        throw new Error(
+          `Could not read the children of Emby item ${parentId}`,
+          { cause: error },
+        );
+      }
+
       this.logger.debug(
         `Emby getChildrenMetadata(${parentId}) failed: ${formatConnectionFailureMessage(error, 'Connection failed')}`,
       );
       return [];
     }
+  }
+
+  private cacheChildren(cacheKey: string, children: MediaItem[]): MediaItem[] {
+    this.cache.data.set(cacheKey, children, EMBY_CACHE_TTL.METADATA);
+    return children;
   }
 
   /**
@@ -539,44 +616,37 @@ export class EmbyAdapterService implements IMediaServerService {
 
   /**
    * Users who watched at least one episode under `parentId` (season or show).
-   * Mirrors `JellyfinAdapterService.getDescendantEpisodeWatchers`. One
-   * /Items request per user, each scoped to that user with `IsPlayed=true`
+   * One /Items request per user, each scoped to that user with `IsPlayed=true`
    * + `Limit=1` - we only need to know whether any played episode exists.
+   *
+   * Errors propagate for the same reason they do in getWatchHistory: an empty
+   * watcher list is indistinguishable from "nobody watched this", which would
+   * make a failed lookup a deletion candidate. The Jellyfin adapter answers the
+   * same question from its prefetched snapshot instead, because Emby omits the
+   * watch dates a bulk sweep would need (see getWatchHistory).
    */
   async getDescendantEpisodeWatchers(parentId: string): Promise<string[]> {
     if (!this.http) return [];
-    try {
-      const users = await this.getUsers();
-      const watchers = new Set<string>();
-      for (const user of users) {
-        try {
-          const { data } = await this.http.get<EmbyItemsQueryResponse>(
-            '/Items',
-            {
-              params: {
-                UserId: user.id,
-                ParentId: parentId,
-                Recursive: true,
-                IncludeItemTypes: 'Episode',
-                ExcludeLocationTypes: 'Virtual',
-                IsPlayed: true,
-                Limit: 1,
-                EnableUserData: true,
-              },
-            },
-          );
-          if ((data.Items ?? []).length > 0) watchers.add(user.id);
-        } catch {
-          // skip users without visibility
-        }
-      }
-      return [...watchers];
-    } catch (error) {
-      this.logger.debug(
-        `Emby getDescendantEpisodeWatchers(${parentId}) failed: ${formatConnectionFailureMessage(error, 'Connection failed')}`,
-      );
-      return [];
+
+    const users = await this.fetchUsersQuery(this.http);
+    const watchers = new Set<string>();
+    for (const user of users) {
+      const { data } = await this.http.get<EmbyItemsQueryResponse>('/Items', {
+        params: {
+          UserId: user.Id,
+          ParentId: parentId,
+          Recursive: true,
+          IncludeItemTypes: 'Episode',
+          ExcludeLocationTypes: 'Virtual',
+          IsPlayed: true,
+          Limit: 1,
+          EnableUserData: true,
+        },
+      });
+      if ((data.Items ?? []).length > 0) watchers.add(user.Id);
     }
+
+    return [...watchers];
   }
 
   /**
@@ -699,7 +769,9 @@ export class EmbyAdapterService implements IMediaServerService {
   }
 
   async refreshItemMetadata(itemId: string): Promise<void> {
-    if (!this.http) return;
+    if (!this.http) {
+      throw new Error('Emby not initialized');
+    }
     try {
       await this.http.post(`/Items/${itemId}/Refresh`, null, {
         params: {
@@ -711,9 +783,13 @@ export class EmbyAdapterService implements IMediaServerService {
         },
       });
     } catch (error) {
-      this.logger.debug(
+      // Plex and Jellyfin throw here, and #2594's verify-and-retry-with-a-
+      // corrected-id path only runs on a rejection - swallowing left that
+      // dead on Emby and every refresh reported as queued.
+      this.logger.error(
         `Emby refreshItemMetadata(${itemId}) failed: ${formatConnectionFailureMessage(error, 'Connection failed')}`,
       );
+      throw error;
     }
   }
 
@@ -726,8 +802,9 @@ export class EmbyAdapterService implements IMediaServerService {
   // adapter's shape but use Emby endpoint paths.
 
   async prefetchWatchHistory(): Promise<void> {
-    // Emby has no central watch-history endpoint (history is per-user), so
-    // there is nothing to bulk prefetch. Gated by
+    // Emby cannot do what the Jellyfin adapter does here: it omits
+    // LastPlayedDate and PlayCount from every bulk /Items listing shape, so a
+    // sweep would report watched items as having no watch date. Gated by
     // supportsFeature(CENTRAL_WATCH_HISTORY) which is false for Emby - callers
     // shouldn't reach here.
     throw new Error(
@@ -735,6 +812,13 @@ export class EmbyAdapterService implements IMediaServerService {
     );
   }
 
+  /**
+   * Stays per item, unlike the Jellyfin twin's descendant sweep (#3337): Emby
+   * omits LastPlayedDate and PlayCount from every bulk /Items listing shape
+   * (verified on 4.9.5 with and without UserId scoping and Fields=UserData)
+   * and returns them only from /Users/{userId}/Items/{itemId}. A bulk sweep
+   * would therefore report every watched episode as having no watch date.
+   */
   async getWatchHistory(itemId: string): Promise<WatchRecord[]> {
     if (!this.http) return [];
     let users: EmbyUserDto[];
@@ -816,11 +900,19 @@ export class EmbyAdapterService implements IMediaServerService {
   // Collections
   // ============================================================================
 
-  async getCollections(libraryId: string): Promise<MediaCollection[]> {
-    if (!this.http) return [];
+  async getCollections(
+    libraryId: string,
+    useCache = true,
+  ): Promise<MediaCollection[]> {
+    if (!this.http) {
+      throw new Error('Emby not initialized');
+    }
 
     const cacheKey = `${EMBY_CACHE_KEYS.COLLECTIONS}:${libraryId}`;
-    const cached = this.cache.data.get<MediaCollection[]>(cacheKey);
+    // Still written back on a live read, so per-item reads stay warm.
+    const cached = useCache
+      ? this.cache.data.get<MediaCollection[]>(cacheKey)
+      : undefined;
     if (cached) {
       return cached;
     }
@@ -833,17 +925,31 @@ export class EmbyAdapterService implements IMediaServerService {
       // user value interpolated into the request path is a CodeQL SSRF sink; a
       // query param is not.)
       const userId = await this.resolveUserId();
-      const { data } = await this.http.get<EmbyItemsQueryResponse>('/Items', {
-        params: {
-          ...(userId ? { UserId: userId } : {}),
-          ParentId: libraryId,
-          IncludeItemTypes: 'BoxSet',
-          Recursive: true,
-          Fields: 'DateCreated,Overview,ChildCount',
-          Limit: EMBY_BATCH_SIZE.MAX_PAGE_SIZE,
-        },
-      });
-      const collections = (data.Items ?? []).map(EmbyMapper.toMediaCollection);
+      // A truncated page is an HTTP 200, so failing closed cannot catch it.
+      const collections: MediaCollection[] = [];
+      let offset = 0;
+      let hasMore = true;
+
+      while (hasMore) {
+        const { data } = await this.http.get<EmbyItemsQueryResponse>('/Items', {
+          params: {
+            ...(userId ? { UserId: userId } : {}),
+            ParentId: libraryId,
+            IncludeItemTypes: 'BoxSet',
+            Recursive: true,
+            Fields: 'DateCreated,Overview,ChildCount',
+            Limit: EMBY_BATCH_SIZE.MAX_PAGE_SIZE,
+            StartIndex: offset,
+            EnableTotalRecordCount: true,
+          },
+        });
+
+        const items = data.Items ?? [];
+        collections.push(...items.map(EmbyMapper.toMediaCollection));
+        offset += items.length;
+        hasMore =
+          items.length > 0 && offset < (data.TotalRecordCount ?? offset);
+      }
       // Skip caching empty results so a transient zero-collection response
       // (e.g. mid-library-scan) can't mask a just-created entry.
       if (collections.length > 0) {
@@ -851,10 +957,10 @@ export class EmbyAdapterService implements IMediaServerService {
       }
       return collections;
     } catch (error) {
-      this.logger.debug(
+      this.logger.error(
         `Emby getCollections(${libraryId}) failed: ${formatConnectionFailureMessage(error, 'Connection failed')}`,
       );
-      return [];
+      throw error;
     }
   }
 
@@ -914,7 +1020,13 @@ export class EmbyAdapterService implements IMediaServerService {
     collectionId: string,
     throwOnError = false,
   ): Promise<MediaCollection | undefined> {
-    if (!this.http) return undefined;
+    // Guard predates throwOnError, and answered "confirmed 404" without it.
+    if (!this.http) {
+      if (throwOnError) {
+        throw new Error('Emby not initialized');
+      }
+      return undefined;
+    }
     try {
       const path = this.embyUserId
         ? `/Users/${this.embyUserId}/Items/${collectionId}`
@@ -922,6 +1034,16 @@ export class EmbyAdapterService implements IMediaServerService {
       const { data } = await this.http.get<EmbyBaseItemDto>(path);
       return EmbyMapper.toMediaCollection(data);
     } catch (error) {
+      // A 404 is the server confirming the collection is gone; anything else
+      // leaves its existence unknown, so throwOnError callers must not read it
+      // as "missing".
+      if (error instanceof AxiosError && error.response?.status === 404) {
+        this.logger.debug(
+          `Emby collection ${collectionId} not found; treating it as missing`,
+        );
+        return undefined;
+      }
+
       if (throwOnError) throw error;
       this.logger.debug(
         `Emby getCollection(${collectionId}) failed: ${formatConnectionFailureMessage(error, 'Connection failed')}`,
@@ -959,6 +1081,10 @@ export class EmbyAdapterService implements IMediaServerService {
       if (!collection.id) {
         throw new Error('Collection created but no ID returned');
       }
+      // Invalidate here, not after the refetch/metadata follow-up below: those
+      // can throw, and the collection already exists on the server. Leaving the
+      // stale listing behind makes the next attempt create a second BoxSet.
+      this.invalidateCollectionsCache(params.libraryId);
       if (!collection.title) {
         const refreshed = await this.getCollection(collection.id, true);
         if (!refreshed) {
@@ -980,7 +1106,6 @@ export class EmbyAdapterService implements IMediaServerService {
           );
         }
       }
-      this.invalidateCollectionsCache(params.libraryId);
       return collection;
     } catch (error) {
       const message = formatConnectionFailureMessage(
@@ -1014,21 +1139,36 @@ export class EmbyAdapterService implements IMediaServerService {
     if (!this.http) return;
     const children = await this.getCollectionChildren(collectionId);
     const fromLibrary: MediaItem[] = [];
+    let membershipUnknown = false;
 
     for (const child of children) {
-      if (await this.itemIsInLibrary(child.id, libraryId)) {
+      const inLibrary = await this.itemIsInLibrary(child.id, libraryId);
+      if (inLibrary === undefined) {
+        membershipUnknown = true;
+      } else if (inLibrary) {
         fromLibrary.push(child);
       }
     }
 
-    if (fromLibrary.length === 0) return;
-    await this.removeBatchFromCollection(
-      collectionId,
-      fromLibrary.map((c) => c.id),
-    );
+    if (fromLibrary.length > 0) {
+      await this.removeBatchFromCollection(
+        collectionId,
+        fromLibrary.map((c) => c.id),
+      );
+    }
+
+    // Guard only the removal, not the delete: an automatic collection that is
+    // already empty still has to go, which the old "nothing to remove" early
+    // return skipped - leaving it behind while the caller dropped the link.
     const remaining = await this.getCollectionChildren(collectionId);
     if (remaining.length === 0 && !isManualCollection) {
       await this.deleteCollection(collectionId);
+    }
+
+    if (membershipUnknown) {
+      throw new Error(
+        `Could not determine library membership for every child of collection ${collectionId}`,
+      );
     }
   }
 
@@ -1042,15 +1182,32 @@ export class EmbyAdapterService implements IMediaServerService {
       // goes in the query param (not the path) to stay clear of CodeQL's SSRF
       // sink while keeping the read user-scoped.
       const userId = await this.resolveUserId();
-      const { data } = await this.http.get<EmbyItemsQueryResponse>('/Items', {
-        params: {
-          ...(userId ? { UserId: userId } : {}),
-          ParentId: collectionId,
-          Fields: 'ProviderIds,DateCreated,Overview',
-          Limit: EMBY_BATCH_SIZE.MAX_PAGE_SIZE,
-        },
-      });
-      return (data.Items ?? []).map(EmbyMapper.toMediaItem);
+      // Callers treat a non-empty list as a complete snapshot, so a bare
+      // Limit made everything past the cap look absent.
+      const children: MediaItem[] = [];
+      let offset = 0;
+      let hasMore = true;
+
+      while (hasMore) {
+        const { data } = await this.http.get<EmbyItemsQueryResponse>('/Items', {
+          params: {
+            ...(userId ? { UserId: userId } : {}),
+            ParentId: collectionId,
+            Fields: 'ProviderIds,DateCreated,Overview',
+            Limit: EMBY_BATCH_SIZE.MAX_PAGE_SIZE,
+            StartIndex: offset,
+            EnableTotalRecordCount: true,
+          },
+        });
+
+        const items = data.Items ?? [];
+        children.push(...items.map(EmbyMapper.toMediaItem));
+        offset += items.length;
+        hasMore =
+          items.length > 0 && offset < (data.TotalRecordCount ?? offset);
+      }
+
+      return children;
     } catch (error) {
       this.logger.error(
         `Emby getCollectionChildren(${collectionId}) failed: ${formatConnectionFailureMessage(error, 'Connection failed')}`,
@@ -1302,38 +1459,24 @@ export class EmbyAdapterService implements IMediaServerService {
     context: { type: MediaItemType; id: string },
     mediaId: string,
   ): Promise<string[]> {
-    // Match Jellyfin's semantics: when the collection type matches the context
-    // type, return [mediaId]. Otherwise traverse parent/child relationships
-    // appropriately. Episodes vs. shows are the most common case.
-    if (!collectionType || collectionType === context.type) {
-      return [mediaId];
-    }
-    if (collectionType === 'show' && context.type === 'episode') {
-      const ep = await this.getMetadata(context.id);
-      const seriesId = ep?.grandparentId;
-      return seriesId ? [seriesId] : [];
-    }
-    if (collectionType === 'episode' && context.type === 'show') {
-      const seasons = await this.getChildrenMetadata(context.id, 'season');
-      const episodeIds: string[] = [];
-      for (const season of seasons) {
-        const eps = await this.getChildrenMetadata(season.id, 'episode');
-        episodeIds.push(...eps.map((e) => e.id));
-      }
-      return episodeIds;
-    }
-    return [mediaId];
+    return resolveContextActionIds(
+      collectionType,
+      context,
+      mediaId,
+      (parentId, type) => this.getChildrenMetadata(parentId, type, true),
+      (message) => this.logger.warn(message),
+    );
   }
 
   // ============================================================================
   // Cache management
   // ============================================================================
 
-  resetMetadataCache(_itemId?: string): void {
-    // The Emby cache only stores server-wide aggregates (users/libraries/status/
-    // collections), never per-item watch entries (getWatchHistory hits the API
-    // fresh), so a full flush is the simplest correct reset.
-    void _itemId;
+  // The item id is ignored: besides the server-wide aggregates
+  // (users/libraries/status/collections) the only per-item entries are
+  // getMetadata's, and watch reads still hit the API fresh, so a full flush is
+  // the simplest correct reset.
+  resetMetadataCache(): void {
     this.cache.flush();
   }
 
@@ -1487,8 +1630,8 @@ export class EmbyAdapterService implements IMediaServerService {
   private async itemIsInLibrary(
     itemId: string,
     libraryId: string,
-  ): Promise<boolean> {
-    if (!this.http) return false;
+  ): Promise<boolean | undefined> {
+    if (!this.http) return undefined;
 
     try {
       const { data } = await this.http.get<EmbyBaseItemDto[]>(
@@ -1500,7 +1643,7 @@ export class EmbyAdapterService implements IMediaServerService {
       this.logger.debug(
         `Emby itemIsInLibrary(${itemId}, ${libraryId}) failed: ${formatConnectionFailureMessage(error, 'Connection failed')}`,
       );
-      return false;
+      return undefined;
     }
   }
 

@@ -15,6 +15,7 @@ export class RulesDto {
   ruleHandlerCronSchedule?: string | null;
   collection?: ICollection;
   listExclusions?: boolean;
+  cleanupLeftoverFolders?: boolean;
   forceSeerr?: boolean;
   rules: RuleDto[] | RuleDbDto[];
   manualCollection?: boolean;
@@ -24,7 +25,9 @@ export class RulesDto {
   notifications?: Notification[];
   radarrSettingsId?: number;
   sonarrSettingsId?: number;
+  sportarrSettingsId?: number;
   radarrQualityProfileId?: number;
   sonarrQualityProfileId?: number;
+  sportarrQualityProfileId?: number;
   tagInArr?: boolean;
 }

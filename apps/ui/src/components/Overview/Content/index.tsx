@@ -19,6 +19,7 @@ interface IOverviewContent {
   extrasLoading?: boolean
   fetchData: () => void
   onRemove?: (id: string) => void
+  onItemPostponed?: (id: string, addDate: string) => void
   libraryId: string
   collectionPage?: boolean
   collectionInfo?: ICollectionMedia[]
@@ -139,15 +140,7 @@ const OverviewContent = (props: IOverviewContent) => {
                   id={el.id}
                   libraryId={props.libraryId}
                   type={el.type}
-                  summary={
-                    el.type === 'movie' || el.type === 'show'
-                      ? el.summary
-                      : el.type === 'season'
-                        ? el.title
-                        : el.type === 'episode'
-                          ? 'Episode ' + el.index + ' - ' + el.title
-                          : ''
-                  }
+                  summary={el.summary}
                   year={
                     el.type === 'episode'
                       ? el.parentTitle
@@ -156,6 +149,15 @@ const OverviewContent = (props: IOverviewContent) => {
                         : el.year?.toString()
                   }
                   mediaType={el.type}
+                  seasonNumber={
+                    el.type === 'season'
+                      ? el.index
+                      : el.type === 'episode'
+                        ? el.parentIndex
+                        : undefined
+                  }
+                  episodeNumber={el.type === 'episode' ? el.index : undefined}
+                  episodeTitle={el.type === 'episode' ? el.title : undefined}
                   title={
                     el.grandparentTitle
                       ? el.grandparentTitle
@@ -174,6 +176,7 @@ const OverviewContent = (props: IOverviewContent) => {
                   }
                   exclusionType={el.maintainerrExclusionType}
                   onRemove={props.onRemove}
+                  onItemPostponed={props.onItemPostponed}
                   collectionId={props.collectionId}
                   collection={
                     props.collection ??

@@ -102,6 +102,13 @@ export interface IMediaServerService {
 
   /**
    * Get contents of a specific library with optional pagination and filtering.
+   * An empty page means the server confirmed there are no (more) items -
+   * never "the read failed".
+   *
+   * @throws Error on any failure to read the page (connection, 4xx/5xx).
+   * Like getCollectionChildren: a fabricated empty page would read as
+   * end-of-library and let rule evaluation truncate silently, mass-removing
+   * the unevaluated tail from collections.
    */
   getLibraryContents(
     libraryId: string,
@@ -110,6 +117,9 @@ export interface IMediaServerService {
 
   /**
    * Get total count of items in a library, optionally filtered by type.
+   *
+   * @throws Error on a failed read - a fabricated 0 masks the failure from
+   * callers that gate work on the count.
    */
   getLibraryContentCount(
     libraryId: string,
@@ -143,8 +153,16 @@ export interface IMediaServerService {
 
   /**
    * Get child items (seasons for shows, episodes for seasons).
+   *
+   * @param throwOnError - by default a failed read answers with an empty list,
+   * which reads as "no children" downstream. Callers that must not mistake the
+   * two pass true.
    */
-  getChildrenMetadata(parentId: string): Promise<MediaItem[]>;
+  getChildrenMetadata(
+    parentId: string,
+    childType?: MediaItemType,
+    throwOnError?: boolean,
+  ): Promise<MediaItem[]>;
 
   /**
    * Get recently added items from a library.
@@ -160,16 +178,27 @@ export interface IMediaServerService {
   searchContent(query: string): Promise<MediaItem[]>;
 
   /**
-   * Prefetch watch history for all library items in a single bulk request,
-   * caching the result so that subsequent per-item getWatchHistory /
-   * getWatchState calls can be served from memory instead of making individual
-   * HTTP requests.
+   * Prefetch watch history in bulk, caching the result so that subsequent
+   * per-item getWatchHistory / getWatchState calls can be served from memory
+   * instead of making individual HTTP requests.
    *
-   * Gated by MediaServerFeature.CENTRAL_WATCH_HISTORY (a centrally queryable
-   * history endpoint). Throws if not supported - callers must check
-   * supportsFeature() first; when unsupported, evaluation uses per-item queries.
+   * @param libraryId - The library about to be evaluated. Sweeps are scoped to
+   *   it and cached per library: a rule group only ever evaluates its own
+   *   library, and an unscoped sweep pays for every other one on the server.
+   *
+   * Gated by MediaServerFeature.CENTRAL_WATCH_HISTORY (watch history is
+   * fetchable in bulk, whether from one central endpoint or one sweep per
+   * user). Throws if not supported - callers must check supportsFeature()
+   * first; when unsupported, evaluation uses per-item queries.
+   *
+   * Best-effort: implementations swallow their own failures and leave no
+   * cached result, so getWatchHistory falls back to live per-item reads. A
+   * failed prefetch must never surface as "nothing was watched".
    */
-  prefetchWatchHistory(abortSignal?: AbortSignal): Promise<void>;
+  prefetchWatchHistory(options: {
+    libraryId: string;
+    abortSignal?: AbortSignal;
+  }): Promise<void>;
 
   /**
    * Get watch history for a specific item.
@@ -182,17 +211,16 @@ export interface IMediaServerService {
   /**
    * Get aggregate watch state for a specific item.
    *
-   * @param nativeViewCount - Optional native view count from the media item
-   *   metadata. Used as a fallback signal for `isWatched` when watch history
-   *   has been purged or the item was marked watched without a play event.
-   *   Note: on Plex this value is per-user (admin token), so it is only used
-   *   for the boolean `isWatched`, not for the numeric `viewCount`.
+   * @param nativeViewCount - Optional view count carried by the item's own
+   *   metadata, for the servers that record a watched state without writing a
+   *   history row (marking something played by hand, a scrobble from an
+   *   external tracker). It is an extra signal, never a replacement: where a
+   *   server reports it per account rather than per server, it can raise the
+   *   aggregate but must never lower what history already established.
    */
   getWatchState(
     itemId: string,
     nativeViewCount?: number,
-    itemTitle?: string,
-    itemType?: MediaItemType,
   ): Promise<MediaWatchState>;
 
   /**
@@ -223,12 +251,29 @@ export interface IMediaServerService {
   getActiveSessions(): Promise<Set<string>>;
 
   /**
-   * Get all collections in a library.
+   * Get all collections in a library. An empty array means the server confirmed
+   * the library holds no collections - never "the lookup failed".
+   *
+   * @throws Error on any failure to enumerate, including an uninitialized
+   * client. A failed listing read as "no collection with that title" is what
+   * makes the link lookup create a duplicate beside the real one (#3344).
+   *
+   * @param useCache - Cached by default for the per-item rule reads. Callers
+   * deciding whether a collection EXISTS must pass false; a stale listing
+   * reports one created since the last read as missing.
    */
-  getCollections(libraryId: string): Promise<MediaCollection[]>;
+  getCollections(
+    libraryId: string,
+    useCache?: boolean,
+  ): Promise<MediaCollection[]>;
 
   /**
-   * Get a specific collection by ID.
+   * Get a specific collection by ID. Undefined means the server confirmed the
+   * collection is gone (404) - never "the lookup failed".
+   *
+   * @param throwOnError - When true a failed lookup throws, so callers that
+   * unlink on "missing" can tell a deleted collection from an unreachable
+   * server. Uncertainty must never unlink.
    */
   getCollection(
     collectionId: string,
@@ -385,7 +430,10 @@ export interface IMediaServerService {
 
   /**
    * Reset metadata cache.
-   * @param itemId - If provided, only reset cache for this item. Otherwise reset all.
+   * @param itemId - If provided, invalidate at least this item's cached
+   * metadata; implementations may drop more (Jellyfin also clears its
+   * children and watch namespaces, Emby flushes everything). Otherwise
+   * reset all.
    */
   resetMetadataCache(itemId?: string): void;
 

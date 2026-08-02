@@ -1,3 +1,140 @@
+# [3.21.1](https://github.com/Maintainerr/Maintainerr/compare/v3.21.0...v3.21.1) (2026-08-02)
+
+
+### Fixes
+
+- fix(rules): answer a status code when a rule group cannot be saved, and drop the add modal's fetch effects (#3385)
+- fix(collections): report manual add failures, and the defects that cause them (#3383)
+- fix(collections): add a whole show to a season or episode collection (#3381) (#3382)
+
+### Dependencies
+
+- 2 dependency updates (js-yaml, brace-expansion)
+
+# [3.21.0](https://github.com/Maintainerr/Maintainerr/compare/v3.20.1...v3.21.0) (2026-08-01)
+
+
+### Database migrations
+
+- `1785498159951-AddCollectionLeftoverCleanup.ts`
+
+### Features
+
+- feat(actions): clean up dangling symlinks left by a per-file *arr delete (#3377)
+- feat: clean up leftover media folder after a per-file *arr delete (#3200)
+- feat(metadata): number season and episode posters and resolve their metadata (#3366)
+
+### Fixes
+
+- fix(actions): keep the leftover-cleanup fences intact on a failed listing (#3375)
+- fix(actions): stop claiming a media-server delete strands the folder (#3373)
+- fix: make the delete and prefetch logs report what actually happened (#3372)
+- fix(actions): report the leftover-cleanup skip for items not tracked in the *arr (#3371)
+- fix(ui): stop nesting the in-use rule list inside a paragraph
+- fix: add missing space in the take-action-after-days hint
+
+### Performance
+
+- perf(media-server): scope the watch-history prefetch to the library being evaluated (#3368)
+
+### Refactors
+
+- refactor: drop underscore-prefixed identifiers (#3367)
+
+### Other
+
+- docs: drop the contributor notes; the code is the reference
+- docs: move contributor notes out of docs/ into .github/notes
+- docs: drop the duplicated collection-poster page for the docs site
+- docs: drop the in-repo leftover-cleanup page for the docs site
+- docs: make the TypeORM migration commands actually runnable
+
+# [3.20.1](https://github.com/Maintainerr/Maintainerr/compare/v3.20.0...v3.20.1) (2026-07-30)
+
+
+## Highlights
+- Fixed Jellyfin and Emby metadata handling to prevent incorrect rule matches when metadata reads fail (#3364).
+- Improved performance for Jellyfin and Emby by caching per-item metadata reads, reducing redundant requests (#3355, #3363).
+- Resolved issues with Plex collections being duplicated or orphaned, ensuring accurate synchronization (#3344, #3353).
+
+## Fixes
+- Fixed Jellyfin and Emby metadata handling to fail closed when metadata reads fail, preventing incorrect rule matches (#3364).
+- Fixed Plex watched-state rules to use native watched state, resolving inaccuracies in rule matching (#3352).
+- Fixed issues with media server collections being duplicated or orphaned, and resolved errors with manual collections not being recognized (#3344, #3353).
+
+## Performance
+- Improved Jellyfin performance by serving container favorites from the watch snapshot, reducing redundant requests (#3356, #3357).
+- Improved Jellyfin and Emby performance by caching per-item metadata reads, significantly reducing redundant metadata requests (#3355, #3363).
+
+## Dependencies
+- Updated 5 dependencies, including notable packages: jsdom, @eslint-react/eslint-plugin, vite, @vitejs/plugin-react, and @swc/core.
+
+## New Contributors
+* @noahphex made their first contribution in https://github.com/Maintainerr/Maintainerr/pull/3352
+
+# [3.20.0](https://github.com/Maintainerr/Maintainerr/compare/v3.19.0...v3.20.0) (2026-07-29)
+
+
+## Highlights
+- Added Sportarr as a native application connection, enabling direct integration with its API and introducing a "Has upcoming events" rule property for shows (#3306, #3335).
+- Improved Jellyfin watch state resolution, reducing API calls and improving performance for show-level watch properties (#3337, #3345, #3346).
+
+## Features
+- Added Sportarr as a native application connection (#3306).
+- Introduced a "Has upcoming events" rule property for shows in Sportarr (#3335).
+
+## Fixes
+- Linked the Sportarr docs button to its specific section in the settings modal.
+- Ensured the newest entry is displayed in the log viewer (#3343).
+- Fixed overdue items being deleted despite postponed deletion dates (#3334).
+- Prevented handler-removed items from being re-adopted as manual collection members (#3327).
+- Updated postpone logs to display media titles instead of raw IDs (#3326).
+
+## Performance
+- Optimized Jellyfin watch state resolution to reduce API calls for show-level watch properties (#3337, #3345, #3346).
+
+## Database migrations
+- Added a new `sportarr_settings` table for Sportarr configuration.
+- Updated the `collection` table to include `sportarrSettingsId` and `sportarrQualityProfileId` columns.
+
+## Internal
+- Minor follow-up fixes and improvements for Sportarr integration (#3335).
+
+## Dependencies
+- Updated 13 dependencies, including notable packages like `@types/node`, `react-router-dom`, and `better-sqlite3`.
+
+## New Contributors
+* @Sportarr made their first contribution in https://github.com/Maintainerr/Maintainerr/pull/3306
+
+# [3.19.0](https://github.com/Maintainerr/Maintainerr/compare/v3.18.0...v3.19.0) (2026-07-27)
+
+
+## Highlights
+- Added per-item postpone deletion capability for collections, enabling external tools to manage media retention without disabling automatic deletion (#3289).
+- Fixed transient internet lookup failures that previously emptied collections and reset deletion countdowns (#3318).
+- Improved rule evaluation performance by memoizing metadata id-resolution across multiple services (#3287, #3290).
+
+## Features
+- Added per-item postpone deletion capability for collections, including an authenticated API endpoint and admin-UI control (#3289).
+
+## Fixes
+- Prevented transient internet lookup failures from emptying collections and resetting deletion countdowns (#3318).
+- Stopped re-adopting rule-removed orphans as manual members in collections (#3298).
+- Removed orphaned `@semantic-release/error@^3.0.0` from the lockfile (#3317).
+
+## Performance
+- Memoized metadata id-resolution during rule evaluation to reduce redundant calls across multiple services (#3287, #3290).
+- Raised default cache key ceiling to 1200 for improved API response caching during rule sweeps (#3284, #3286).
+
+## Database migrations
+- Added `collection_media_rule_removal` table with unique indexing to track rule-based media removal from collections.
+
+## Internal
+- Bounded external API response cache key counts to prevent memory exhaustion during bulk rule sweeps (#3284, #3286).
+
+## Dependencies
+- 27 dependency updates, including major bumps for `@semantic-release/git`, `@typescript-eslint/parser`, and `@semantic-release/changelog`.
+
 # [3.18.0](https://github.com/Maintainerr/Maintainerr/compare/v3.17.1...v3.18.0) (2026-07-18)
 
 

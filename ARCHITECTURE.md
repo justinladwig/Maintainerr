@@ -107,9 +107,10 @@ integrations, and production static serving.
   service data.
 - `src/modules/collections/` tracks matched media, exclusions, collection logs,
   posters, and collection handling actions.
-- `src/modules/actions/` contains the Radarr and Sonarr action handlers for
-  destructive or state-changing Servarr actions such as delete, unmonitor, and
-  quality profile changes.
+- `src/modules/actions/` contains the Radarr, Sonarr and Sportarr action handlers
+  for destructive or state-changing Servarr actions such as delete, unmonitor,
+  and quality profile changes, plus the opt-in leftover-folder cleanup - the one
+  place in the module that writes to the local filesystem.
 - `src/modules/tasks/` creates and tracks scheduled jobs.
 - `src/modules/events/` exposes server-sent events for rule and collection job
   progress.
@@ -258,10 +259,17 @@ See `CONTRIBUTING.md` for setup, branching, and pull request expectations.
 
 ## Feature References
 
-- `docs/collection-poster.md` describes custom collection poster storage,
-  media-server support, and switch behaviour.
-- `docs/overlay-feature.md` describes overlay templates, rendering, storage,
-  scheduling, and provider integration.
+Feature documentation lives in the `Maintainerr_docs` repository and is published
+at <https://docs.maintainerr.info>. It is the single source of truth: describe a
+feature there, not here, so the two cannot drift. This repository documents
+architecture and intent only; for how the code works, read the code.
+
+- <https://docs.maintainerr.info/collections/> covers custom collection posters
+  and the per-collection opt-in post-delete folder cleanup, including which
+  \*arr actions strand a folder, the same-path mount requirement, and the
+  guardrails.
+- <https://docs.maintainerr.info/overlays/> covers overlay templates, settings,
+  and processing behaviour.
 - `README.md` describes product capabilities, installation, API compatibility,
   and supported services.
 
