@@ -2,12 +2,15 @@ import { BasicResponseDto, PlexSetting } from '@maintainerr/contracts';
 import { Injectable } from '@nestjs/common';
 import axios from 'axios';
 import { isIP } from 'net';
-import {
-  CONNECTION_TEST_TIMEOUT_MS,
-  getErrorMessage,
-} from '../../../utils/connection-error';
+import { getErrorMessage } from '../../../utils/connection-error';
 import { createPrefetchProgressReporter } from '../../../utils/prefetch-progress';
 import cacheManager from '../../api/lib/cache';
+import { retryingHttp } from '../../api/lib/httpRetry';
+import {
+  CONNECTION_TEST_TIMEOUT_MS,
+  MEDIA_SERVER_REQUEST_TIMEOUT_MS,
+  NO_TIMEOUT,
+} from '../../api/lib/httpTimeouts';
 import PlexCommunityApi, {
   PlexCommunityErrorResponse,
   PlexCommunityWatchList,
@@ -51,8 +54,8 @@ import {
   PlexStatusResponse,
 } from './interfaces/server.interface';
 import {
+  PLEX_COMMUNITY_UNRESOLVED_USER_ERROR,
   PLEX_PAGE_SIZE,
-  PLEX_REQUEST_TIMEOUT_MS,
   WATCH_HISTORY_EXCLUDE_FIELDS,
   WATCH_HISTORY_MAX_ENTRIES,
   watchHistoryCacheKey,
@@ -262,7 +265,7 @@ export class PlexApiService {
         port: settingsPlex.port,
         https: settingsPlex.useSsl,
         token: plexToken,
-        timeout: PLEX_REQUEST_TIMEOUT_MS,
+        timeout: MEDIA_SERVER_REQUEST_TIMEOUT_MS,
       });
 
       const machineId = await this.setMachineId();
@@ -350,7 +353,7 @@ export class PlexApiService {
           port: conn.port,
           https: conn.protocol === 'https',
           token: plexToken,
-          timeout: PLEX_REQUEST_TIMEOUT_MS,
+          timeout: MEDIA_SERVER_REQUEST_TIMEOUT_MS,
         });
 
         await this.settings.updatePlexConnectionDetails({
@@ -660,11 +663,51 @@ export class PlexApiService {
         return undefined;
       }
     } catch (error) {
+      // 404 is Plex answering that the item is gone, not that it is
+      // unreachable. Blaming the connection logged one ERROR per gone item.
+      if (this.responseStatus(error) === 404) {
+        this.logger.debug(`Plex has no item with id ${key}`);
+        return undefined;
+      }
+
       this.logger.error(
         'Plex api communication failure.. Is the application running?',
       );
       this.logger.debug(error);
       return undefined;
+    }
+  }
+
+  /**
+   * Guid arrays for many items in one request. Verified on PMS 1.43.3: 240 ids
+   * answer in one response, and an unresolvable id is left out of it rather
+   * than failing the batch.
+   */
+  public async getMetadataBatch(keys: string[]): Promise<PlexMetadata[]> {
+    if (keys.length === 0) {
+      return [];
+    }
+
+    try {
+      const response = await this.plexClient.query<PlexMetadataResponse>(
+        `/library/metadata/${keys.join(',')}?includeGuids=1`,
+      );
+      return response?.MediaContainer?.Metadata ?? [];
+    } catch (error) {
+      // Plex 404s only when it holds none of the requested ids; a mixed batch
+      // is a 200 listing just the live ones (verified on PMS 1.43.3).
+      if (this.responseStatus(error) === 404) {
+        this.logger.debug(
+          `Plex has none of the ${keys.length} requested items`,
+        );
+        return [];
+      }
+
+      this.logger.error(
+        'Plex api communication failure.. Is the application running?',
+      );
+      this.logger.debug(error);
+      return [];
     }
   }
 
@@ -676,17 +719,28 @@ export class PlexApiService {
     // the one path that caches, and served pre-change metadata for the TTL.
     // Drop every option variant for this id instead.
     const cache = cacheManager.getCache('plexguid').data;
-    const uri = `/library/metadata/${mediaId}`;
+    const metadataUriPrefix = '/library/metadata/';
     // Watch state goes too, like the Jellyfin and Emby resets already do.
     // History entries are keyed by leaf ratingKey - a show or season test
     // reads its episodes' entries, not the id passed here - so the whole
     // history namespace is dropped rather than one id's key.
     const historyUri = '/status/sessions/history/all';
 
+    // Matched against the id list a uri reads, not the uri: a batch entry
+    // holding this id would otherwise keep serving its old copy. Comparing list
+    // members also keeps id 12 from matching id 123.
+    const readsMediaId = (cachedUri: string): boolean =>
+      cachedUri.startsWith(metadataUriPrefix) &&
+      cachedUri
+        .slice(metadataUriPrefix.length)
+        .split('?', 1)[0]
+        .split(',')
+        .includes(mediaId);
+
     for (const key of cache.keys()) {
       // Keys are the serialized request options, so read the uri back out
       // rather than matching on the raw key - options other than the uri end up
-      // in there too. The `?` boundary keeps id 12 from matching id 123.
+      // in there too.
       let cachedUri: string | undefined;
       try {
         cachedUri = (JSON.parse(key) as { uri?: string }).uri;
@@ -695,9 +749,8 @@ export class PlexApiService {
       }
 
       if (
-        cachedUri === uri ||
-        cachedUri?.startsWith(`${uri}?`) ||
-        cachedUri?.startsWith(historyUri)
+        cachedUri !== undefined &&
+        (readsMediaId(cachedUri) || cachedUri.startsWith(historyUri))
       ) {
         cache.del(key);
       }
@@ -1218,19 +1271,29 @@ export class PlexApiService {
   }
 
   public async deleteMediaFromDisk(plexId: number | string): Promise<void> {
-    try {
-      await this.plexClient.deleteQuery({
-        uri: `/library/metadata/${plexId}`,
-      });
-      this.logger.log(
-        `[Plex] Removed media with ID ${plexId} from Plex library.`,
-      );
-    } catch (error) {
-      this.logger.error(
-        `Something went wrong while removing media ${plexId} from Plex.`,
-      );
-      this.logger.debug(error);
+    await this.plexClient.deleteQuery({
+      uri: `/library/metadata/${plexId}`,
+      timeout: NO_TIMEOUT,
+    });
+    this.logger.log(
+      `[Plex] Removed media with ID ${plexId} from Plex library.`,
+    );
+  }
+
+  public async scanFolder(
+    libraryId: string,
+    folderPath: string,
+  ): Promise<void> {
+    // Without a path Plex scans the whole section, which is what this avoids.
+    if (!folderPath) {
+      throw new Error('scanFolder called without a folder path');
     }
+    await this.plexClient.query(
+      {
+        uri: `/library/sections/${libraryId}/refresh?path=${encodeURIComponent(folderPath)}`,
+      },
+      false,
+    );
   }
 
   public async refreshMediaMetadata(ratingKey: string): Promise<void> {
@@ -1401,7 +1464,10 @@ export class PlexApiService {
       const response: PlexLibraryResponse =
         await this.plexClient.queryAll<PlexLibraryResponse>(
           {
-            uri: `/library/collections/${collectionId}/children`,
+            // Without it Plex sends only its own `plex://` guid, which carries
+            // no imdb/tmdb/tvdb id. Undocumented on this endpoint but honoured,
+            // verified on PMS 1.43.3.
+            uri: `/library/collections/${collectionId}/children?includeGuids=1`,
           },
           useCache,
         );
@@ -1423,6 +1489,21 @@ export class PlexApiService {
     }
   }
 
+  /**
+   * Drop the cached child pages for one collection.
+   *
+   * getCollectionChildren reads through the 5-minute `plexguid` cache, so
+   * without this a mutation is followed by a stale child list - and a membership
+   * decision made from one has already produced phantom manual members once
+   * (#1446). Jellyfin invalidates the same way after every collection mutation;
+   * Emby does not cache the read at all.
+   */
+  private invalidateCollectionChildrenCache(collectionId: string): void {
+    this.plexClient?.invalidateCachedUri(
+      `/library/collections/${collectionId}/children`,
+    );
+  }
+
   public async addChildToCollection(
     collectionId: string,
     childId: string,
@@ -1432,8 +1513,12 @@ export class PlexApiService {
       const response: PlexLibraryResponse = await this.plexClient.putQuery({
         uri: `/library/collections/${collectionId}/items?uri=${this.buildCollectionItemsUri([childId])}`,
       });
+      this.invalidateCollectionChildrenCache(collectionId);
       return response.MediaContainer.Metadata[0] as PlexCollection;
     } catch (error) {
+      // A write that failed may still have been applied, so the cached child
+      // list is no more trustworthy here than on the success path.
+      this.invalidateCollectionChildrenCache(collectionId);
       const failure = this.buildCollectionMutationFailure(error);
 
       if (failure.logLevel === 'warn') {
@@ -1467,6 +1552,7 @@ export class PlexApiService {
       const response: PlexLibraryResponse = await this.plexClient.putQuery({
         uri: `/library/collections/${collectionId}/items?uri=${this.buildCollectionItemsUri(childIds)}`,
       });
+      this.invalidateCollectionChildrenCache(collectionId);
 
       return (
         (response.MediaContainer.Metadata?.[0] as PlexCollection | undefined) ??
@@ -1477,6 +1563,9 @@ export class PlexApiService {
         } as BasicResponseDto)
       );
     } catch (error) {
+      // A write that failed may still have been applied, so the cached child
+      // list is no more trustworthy here than on the success path.
+      this.invalidateCollectionChildrenCache(collectionId);
       const failure = this.buildCollectionMutationFailure(error);
 
       if (failure.logLevel === 'error') {
@@ -1591,23 +1680,33 @@ export class PlexApiService {
       await this.plexClient.deleteQuery({
         uri: `/library/collections/${collectionId}/items/${childId}`,
       });
+      this.invalidateCollectionChildrenCache(collectionId);
       return {
         status: 'OK',
         code: 1,
         message: `successfully deleted child with id ${childId}`,
       } as BasicResponseDto;
     } catch (error) {
-      this.logger.error(
-        'Plex api communication failure.. Is the application running?',
-      );
+      // A write that failed may still have been applied, so the cached child
+      // list is no more trustworthy here than on the success path.
+      this.invalidateCollectionChildrenCache(collectionId);
+
+      // Same classification the add path uses: `code` carries the status Plex
+      // answered with, or 0 when nothing answered. Callers need that difference
+      // to tell a refusal from a write that may well have applied.
+      const failure = this.buildCollectionMutationFailure(error);
+
+      if (failure.logLevel === 'warn') {
+        this.logger.warn(failure.message);
+      } else {
+        this.logger.error(failure.message);
+      }
       this.logger.debug(error);
+
       return {
         status: 'NOK',
-        code: 0,
-        message: getErrorMessage(
-          error,
-          'Plex api communication failure.. Is the application running?',
-        ),
+        code: failure.code,
+        message: failure.message,
       } as BasicResponseDto;
     }
   }
@@ -1698,10 +1797,18 @@ export class PlexApiService {
     }
   }
 
+  /**
+   * The watchlist of a single plex.tv user.
+   *
+   * `undefined` means the read failed and the watchlist is unknown, so callers
+   * must not read it as "empty" (#3307). `null` means plex.tv answered that it
+   * will not share this user's watchlist (private profile, or an account it
+   * does not know) - a permanent condition callers should skip past (#3395).
+   */
   public async getWatchlistIdsForUser(
     userId: string,
     username: string,
-  ): Promise<PlexCommunityWatchList[]> {
+  ): Promise<PlexCommunityWatchList[] | null | undefined> {
     try {
       let result: PlexCommunityWatchList[] = [];
       let next = true;
@@ -1744,8 +1851,26 @@ export class PlexApiService {
           );
           return undefined;
         } else if (resp.errors) {
+          const reason = resp.errors.map((x) => x.message).join(', ');
+          // Every error has to be the definitive one - a mixed response could
+          // still be hiding a transient failure.
+          const unresolvedUser =
+            resp.errors.length > 0 &&
+            resp.errors.every((x) =>
+              x.message?.startsWith(PLEX_COMMUNITY_UNRESOLVED_USER_ERROR),
+            );
+
+          if (unresolvedUser) {
+            // Debug, not warn: a normal, permanent state of that account, which
+            // the admin cannot act on from Maintainerr.
+            this.logger.debug(
+              `Plex is not sharing the watchlist of user ${userId} (${username}), skipping them: ${reason}`,
+            );
+            return null;
+          }
+
           this.logger.warn(
-            `Failure while fetching watchlist of user ${userId} (${username}): ${resp.errors.map((x) => x.message).join(', ')}`,
+            `Failure while fetching watchlist of user ${userId} (${username}): ${reason}`,
           );
           return undefined;
         }
@@ -1884,7 +2009,7 @@ export class PlexApiService {
       ? thumbPath
       : `${baseUrl}${thumbPath}`;
 
-    const { data } = await axios.get<ArrayBuffer>(url, {
+    const { data } = await retryingHttp.get<ArrayBuffer>(url, {
       responseType: 'arraybuffer',
       headers: {
         'X-Plex-Token': settings.auth_token,
@@ -1938,6 +2063,9 @@ export class PlexApiService {
       ':' +
       settings.port;
 
+    // Deliberately not retryingHttp: a retried network error on a 120s binary
+    // upload can leave Plex holding two copies of the same poster.
+    // eslint-disable-next-line no-restricted-syntax
     await axios.post(`${baseUrl}/library/metadata/${plexId}/posters`, buffer, {
       headers: {
         'X-Plex-Token': settings.auth_token,
@@ -1964,11 +2092,15 @@ export class PlexApiService {
         ':' +
         settings.port;
 
-      await axios.put(`${baseUrl}/library/metadata/${plexId}/poster`, null, {
-        params: { url: `upload://posters/${uploadId}` },
-        headers: { 'X-Plex-Token': settings.auth_token },
-        timeout: 30000,
-      });
+      await retryingHttp.put(
+        `${baseUrl}/library/metadata/${plexId}/poster`,
+        null,
+        {
+          params: { url: `upload://posters/${uploadId}` },
+          headers: { 'X-Plex-Token': settings.auth_token },
+          timeout: 30000,
+        },
+      );
       return true;
     } catch (error) {
       this.logger.warn(`Failed to select poster ${uploadId} for ${plexId}`);
@@ -2196,7 +2328,7 @@ export class PlexApiService {
         settings.port;
 
       // type=4 fetches episodes directly
-      const { data } = await axios.get(
+      const { data } = await retryingHttp.get(
         `${baseUrl}/library/sections/${section.key}/all`,
         {
           params: {

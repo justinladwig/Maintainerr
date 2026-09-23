@@ -1,23 +1,25 @@
 import {
+  isSportarrTvdbAlias,
   MediaItem,
   ServarrAction,
-  SPORTARR_TVDB_ALIAS_LEAGUE_OFFSET,
-  SPORTARR_TVDB_ALIAS_RANGE,
   type MaintainerrMediaStatusDetails,
   type MaintainerrMediaStatusEntry,
   type MediaItemType,
   type MediaProviderIds,
 } from '@maintainerr/contracts'
+import { Trans, useLingui } from '@lingui/react/macro'
 import React, { memo, useEffect, useMemo, useState } from 'react'
 import { useMetadataOverview } from '../../../../api/metadata'
+import useCloseOnEscape from '../../../../hooks/useCloseOnEscape'
 import { useLockBodyScroll } from '../../../../hooks/useLockBodyScroll'
 import { useMediaServerType } from '../../../../hooks/useMediaServerType'
 import GetApiHandler from '../../../../utils/ApiHandler'
 import { logClientError } from '../../../../utils/ClientLogger'
 import {
   buildMetadataPath,
+  buildProviderUrl,
+  displayProviderId,
   mediaTypeLabel,
-  toApiMediaType,
 } from '../../../../utils/mediaTypeUtils'
 import Button from '../../Button'
 import LoadingSpinner from '../../LoadingSpinner'
@@ -101,23 +103,58 @@ const metadataProviderLogos: Record<
   {
     logo: string
     alt: string
-    buildUrl: (mediaType: string, id: string) => string
     providerIdKey: keyof MediaProviderIds
   }
 > = {
   TMDB: {
     logo: `${basePath}/icons_logos/tmdb_logo.svg`,
     alt: 'TMDB Logo',
-    buildUrl: (mediaType, id) => `https://themoviedb.org/${mediaType}/${id}`,
     providerIdKey: 'tmdb',
   },
   TVDB: {
     logo: `${basePath}/icons_logos/tvdb_logo.svg`,
     alt: 'TheTVDB Logo',
-    buildUrl: (mediaType, id) =>
-      `https://thetvdb.com/dereferrer/${mediaType === 'tv' ? 'series' : 'movie'}/${id}`,
     providerIdKey: 'tvdb',
   },
+  Sportarr: {
+    logo: `${basePath}/icons_logos/sportarr_logo.svg`,
+    alt: 'Sportarr Logo',
+    providerIdKey: 'sportarr',
+  },
+}
+
+const providerBadgeClassName =
+  'flex items-center justify-center rounded-lg bg-zinc-700 p-2 text-xs text-white shadow-lg'
+
+const ProviderIdBadge = ({
+  provider,
+  providerId,
+  mediaType,
+}: {
+  provider: keyof MediaProviderIds
+  providerId: string
+  mediaType: MediaItemType
+}) => {
+  const { t } = useLingui()
+  const href = buildProviderUrl(provider, providerId, mediaType)
+  const label = `${provider}://${displayProviderId(provider, providerId)}`
+
+  if (!href) {
+    return <span className={providerBadgeClassName}>{label}</span>
+  }
+
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noreferrer"
+      title={t`Open on ${{ provider }}`}
+      className={`${providerBadgeClassName} underline transition hover:bg-zinc-600`}
+      onClick={(event) => event.stopPropagation()}
+    >
+      {label}
+    </a>
+  )
 }
 
 interface BackdropResult {
@@ -161,7 +198,10 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
     onCollectionItemRemoved,
     onCollectionItemPostponed,
   }) => {
+    const { t } = useLingui()
+
     useLockBodyScroll(true)
+    useCloseOnEscape(true, onClose)
 
     const { isPlex, isJellyfin, isEmby } = useMediaServerType()
     const [loading, setLoading] = useState<boolean>(true)
@@ -177,13 +217,17 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
     >(null)
     const [metadata, setMetadata] = useState<MediaItem | null>(null)
     const [seerrConfigured, setSeerrConfigured] = useState<boolean>(false)
-    const [requestedBy, setRequestedBy] = useState<string[]>([])
+    // Keyed by the path it was fetched for, like the backdrop below, so a
+    // change of item derives an empty list instead of resetting state.
+    const [requesterResult, setRequesterResult] = useState<{
+      requestKey: string
+      users: string[]
+    }>()
     const [maintainerrDetailsState, setMaintainerrDetailsState] = useState<{
       key: string
       details: MaintainerrMediaStatusDetails
     } | null>(null)
 
-    const mediaTypeOf = useMemo(() => toApiMediaType(mediaType), [mediaType])
     const maintainerrDetailsKey = useMemo(
       () =>
         forceStatusLoad
@@ -258,6 +302,12 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
       return season != null ? `${base}?season=${season}` : base
     }, [seerrConfigured, providerIds, metadata])
 
+    const requestedBy =
+      requesterResult?.requestKey === seerrRequestersPath
+        ? requesterResult.users
+        : []
+    const requesters = requestedBy.join(', ')
+
     const backdropRequestPath = buildMetadataPath(
       'backdrop',
       mediaType,
@@ -281,7 +331,7 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
     const summaryText =
       mediaServerSummary ||
       providerOverview ||
-      (loading || isOverviewPending ? '' : 'No summary available.')
+      (loading || isOverviewPending ? '' : t`No summary available.`)
     const providerLogo = useMemo(() => {
       if (!isCurrentBackdrop || !backdropResult.provider) return null
       const cfg = metadataProviderLogos[backdropResult.provider]
@@ -290,19 +340,10 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
         backdropResult.providerId?.toString() ??
         providerIds?.[cfg.providerIdKey]?.[0]
       if (!linkId) return null
-      // Sportarr stamps numeric aliases in the tvdb namespace on its items;
-      // no real TVDB page exists for those, so don't render a dead link.
-      if (cfg.providerIdKey === 'tvdb') {
-        const numericId = Number(linkId)
-        if (
-          numericId >= SPORTARR_TVDB_ALIAS_LEAGUE_OFFSET &&
-          numericId <
-            SPORTARR_TVDB_ALIAS_LEAGUE_OFFSET + SPORTARR_TVDB_ALIAS_RANGE
-        )
-          return null
-      }
-      return { ...cfg, linkId }
-    }, [isCurrentBackdrop, backdropResult, providerIds])
+      const href = buildProviderUrl(cfg.providerIdKey, linkId, mediaType)
+      if (!href) return null
+      return { ...cfg, href }
+    }, [isCurrentBackdrop, backdropResult, providerIds, mediaType])
 
     useEffect(() => {
       if (!maintainerrDetailsKey) {
@@ -412,7 +453,6 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
 
     useEffect(() => {
       if (!seerrRequestersPath) {
-        setRequestedBy([])
         return
       }
 
@@ -421,7 +461,10 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
       GetApiHandler<string[]>(seerrRequestersPath)
         .then((users) => {
           if (!active) return
-          setRequestedBy(users ?? [])
+          setRequesterResult({
+            requestKey: seerrRequestersPath,
+            users: users ?? [],
+          })
         })
         .catch(() => {})
 
@@ -524,23 +567,47 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
       isCurrentBackdrop && backdropResult.provider
         ? metadataProviderLogos[backdropResult.provider]?.providerIdKey
         : undefined
+    // The metadata layer answers with the league number where the media
+    // server carries the canonical id, so compare what they both read as.
     const showBackdropProviderBadge =
       !!backdropProviderKey &&
       backdropResult.providerId != null &&
-      !providerIds?.[backdropProviderKey]?.includes(
-        String(backdropResult.providerId),
+      !providerIds?.[backdropProviderKey]?.some(
+        (id) =>
+          displayProviderId(backdropProviderKey, id) ===
+          displayProviderId(
+            backdropProviderKey,
+            String(backdropResult.providerId),
+          ),
       )
+    // The Sportarr alias in the tvdb namespace only exists for tools that
+    // cannot read the sportarr id. A person gets the real one.
+    const providerBadges = (
+      ['tmdb', 'imdb', 'tvdb', 'sportarr'] as const
+    ).flatMap((provider) =>
+      (providerIds?.[provider] ?? [])
+        .filter((id) => provider !== 'tvdb' || !isSportarrTvdbAlias(Number(id)))
+        .map((id) => ({ provider, id })),
+    )
 
     return (
-      <div
-        className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-3"
-        onClick={onClose}
-      >
+      <div className="modal-backdrop px-3" onClick={onClose}>
+        {/* A column, like the shared Modal: only the body scrolls, so the
+            actions and the close stay on screen on a phone, where the sheet
+            fills the height. */}
         <div
-          className="relative max-h-[90vh] w-full max-w-4xl overflow-auto rounded-xl bg-zinc-800 shadow-lg"
+          className="relative flex max-h-[90vh] w-full max-w-4xl flex-col overflow-hidden rounded-xl bg-zinc-800 shadow-lg"
           onClick={(event) => event.stopPropagation()}
+          role="dialog"
+          aria-modal="true"
+          aria-label={title}
         >
-          <div className="relative h-72 w-full overflow-hidden p-2 xl:h-96">
+          {/* Short on a small phone: at h-72 the backdrop took two thirds of
+              the sheet and pushed the title and summary below the fold. */}
+          {/* Capped by height too: the sm height is keyed on width, so a phone
+              in landscape got the tablet backdrop and it pushed the footer
+              out of the sheet. */}
+          <div className="relative h-40 max-h-[50vh] w-full shrink-0 overflow-hidden p-2 sm:h-72 xl:h-96">
             <div
               className="h-full w-full rounded-xl bg-cover bg-center bg-no-repeat"
               style={{
@@ -576,7 +643,7 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
                   </div>
                   {metadata?.contentRating && (
                     <div className="pointer-events-none mt-1 rounded-lg bg-black/70 p-2 text-xs font-medium text-zinc-200 uppercase">
-                      {`Rated: ${metadata.contentRating}`}
+                      {t`Rated: ${{ contentRating: metadata.contentRating }}`}
                     </div>
                   )}
                 </div>
@@ -614,10 +681,7 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
                   <div className="flex h-8 w-32 justify-end">
                     {providerLogo && (
                       <a
-                        href={providerLogo.buildUrl(
-                          mediaTypeOf,
-                          providerLogo.linkId,
-                        )}
+                        href={providerLogo.href}
                         target="_blank"
                         rel="noreferrer"
                         className="block h-full w-full"
@@ -722,8 +786,11 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
                     </div>
                   )}
                 </div>
+                {/* One row of genres on a phone. Wrapped, they ran past the
+                    short backdrop and the overflow sliced them in half. The cap
+                    is exactly one chip tall, so nothing is left cut. */}
                 {metadata?.genres && metadata.genres.length > 0 ? (
-                  <div className="pointer-events-none flex flex-wrap-reverse items-end justify-end gap-1">
+                  <div className="pointer-events-none flex max-h-8 flex-wrap-reverse items-end justify-end gap-1 overflow-hidden sm:max-h-none sm:overflow-visible">
                     {metadata.genres.map((genre, index) => (
                       <span
                         key={index}
@@ -737,7 +804,7 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
               </div>
             </div>
           </div>
-          <div className="p-4">
+          <div className="flex-1 overflow-y-auto p-4">
             <div className="flex items-center justify-between border-b border-zinc-700 pb-4">
               <div>
                 <h2 className="text-xl font-semibold text-gray-100">
@@ -753,8 +820,10 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
 
             {requestedBy.length > 0 ? (
               <div className="mt-2 text-sm text-zinc-400">
-                Requested by{' '}
-                <span className="text-zinc-200">{requestedBy.join(', ')}</span>
+                <Trans>
+                  Requested by{' '}
+                  <span className="text-zinc-200">{requesters}</span>
+                </Trans>
               </div>
             ) : null}
 
@@ -776,20 +845,20 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
                     <p
                       className={`text-sm font-semibold ${maintainerrStatusCardStyles.titleClassName}`}
                     >
-                      Excluded From
+                      <Trans>Excluded From</Trans>
                     </p>
                     <div className="mt-2">
                       {maintainerrDetailsLoading
                         ? renderMaintainerrStatusItems(
                             [],
-                            'Loading exclusion details...',
+                            t`Loading exclusion details...`,
                             maintainerrStatusCardStyles.contentClassName,
                             maintainerrStatusCardStyles.emptyClassName,
                             maintainerrStatusCardStyles.linkClassName,
                           )
                         : renderMaintainerrStatusItems(
                             excludedFromEntries,
-                            'Not excluded from any collection.',
+                            t`Not excluded from any collection.`,
                             maintainerrStatusCardStyles.contentClassName,
                             maintainerrStatusCardStyles.emptyClassName,
                             maintainerrStatusCardStyles.linkClassName,
@@ -804,20 +873,20 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
                     <p
                       className={`text-sm font-semibold ${maintainerrStatusCardStyles.titleClassName}`}
                     >
-                      Manually Added To
+                      <Trans>Manually Added To</Trans>
                     </p>
                     <div className="mt-2">
                       {maintainerrDetailsLoading
                         ? renderMaintainerrStatusItems(
                             [],
-                            'Loading manual collection details...',
+                            t`Loading manual collection details...`,
                             maintainerrStatusCardStyles.contentClassName,
                             maintainerrStatusCardStyles.emptyClassName,
                             maintainerrStatusCardStyles.linkClassName,
                           )
                         : renderMaintainerrStatusItems(
                             manuallyAddedToEntries,
-                            'Not manually added to any collection.',
+                            t`Not manually added to any collection.`,
                             maintainerrStatusCardStyles.contentClassName,
                             maintainerrStatusCardStyles.emptyClassName,
                             maintainerrStatusCardStyles.linkClassName,
@@ -827,67 +896,49 @@ const MediaModalContent: React.FC<ModalContentProps> = memo(
                 ) : null}
               </div>
             ) : undefined}
-
-            <div className="mt-6 mr-0.5 flex flex-row items-center justify-between gap-4">
-              {providerIds &&
-                ['movie', 'show'].includes(mediaType) &&
-                (providerIds.tmdb?.length ||
-                  providerIds.imdb?.length ||
-                  providerIds.tvdb?.length) && (
-                  <div className="flex flex-wrap items-center gap-1 text-xs text-zinc-400">
-                    {providerIds.tmdb?.map((id) => (
-                      <span
-                        key={`tmdb-${id}`}
-                        className="flex items-center justify-center rounded-lg bg-zinc-700 p-2 text-xs text-white shadow-lg"
-                      >
-                        tmdb://{id}
-                      </span>
-                    ))}
-                    {providerIds.imdb?.map((id) => (
-                      <span
-                        key={`imdb-${id}`}
-                        className="flex items-center justify-center rounded-lg bg-zinc-700 p-2 text-xs text-white shadow-lg"
-                      >
-                        imdb://{id}
-                      </span>
-                    ))}
-                    {providerIds.tvdb?.map((id) => (
-                      <span
-                        key={`tvdb-${id}`}
-                        className="flex items-center justify-center rounded-lg bg-zinc-700 p-2 text-xs text-white shadow-lg"
-                      >
-                        tvdb://{id}
-                      </span>
-                    ))}
-                    {showBackdropProviderBadge && backdropProviderKey && (
-                      <span
-                        key={`${backdropProviderKey}-${backdropResult.providerId}`}
-                        className="flex items-center justify-center rounded-lg bg-zinc-700 p-2 text-xs text-white shadow-lg"
-                      >
-                        {backdropProviderKey}://{backdropResult.providerId}
-                      </span>
-                    )}
-                  </div>
-                )}
-              <div className="ml-auto flex space-x-3">
-                {canPostpone ? (
-                  <PostponeButton
-                    collection={collection}
-                    mediaServerId={id}
-                    onPostponed={onCollectionItemPostponed}
-                  />
-                ) : null}
-                {canTriggerRuleAction ? (
-                  <TriggerRuleButton
-                    collection={collection}
-                    mediaServerId={id}
-                    onHandled={onCollectionItemRemoved}
-                  />
-                ) : null}
-                <Button buttonType="default" onClick={onClose}>
-                  Close
-                </Button>
-              </div>
+          </div>
+          {/* Wraps: side by side these actions are wider than a phone, and
+              the sheet scrolled sideways to reach the last one. */}
+          <div className="flex shrink-0 flex-row flex-wrap items-center justify-between gap-4 p-4">
+            {['movie', 'show'].includes(mediaType) &&
+              (providerBadges.length > 0 || showBackdropProviderBadge) && (
+                <div className="flex flex-wrap items-center gap-1 text-xs text-zinc-400">
+                  {providerBadges.map(({ provider, id }) => (
+                    <ProviderIdBadge
+                      key={`${provider}-${id}`}
+                      provider={provider}
+                      providerId={id}
+                      mediaType={mediaType}
+                    />
+                  ))}
+                  {showBackdropProviderBadge && backdropProviderKey && (
+                    <ProviderIdBadge
+                      key={`${backdropProviderKey}-${backdropResult.providerId}`}
+                      provider={backdropProviderKey}
+                      providerId={String(backdropResult.providerId)}
+                      mediaType={mediaType}
+                    />
+                  )}
+                </div>
+              )}
+            <div className="ml-auto flex flex-wrap justify-end gap-3">
+              {canPostpone ? (
+                <PostponeButton
+                  collection={collection}
+                  mediaServerId={id}
+                  onPostponed={onCollectionItemPostponed}
+                />
+              ) : null}
+              {canTriggerRuleAction ? (
+                <TriggerRuleButton
+                  collection={collection}
+                  mediaServerId={id}
+                  onHandled={onCollectionItemRemoved}
+                />
+              ) : null}
+              <Button buttonType="default" onClick={onClose} type="button">
+                <Trans>Close</Trans>
+              </Button>
             </div>
           </div>
         </div>

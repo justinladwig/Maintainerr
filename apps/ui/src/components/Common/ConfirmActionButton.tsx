@@ -8,16 +8,24 @@ import PendingButton from './PendingButton'
 
 interface ConfirmActionButtonProps {
   buttonLabel: string
-  buttonIcon: ReactNode
+  buttonIcon?: ReactNode
   buttonType?: ButtonType
+  buttonClassName?: string
+  // Destructive callers pass 'danger' so the dialog's confirm carries the
+  // same weight as the action button that opened it.
+  confirmButtonType?: ButtonType
   modalTitle: string
   modalSize?: 'sm' | 'md' | 'lg' | 'xl' | '2xl' | '3xl'
   confirmLabel: string
   pendingLabel: string
+  disabled?: boolean
   confirmDisabled?: boolean
-  // Shown when the action throws without a usable message, and logged as the
-  // client-error summary.
+  // Shown when the action throws without a usable message. Translated.
   errorMessage: string
+  // Summary written to the server log. Deliberately separate from
+  // errorMessage: a log line is read by whoever is debugging the install, not
+  // by the user, so it must stay English whatever the UI language is.
+  errorLogSummary: string
   // Identifies the call site in the client error log.
   errorContext: string
   onConfirm: () => Promise<void>
@@ -33,12 +41,16 @@ const ConfirmActionButton = ({
   buttonLabel,
   buttonIcon,
   buttonType = 'default',
+  buttonClassName,
+  confirmButtonType = 'primary',
   modalTitle,
   modalSize,
   confirmLabel,
   pendingLabel,
+  disabled = false,
   confirmDisabled = false,
   errorMessage,
+  errorLogSummary,
   errorContext,
   onConfirm,
   children,
@@ -48,7 +60,7 @@ const ConfirmActionButton = ({
   const [error, setError] = useState<string | undefined>()
 
   const handleConfirm = async () => {
-    if (executing || confirmDisabled) {
+    if (disabled || executing || confirmDisabled) {
       return
     }
 
@@ -61,7 +73,7 @@ const ConfirmActionButton = ({
       setExecuting(false)
       setConfirmOpen(false)
     } catch (error) {
-      void logClientError(errorMessage, error, errorContext)
+      void logClientError(errorLogSummary, error, errorContext)
 
       setError(getApiErrorMessage(error, errorMessage))
       setExecuting(false)
@@ -70,7 +82,12 @@ const ConfirmActionButton = ({
 
   return (
     <>
-      <Button buttonType={buttonType} onClick={() => setConfirmOpen(true)}>
+      <Button
+        buttonType={buttonType}
+        className={buttonClassName}
+        disabled={disabled}
+        onClick={() => setConfirmOpen(true)}
+      >
         {buttonIcon}
         {buttonLabel}
       </Button>
@@ -90,9 +107,9 @@ const ConfirmActionButton = ({
           backgroundClickable={!executing}
           footerActions={
             <PendingButton
-              buttonType="primary"
+              buttonType={confirmButtonType}
               className="ml-3"
-              disabled={executing || confirmDisabled}
+              disabled={disabled || executing || confirmDisabled}
               isPending={executing}
               idleLabel={confirmLabel}
               pendingLabel={pendingLabel}

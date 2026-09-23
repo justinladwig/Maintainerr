@@ -21,6 +21,7 @@ import {
   Controller,
   Delete,
   Get,
+  HttpCode,
   HttpException,
   HttpStatus,
   Param,
@@ -36,10 +37,12 @@ import {
   UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
+import { InjectRepository } from '@nestjs/typeorm';
 import { Response } from 'express';
 import * as fs from 'fs';
 import { ZodValidationPipe } from 'nestjs-zod';
 import * as path from 'path';
+import { Repository } from 'typeorm';
 import {
   isSharpAvailable,
   sharp,
@@ -51,7 +54,8 @@ import {
 } from '@maintainerr/contracts';
 import { dataDir as configDataDir } from '../../app/config/dataDir';
 import { MediaServerSetupGuard } from '../api/media-server/guards/media-server-setup.guard';
-import { CollectionsService } from '../collections/collections.service';
+import { Collection } from '../collections/entities/collection.entities';
+import { CollectionMedia } from '../collections/entities/collection_media.entities';
 import { MaintainerrLogger } from '../logging/logs.service';
 import { OverlayProcessorService } from './overlay-processor.service';
 import { OverlaySettingsService } from './overlay-settings.service';
@@ -81,7 +85,10 @@ export class OverlaysController {
     private readonly taskService: OverlayTaskService,
     private readonly templateService: OverlayTemplateService,
     private readonly providerFactory: OverlayProviderFactory,
-    private readonly collectionsService: CollectionsService,
+    @InjectRepository(Collection)
+    private readonly collectionRepo: Repository<Collection>,
+    @InjectRepository(CollectionMedia)
+    private readonly collectionMediaRepo: Repository<CollectionMedia>,
     private readonly logger: MaintainerrLogger,
   ) {
     this.logger.setContext(OverlaysController.name);
@@ -190,21 +197,27 @@ export class OverlaysController {
     };
   }
 
+  /**
+   * Started, not awaited. A full run outlives any browser or reverse-proxy
+   * response timeout, and a severed response read as a failed run while the
+   * run itself carried on (#3549). Callers follow it on GET status.
+   */
   @Post('process')
-  async processAll(
+  @HttpCode(HttpStatus.ACCEPTED)
+  processAll(
     @Body(new ZodValidationPipe(overlayProcessRequestSchema))
     request: OverlayProcessRequest,
   ) {
     if (this.processorService.status === 'running') {
       throw new HttpException(
-        'Overlay processing is already running',
+        'An overlay run is already in progress',
         HttpStatus.CONFLICT,
       );
     }
-    const result = await this.processorService.processAllCollections(
-      request.force ?? false,
-    );
-    return result;
+
+    this.processorService
+      .processAllCollections(request.force ?? false)
+      .catch((error) => this.logger.error('Overlay processing failed', error));
   }
 
   @Post('process/:collectionId')
@@ -213,22 +226,23 @@ export class OverlaysController {
   ) {
     if (this.processorService.status === 'running') {
       throw new HttpException(
-        'Overlay processing is already running',
+        'An overlay run is already in progress',
         HttpStatus.CONFLICT,
       );
     }
 
-    const collection =
-      await this.collectionsService.getCollection(collectionId);
+    const collection = await this.collectionRepo.findOne({
+      where: { id: collectionId },
+    });
     if (!collection) {
       throw new HttpException('Collection not found', HttpStatus.NOT_FOUND);
     }
 
     // Ensure collectionMedia is loaded
     if (!collection.collectionMedia) {
-      const media =
-        await this.collectionsService.getCollectionMedia(collectionId);
-      collection.collectionMedia = media ?? [];
+      collection.collectionMedia = await this.collectionMediaRepo.find({
+        where: { collectionId },
+      });
     }
 
     const result = await this.processorService.processCollection(collection);
@@ -244,15 +258,18 @@ export class OverlaysController {
   }
 
   @Delete('reset')
-  async resetAll() {
+  @HttpCode(HttpStatus.ACCEPTED)
+  resetAll() {
     if (this.processorService.status === 'running') {
       throw new HttpException(
-        'Overlay processing is already running',
+        'An overlay run is already in progress',
         HttpStatus.CONFLICT,
       );
     }
-    await this.processorService.resetAllOverlays();
-    return { success: true };
+
+    this.processorService
+      .resetAllOverlays()
+      .catch((error) => this.logger.error('Overlay reset failed', error));
   }
 
   // ── Fonts ───────────────────────────────────────────────────────────────

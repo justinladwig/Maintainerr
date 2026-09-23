@@ -23,6 +23,24 @@ export interface MediaWatchState {
 }
 
 /**
+ * Per-item result of a batched collection mutation.
+ *
+ * `refused` and `unknown` are not interchangeable. The server answered for a
+ * refused id, so its state is established: the mutation did not happen. Nothing
+ * answered for an unknown id - a timeout, a dropped connection, a DNS failure -
+ * so the mutation may well have been applied. Plex commits a collection write it
+ * has begun processing and then answers late; recording that as "refused" is
+ * what leaves a server child no local row accounts for, which the manual-child
+ * import then adopts as a hand-added member.
+ *
+ * Ids absent from both lists succeeded.
+ */
+export interface CollectionMutationOutcome {
+  refused: string[];
+  unknown: string[];
+}
+
+/**
  * Core interface for media server implementations.
  * Both Plex and Jellyfin adapters must implement this interface.
  *
@@ -105,6 +123,10 @@ export interface IMediaServerService {
    * An empty page means the server confirmed there are no (more) items -
    * never "the read failed".
    *
+   * A page can hold fewer items than the limit asked for, mid-library: rows of
+   * a kind the query did not ask for are dropped (#3550). Page by offset
+   * window or resume from the rows returned; a short page is not the end.
+   *
    * @throws Error on any failure to read the page (connection, 4xx/5xx).
    * Like getCollectionChildren: a fabricated empty page would read as
    * end-of-library and let rule evaluation truncate silently, mass-removing
@@ -139,6 +161,19 @@ export interface IMediaServerService {
    * Get detailed metadata for a specific item.
    */
   getMetadata(itemId: string): Promise<MediaItem | undefined>;
+
+  /**
+   * Metadata for many items, in as few reads as the server allows.
+   *
+   * Only the items the server resolved come back, in no guaranteed order, so
+   * callers must match on `id` rather than position. An id the server does not
+   * hold is left out rather than answering an entry for it.
+   *
+   * Same read contract as `getMetadata`: an absent item and a failed read are
+   * indistinguishable, both being an id that simply is not in the result. Never
+   * use it to decide an item is gone - `itemExists` is the primitive for that.
+   */
+  getMetadataBatch(itemIds: string[]): Promise<MediaItem[]>;
 
   /**
    * Confirm an item is still present on the media server.
@@ -326,12 +361,12 @@ export interface IMediaServerService {
 
   /**
    * Add multiple items to a collection in a single operation.
-   * Returns the itemIds that failed to be added.
+   * Reports refused and unknown ids separately; see CollectionMutationOutcome.
    */
   addBatchToCollection(
     collectionId: string,
     itemIds: string[],
-  ): Promise<string[]>;
+  ): Promise<CollectionMutationOutcome>;
 
   /**
    * Remove an item from a collection.
@@ -341,12 +376,12 @@ export interface IMediaServerService {
 
   /**
    * Remove multiple items from a collection in a single operation.
-   * Returns the itemIds that failed to be removed.
+   * Reports refused and unknown ids separately; see CollectionMutationOutcome.
    */
   removeBatchFromCollection(
     collectionId: string,
     itemIds: string[],
-  ): Promise<string[]>;
+  ): Promise<CollectionMutationOutcome>;
 
   /**
    * Update a collection's metadata (title, summary, etc.)
@@ -443,4 +478,11 @@ export interface IMediaServerService {
    * on the server side - the call returns quickly while the server works async.
    */
   refreshItemMetadata(itemId: string): Promise<void>;
+
+  /**
+   * Ask the media server to rescan one folder, so an item whose files were
+   * removed behind its back (an *arr delete) drops out without a full library
+   * scan. Best-effort; the server works asynchronously.
+   */
+  scanFolder(libraryId: string, folderPath: string): Promise<void>;
 }

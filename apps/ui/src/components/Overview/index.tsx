@@ -1,8 +1,10 @@
+import { useLingui } from '@lingui/react/macro'
 import type {
   MediaItem,
   MediaLibrary,
   MediaLibrarySortParams,
 } from '@maintainerr/contracts'
+import { MediaServerFeature, supportsFeature } from '@maintainerr/contracts'
 import {
   useCallback,
   use,
@@ -14,10 +16,15 @@ import {
 } from 'react'
 import SearchContext from '../../contexts/search-context'
 import useLibrarySelection from '../../hooks/useLibrarySelection'
+import useMediaSelection from '../../hooks/useMediaSelection'
+import { useMediaServerType } from '../../hooks/useMediaServerType'
 import { useRequestGeneration } from '../../hooks/useRequestGeneration'
+import { reportBulkOutcome } from '../../utils/bulkOutcome'
 import GetApiHandler from '../../utils/ApiHandler'
 import LibrarySwitcher from '../Common/LibrarySwitcher'
 import LoadingSpinner from '../Common/LoadingSpinner'
+import MediaSelectionActions from '../Common/MediaSelectionActions'
+import type { MediaActionOutcome } from '../Common/MediaActionModal'
 import PageControlRow from '../Common/PageControlRow'
 import {
   getMediaLibrarySortConfig,
@@ -25,6 +32,7 @@ import {
   sortMediaItems,
   useMediaLibrarySort,
 } from '../Common/MediaLibrarySortControl'
+import { invalidateMaintainerrStatusDetails } from '../Common/MediaCard/maintainerrStatus'
 import OverviewContent from './Content'
 
 interface OverviewBootstrapResult {
@@ -56,6 +64,7 @@ export const buildLibraryContentQuery = ({
 }
 
 const Overview = () => {
+  const { t } = useLingui()
   const loadingRef = useRef<boolean>(false)
   const loadingExtraRef = useRef<boolean>(false)
   const [isLoading, setIsLoading] = useState(false)
@@ -63,6 +72,18 @@ const Overview = () => {
 
   const [data, setData] = useState<MediaItem[]>([])
   const dataRef = useRef<MediaItem[]>([])
+  const [statusChangedIds, setStatusChangedIds] = useState<Set<string>>(
+    () => new Set(),
+  )
+  const {
+    selectionMode,
+    selectedIds: selectedMediaIds,
+    toggleSelection,
+    toggleSelectionMode,
+    clearSelection,
+    resetSelection,
+    applyBulkOutcome,
+  } = useMediaSelection()
 
   const [totalSize, setTotalSize] = useState<number>(999)
   const totalSizeRef = useRef<number>(999)
@@ -84,6 +105,7 @@ const Overview = () => {
   const fetchingRef = useRef<boolean>(false)
   const { invalidate, guardedFetch } = useRequestGeneration()
   const SearchCtx = use(SearchContext)
+  const { mediaServerType } = useMediaServerType()
 
   const defaultLibraryId = libraries?.[0]?.id
   const effectiveSelectedLibraryId =
@@ -94,9 +116,13 @@ const Overview = () => {
   const currentLibraryType = libraries?.find(
     (library) => library.id === effectiveSelectedLibraryId,
   )?.type
+  const supportsStudioSort = supportsFeature(
+    mediaServerType,
+    MediaServerFeature.LIBRARY_STUDIO_SORT,
+  )
   const sortConfig = useMemo(
-    () => getMediaLibrarySortConfig(currentLibraryType),
-    [currentLibraryType],
+    () => getMediaLibrarySortConfig(currentLibraryType, supportsStudioSort),
+    [currentLibraryType, supportsStudioSort],
   )
   const { sortValue, sortParams, onSortChange } =
     useMediaLibrarySort(sortConfig)
@@ -161,6 +187,7 @@ const Overview = () => {
           totalSizeRef.current = nextContent.totalSize
           dataRef.current = nextContent.items
           setData(nextContent.items)
+          resetSelection()
         }
       } catch {
         setLibrariesError(true)
@@ -176,6 +203,7 @@ const Overview = () => {
       fetchAmount,
       guardedFetch,
       invalidateFetches,
+      resetSelection,
       sortParams,
     ],
   )
@@ -240,6 +268,12 @@ const Overview = () => {
           pageDataRef.current = preservedPageCount ?? pageDataRef.current + 1
           dataRef.current = mergedItems
           setData(mergedItems)
+          if (options?.replaceExisting) {
+            // The outgoing cards stay clickable while the replacement is in
+            // flight, so anything selected in that window must not survive
+            // into the new item set.
+            clearSelection()
+          }
           setLoadingExtra(false)
           setLoading(false)
           setFetching(false)
@@ -252,6 +286,7 @@ const Overview = () => {
     },
     [
       SearchCtx.search.text,
+      clearSelection,
       effectiveSelectedLibraryId,
       guardedFetch,
       libraries,
@@ -263,6 +298,10 @@ const Overview = () => {
   const performOverviewSync = useCallback(
     async (libraryId?: string, nextSortParams = sortParams) => {
       invalidateFetches()
+      // Every sync replaces the visible item set (search results, a library
+      // switch, a sort change, or leaving search), so a selection made against
+      // the previous set must never survive into the next one.
+      clearSelection()
 
       if (SearchCtx.search.text !== '') {
         setLoading(true)
@@ -282,6 +321,7 @@ const Overview = () => {
               setTotalSize(result.data.length)
               pageDataRef.current = result.data.length * 50
               setData(sortMediaItems(result.data, nextSortParams))
+              clearSelection()
               setLoading(false)
             }
           } catch {
@@ -326,6 +366,7 @@ const Overview = () => {
     [
       SearchCtx.search.text,
       applySelectedLibrary,
+      clearSelection,
       fetchData,
       guardedFetch,
       invalidateFetches,
@@ -366,6 +407,87 @@ const Overview = () => {
       effectiveSelectedLibraryId,
       nextSortState.sortParams,
     )
+  }
+
+  const handleBulkOutcome = (outcome: MediaActionOutcome) => {
+    const { action, collectionId, collectionTitle } = outcome
+    const succeededIds = new Set(outcome.succeededIds)
+    applyBulkOutcome(new Set(outcome.failedIds))
+
+    if (succeededIds.size > 0) {
+      // The server cascades an excluded show to its seasons and episodes, so
+      // visible child cards (mixed search results) must be reconciled along
+      // with the exact submitted ids.
+      const isCovered = (item: MediaItem) =>
+        succeededIds.has(item.id) ||
+        (item.parentId !== undefined && succeededIds.has(item.parentId)) ||
+        (item.grandparentId !== undefined &&
+          succeededIds.has(item.grandparentId))
+
+      const isCollectionAction = action.startsWith('collection-')
+      // Excluding everywhere also drops the items from every collection.
+      const clearsEveryCollection =
+        collectionId === undefined &&
+        (action === 'collection-remove' || action === 'exclusion-add')
+      const nextCollections = (current: string[]) => {
+        if (clearsEveryCollection) return []
+        if (!collectionTitle) return current
+        return action === 'collection-add'
+          ? [...new Set([...current, collectionTitle])].sort((left, right) =>
+              left.localeCompare(right),
+            )
+          : current.filter((title) => title !== collectionTitle)
+      }
+
+      // Only a global exclusion changes the exclusion marker; a scoped one is
+      // invisible on a library card.
+      const nextExclusionType =
+        collectionId === undefined && action === 'exclusion-add'
+          ? ('global' as const)
+          : action === 'exclusion-remove'
+            ? undefined
+            : null
+
+      // A collection action moves membership, which the card names in its own
+      // badge; only a global exclusion changes the exclusion marker, and it
+      // does both.
+      const patchCard = (item: MediaItem) => ({
+        ...item,
+        ...(nextExclusionType !== null
+          ? { maintainerrExclusionType: nextExclusionType }
+          : {}),
+        ...(isCollectionAction || clearsEveryCollection
+          ? {
+              maintainerrCollections: nextCollections(
+                item.maintainerrCollections ?? [],
+              ),
+            }
+          : {}),
+      })
+
+      if (nextExclusionType !== null || isCollectionAction) {
+        const nextItems = dataRef.current.map((item) =>
+          isCovered(item) ? patchCard(item) : item,
+        )
+        dataRef.current = nextItems
+        setData(nextItems)
+      }
+
+      const invalidated = new Set(succeededIds)
+      for (const item of dataRef.current) {
+        if (isCovered(item)) {
+          invalidated.add(item.id)
+        }
+      }
+      for (const mediaId of invalidated) {
+        invalidateMaintainerrStatusDetails(mediaId)
+      }
+      // Merged, not replaced: a second bulk action must not stop the first
+      // one's cards from loading their status.
+      setStatusChangedIds((current) => new Set([...current, ...invalidated]))
+    }
+
+    reportBulkOutcome(outcome)
   }
 
   useEffect(() => {
@@ -447,14 +569,29 @@ const Overview = () => {
 
   return (
     <>
-      <title>Overview - Maintainerr</title>
+      <title>{t`Overview - Maintainerr`}</title>
       <div className="w-full px-4">
-        {!searchUsed ? (
-          <PageControlRow
-            className="justify-end"
-            controlsClassName="sm:w-auto"
-            controls={
-              <div className="ml-auto flex w-full flex-col gap-3 sm:w-auto sm:flex-row sm:items-center sm:justify-end sm:gap-2">
+        <PageControlRow
+          sticky
+          actionsClassName="justify-center sm:justify-start"
+          controlsClassName="sm:w-auto"
+          actions={
+            <MediaSelectionActions
+              selectionMode={selectionMode}
+              onToggleSelectionMode={toggleSelectionMode}
+              selectedIds={selectedMediaIds}
+              items={data}
+              // A search spans every library, so none of them can scope the
+              // collection picker.
+              libraryId={searchUsed ? undefined : effectiveSelectedLibraryId}
+              onSubmitted={handleBulkOutcome}
+            />
+          }
+          controls={
+            !searchUsed ? (
+              // Two across on a phone: they share the pinned row with the
+              // actions, so a stacked pair would eat the screen.
+              <div className="ml-auto grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:items-center sm:justify-end">
                 <div className="w-full sm:w-[18rem]">
                   <LibrarySwitcher
                     shouldShowAllOption={false}
@@ -469,7 +606,7 @@ const Overview = () => {
                 </div>
                 <div className="w-full sm:w-[18rem]">
                   <MediaLibrarySortControl
-                    ariaLabel="Sort overview items"
+                    ariaLabel={t`Sort overview items`}
                     options={sortConfig.options}
                     value={sortValue}
                     onSortChange={handleSortChange}
@@ -477,9 +614,9 @@ const Overview = () => {
                   />
                 </div>
               </div>
-            }
-          />
-        ) : undefined}
+            ) : undefined
+          }
+        />
         {showBootstrapLoading ? (
           <div className="min-h-80">
             <LoadingSpinner />
@@ -491,7 +628,10 @@ const Overview = () => {
             loading={isLoading}
             extrasLoading={isLoadingExtra && !isLoading && hasMoreData}
             data={data}
-            libraryId={resolvedLibraryId ?? ''}
+            statusChangedMediaIds={statusChangedIds}
+            selectionMode={selectionMode}
+            selectedMediaIds={selectedMediaIds}
+            onToggleSelection={toggleSelection}
           />
         ) : (
           <OverviewContent
@@ -500,7 +640,10 @@ const Overview = () => {
             loading={isLoading}
             extrasLoading={false}
             data={data}
-            libraryId=""
+            statusChangedMediaIds={statusChangedIds}
+            selectionMode={selectionMode}
+            selectedMediaIds={selectedMediaIds}
+            onToggleSelection={toggleSelection}
           />
         )}
       </div>

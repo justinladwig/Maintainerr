@@ -33,7 +33,7 @@ Docker images for amd64 & arm64 are available from:
 
 [![Docker Hub](https://img.shields.io/badge/Docker_Hub-2496ED?style=for-the-badge&logo=docker&logoColor=white)](https://hub.docker.com/r/maintainerr/maintainerr)
 
-> **Data directory.** Maintainerr stores its data at `/opt/data` inside the container. Mount a persistent volume there in your `docker run` command or Compose file. The directory must be readable and writable by the configured `user`; if no `user` is set, make it accessible to UID:GID `1000:1000`.
+> **Data directory.** Maintainerr stores its data at `/opt/data` inside the container. Mount a persistent volume there in your `docker run` command, Compose file or Quadlet unit. The directory must be readable and writable by the configured `user`; if no `user` is set, make it accessible to UID:GID `1000:1000`.
 
 > **CPU requirement (x86-64).** Image features (overlays and collection posters) use `sharp`, whose prebuilt binaries require a CPU with the `x86-64-v2` microarchitecture. Maintainerr still starts on older CPUs, but those features are disabled. If you run in a VM and hit this, set the VM CPU type to `host`, `x86-64-v2`, or newer (e.g. Proxmox/QEMU's default `kvm64` does not expose `x86-64-v2`). This does not apply to arm64.
 
@@ -79,6 +79,8 @@ services:
 #          - UI_HOSTNAME=:: # uncomment if you want to listen on IPv6 instead (default 0.0.0.0)
 #          - UI_PORT=6247 # uncomment to change the UI port (default 6246)
 #          - GITHUB_TOKEN=ghp_yourtoken # Optional: GitHub Personal Access Token for higher API rate limits (60/hr without, 5000/hr with token)
+#          - TELEMETRY=off # uncomment to switch off the anonymous weekly usage report
+#          - SPORTARR_NET=on # uncomment to read Sportarr league artwork from sportarr.net
         ports:
           - 6246:6246
         restart: unless-stopped
@@ -89,6 +91,49 @@ services:
           start_period: 40s
           retries: 3
 ```
+
+</details>
+
+<details>
+<summary><b>Podman (Quadlet)</b></summary>
+
+Save this as `~/.config/containers/systemd/maintainerr.container`. Quadlet does not allow comments after a value, so every optional line is commented out as a whole.
+
+```ini
+[Unit]
+Description=Maintainerr
+
+[Container]
+Image=ghcr.io/maintainerr/maintainerr:latest
+ContainerName=maintainerr
+# Maps your own user to 1000:1000 inside the container, so the data directory only has to be owned by you.
+UserNS=keep-id:uid=1000,gid=1000
+Volume=%h/maintainerr/data:/opt/data:Z
+# Uncomment for the leftover-folder cleanup: your library, at the same path Radarr/Sonarr report it at
+#Volume=/path/to/media:/path/to/media:Z
+Environment=TZ=Europe/Brussels
+# Uncomment if you're serving maintainerr from a subdirectory
+#Environment=BASE_PATH=/maintainerr
+PublishPort=6246:6246
+# Uncomment to let `podman auto-update` pull new images
+#AutoUpdate=registry
+
+[Service]
+Restart=always
+TimeoutStartSec=900
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+mkdir -p ~/maintainerr/data
+systemctl --user daemon-reload
+systemctl --user start maintainerr
+loginctl enable-linger "$USER" # keeps it running while you are logged out
+```
+
+For a rootful install, put the file in `/etc/containers/systemd/` instead, replace `UserNS=` with `User=1000` and `Group=1000` (the data directory must then be owned by `1000:1000`), use an absolute data path, set `WantedBy=multi-user.target`, and run `systemctl` without `--user`.
 
 </details>
 
@@ -170,7 +215,7 @@ spec:
 
 # Features
 
-- Build rules from properties across Plex, Jellyfin, Emby, Radarr, Sonarr, Sportarr, Seerr, Tautulli and Streamystats, combined with AND/OR logic.
+- Build rules from properties across Plex, Jellyfin, Emby, Radarr, Sonarr, Sportarr, Seerr, Tautulli, Streamystats, and Tracearr, combined with AND/OR logic.
 - Use Plex, Jellyfin or Emby as your media server.
 - Switch between media server types with rule migration.
 - Deploy separate Maintainerr instances for separate media servers, each with isolated rules, collections and data.
@@ -178,12 +223,13 @@ spec:
 - Bring your own TVDB key for a second metadata source alongside the built-in TMDB - Maintainerr cross-checks IDs and years between providers and fills the gaps from whichever has the data.
 - Collect rule-matched media into a Maintainerr collection that is held for a configurable period before action - optionally pinned to the Plex home screen as a "Leaving soon" shelf.
 - Run automatic collections, or manual ones you manage; add or exclude individual items even when they match a rule.
+- Keep a collection inside Maintainerr, with no collection created on your media server - the rule, its actions, overlays and \*arr tags all still run. Per collection, off by default.
 - Delete items from your download client.
 - Manage collection membership from within your media server - Maintainerr syncs manual changes back.
 - On handling: delete files from disk, unmonitor or delete in Radarr/Sonarr/Sportarr, change quality profile, and clear requests in Seerr.
 - Render configurable overlays (text, countdown, shapes, images) onto posters and title cards on your media server(s).
 - Set a custom collection poster that survives recreation.
-- Send notifications via Discord, Slack, Telegram, Pushover, Gotify, ntfy, Pushbullet, LunaSea, email or webhook.
+- Send notifications via Discord, Slack, Telegram, Pushover, Gotify, ntfy, Pushbullet, LunaSea, email or webhook, including when a newer Maintainerr version is available.
 - Share rules through YAML import/export, the community rule library, and cross-server migration.
 - Schedule rule and collection runs with cron and watch progress live.
 - Plus storage metrics, a calendar, logs, an OpenAPI/Swagger API, health endpoints, and subfolder (`BASE_PATH`) hosting.
@@ -202,8 +248,9 @@ Maintainerr builds rules from data across these apps:
 [![Sportarr](https://img.shields.io/badge/Sportarr-E4572E?style=for-the-badge)](https://sportarr.net/)
 [![Tautulli](https://img.shields.io/badge/Tautulli-DBA81A?style=for-the-badge)](https://tautulli.com/)
 [![Streamystats](https://img.shields.io/badge/Streamystats-8A4FBE?style=for-the-badge)](https://github.com/fredrikburmester/streamystats)
+[![Tracearr](https://img.shields.io/badge/Tracearr-1F7A8C?style=for-the-badge)](https://github.com/connorgallopo/Tracearr)
 
-<sub>Tautulli is Plex-only; Streamystats is Jellyfin-only; Sportarr manages sports libraries.</sub>
+<sub>Tautulli is Plex-only; Streamystats is Jellyfin-only; Tracearr supports Plex, Jellyfin, and Emby; Sportarr manages sports libraries.</sub>
 
 # API
 
@@ -237,6 +284,23 @@ Maintainerr serves health probes under `/api/health` (prefixed with `BASE_PATH` 
 
 [See the documentation for response shapes and full details.](https://docs.maintainerr.info/)
 
+# Help us help you
+
+Maintainerr reports anonymous usage once a week. It is the only signal we have about which versions, media servers and features are actually in use, and it decides what gets built, fixed and kept.
+
+Nothing identifies your server: no account, no instance id, no hostname, no URL, no API key, no library or media name, and no IP address is read or stored. A report carries the version and platform every week, and one week in 32 a bucketed picture of which features and rule properties are in use.
+
+We checked, and reporting by default is normal for tools like ours. Where we differ is in what a report is allowed to contain.
+
+| How it works            | Common practice                 | Maintainerr              |
+| ----------------------- | ------------------------------- | ------------------------ |
+| Goes to a third party   | Yes, Google Analytics or Sentry | No, our own collector    |
+| Identifies your install | Yes, a permanent id per install | No, no id at all         |
+| Sees your IP address    | Yes, the receiving service does | No, never read or stored |
+| How often               | Every action                    | Once a week              |
+
+The exact shape of a report is one TypeScript interface, [`TelemetryPing`](packages/contracts/src/telemetry/telemetryEvent.ts). What happens to it after it arrives is documented in the [collector repository](https://github.com/Maintainerr/telemetry-collector), and the [dashboard](https://telemetry.maintainerr.info) shows what it adds up to.
+
 # Documentation
 
 Want the full picture? Every feature, setting, and gotcha, documented in detail:
@@ -255,9 +319,17 @@ Maintainerr is community-driven, and we're always looking for more hands. You do
 
 - Code - pick up an open issue or feature request, or bring your own idea.
 - Bugs - report them, or even better, send a fix.
+- Translations - see below. No git or coding needed.
 - Support - answer questions and help others on Discord.
 
 Start with [CONTRIBUTING.md](CONTRIBUTING.md), then dive into the [issues](https://github.com/Maintainerr/Maintainerr/issues) or our [Discord](https://discord.maintainerr.info). New contributors are genuinely welcome.
+
+## Translations
+[![Translation status](https://hosted.weblate.org/widget/maintainerr/matrix-auto.svg)](https://hosted.weblate.org/engage/maintainerr/)
+
+Maintainerr uses [Weblate](https://hosted.weblate.org/engage/maintainerr/) for translations. Pick your language, edit in the browser, and your work reaches everyone in the next release - no git, no pull request, no build tooling.
+
+Missing a language? Request it on Weblate and start it yourself.
 
 # Support us
 

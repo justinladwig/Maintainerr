@@ -15,6 +15,8 @@ import { ExecutionLockService } from '../tasks/execution-lock.service';
 import { TasksService } from '../tasks/tasks.service';
 import { CollectionHandler } from './collection-handler';
 import { CollectionWorkerService } from './collection-worker.service';
+import { Exclusion } from '../rules/entities/exclusion.entities';
+import { RuleGroup } from '../rules/entities/rule-group.entities';
 import { Collection } from './entities/collection.entities';
 import {
   CollectionMedia,
@@ -30,12 +32,15 @@ describe('CollectionWorkerService', () => {
   let settings: Mocked<SettingsDataService>;
   let collectionRepository: Mocked<Repository<Collection>>;
   let collectionMediaRepository: Mocked<Repository<CollectionMedia>>;
+  let exclusionRepository: Mocked<Repository<Exclusion>>;
+  let ruleGroupRepository: Mocked<Repository<RuleGroup>>;
   let seerrApi: Mocked<SeerrApiService>;
   let collectionHandler: Mocked<CollectionHandler>;
   let executionLock: Mocked<ExecutionLockService>;
   let eventEmitter: Mocked<EventEmitter2>;
   let logger: Mocked<MaintainerrLogger>;
   let mediaServerFactory: Mocked<MediaServerFactory>;
+  let getMetadataBatch: jest.Mock;
 
   beforeEach(async () => {
     const { unit, unitRef } = await TestBed.solitary(
@@ -51,6 +56,8 @@ describe('CollectionWorkerService', () => {
     collectionMediaRepository = unitRef.get(
       getRepositoryToken(CollectionMedia) as string,
     );
+    exclusionRepository = unitRef.get(getRepositoryToken(Exclusion) as string);
+    ruleGroupRepository = unitRef.get(getRepositoryToken(RuleGroup) as string);
     seerrApi = unitRef.get(SeerrApiService);
     collectionHandler = unitRef.get(CollectionHandler);
     executionLock = unitRef.get(ExecutionLockService);
@@ -60,9 +67,13 @@ describe('CollectionWorkerService', () => {
 
     executionLock.acquire.mockResolvedValue(jest.fn());
     eventEmitter.emit.mockImplementation();
+    exclusionRepository.find.mockResolvedValue([]);
+    ruleGroupRepository.find.mockResolvedValue([]);
+    getMetadataBatch = jest.fn().mockResolvedValue([]);
     mediaServerFactory.verifyConnection.mockResolvedValue({
       supportsFeature: jest.fn().mockReturnValue(false),
       getActiveSessions: jest.fn().mockResolvedValue(new Set<string>()),
+      getMetadataBatch,
     } as any);
   });
 
@@ -111,6 +122,66 @@ describe('CollectionWorkerService', () => {
     expect(collectionHandler.handleMedia).not.toHaveBeenCalled();
   });
 
+  it('should not handle media for a collection with no deletion window set', async () => {
+    // A null window is "never" to the contracts helper, the collection card and
+    // the overlay processor. The due query read it as 0, which made every member
+    // due at once and handed the whole collection to a DELETE action.
+    const collection = createCollection({
+      arrAction: ServarrAction.DELETE,
+      deleteAfterDays: null,
+    });
+    const collectionMedia = createCollectionMedia(collection);
+
+    collectionRepository.find.mockResolvedValue([collection]);
+    collectionMediaRepository.find.mockResolvedValue([collectionMedia]);
+
+    await collectionWorkerService.execute();
+
+    expect(collectionHandler.handleMedia).not.toHaveBeenCalled();
+  });
+
+  it('should still handle a quality profile collection that has no window', async () => {
+    // The rule form hides the timer for CHANGE_QUALITY_PROFILE and saves no
+    // window, so skipping every null-window collection would strand every such
+    // rule forever and no profile change would ever reach the *arr.
+    const collection = createCollection({
+      arrAction: ServarrAction.CHANGE_QUALITY_PROFILE,
+      deleteAfterDays: null,
+    });
+    const collectionMedia = createCollectionMedia(collection);
+
+    collectionRepository.find.mockResolvedValue([collection]);
+    collectionMediaRepository.find.mockResolvedValue([collectionMedia]);
+    collectionHandler.handleMedia.mockResolvedValue('handled');
+
+    await collectionWorkerService.execute();
+
+    expect(collectionHandler.handleMedia).toHaveBeenCalled();
+  });
+
+  it("should not let a converted rule's leftover window delay a profile change", async () => {
+    // Converting a rule keeps the previous action's window, and the form shows
+    // no timer for CHANGE_QUALITY_PROFILE, so honouring it would silently hold
+    // the profile change back for that many days.
+    const collection = createCollection({
+      arrAction: ServarrAction.CHANGE_QUALITY_PROFILE,
+      deleteAfterDays: 30,
+    });
+    const collectionMedia = createCollectionMedia(collection);
+
+    collectionRepository.find.mockResolvedValue([collection]);
+    collectionMediaRepository.find.mockResolvedValue([collectionMedia]);
+    collectionHandler.handleMedia.mockResolvedValue('handled');
+
+    await collectionWorkerService.execute();
+
+    // A 30-day window would put the cutoff 30 days back; due-now is today.
+    const [{ where }] = collectionMediaRepository.find.mock.calls.at(-1)!;
+    const cutoff = (where as { addDate: { value: Date } }).addDate.value;
+    expect(Date.now() - cutoff.getTime()).toBeLessThan(60_000);
+    expect(collectionHandler.handleMedia).toHaveBeenCalled();
+  });
+
   it('should handle media for collection and trigger availability syncs', async () => {
     settings.seerrConfigured.mockReturnValue(true);
 
@@ -134,6 +205,118 @@ describe('CollectionWorkerService', () => {
     });
     expect(collectionHandler.handleMedia).toHaveBeenCalled();
     expect(seerrApi.api.post).toHaveBeenCalled();
+  });
+
+  describe('exclusions protect a due member from the delete action', () => {
+    const arrangeDueMember = (
+      exclusions: Partial<Exclusion>[],
+      {
+        mediaServerId = 'episode-1',
+        ruleGroups = [] as Partial<RuleGroup>[],
+      } = {},
+    ) => {
+      const collection = createCollection({
+        arrAction: ServarrAction.DELETE,
+        type: 'movie',
+      });
+
+      collectionRepository.find.mockResolvedValue([collection]);
+      collectionMediaRepository.find.mockResolvedValue([
+        createCollectionMedia(collection, { mediaServerId }),
+      ]);
+      exclusionRepository.find.mockResolvedValue(exclusions as Exclusion[]);
+      ruleGroupRepository.find.mockResolvedValue(ruleGroups as RuleGroup[]);
+      collectionHandler.handleMedia.mockResolvedValue('handled');
+
+      return collection;
+    };
+
+    it('skips a globally excluded member', async () => {
+      arrangeDueMember([{ mediaServerId: 'episode-1', ruleGroupId: null }]);
+
+      await collectionWorkerService.execute();
+
+      expect(collectionHandler.handleMedia).not.toHaveBeenCalled();
+    });
+
+    it('skips a member excluded from this collection', async () => {
+      const collection = arrangeDueMember([
+        { mediaServerId: 'episode-1', ruleGroupId: 4 },
+      ]);
+      ruleGroupRepository.find.mockResolvedValue([
+        { id: 4, collectionId: collection.id } as RuleGroup,
+      ]);
+
+      await collectionWorkerService.execute();
+
+      expect(collectionHandler.handleMedia).not.toHaveBeenCalled();
+    });
+
+    it('still handles a member excluded from a different collection', async () => {
+      const collection = arrangeDueMember([
+        { mediaServerId: 'episode-1', ruleGroupId: 4 },
+      ]);
+      ruleGroupRepository.find.mockResolvedValue([
+        { id: 4, collectionId: collection.id + 1 } as RuleGroup,
+      ]);
+
+      await collectionWorkerService.execute();
+
+      expect(collectionHandler.handleMedia).toHaveBeenCalled();
+    });
+
+    it.each<[string, Partial<Exclusion>]>([
+      ['a show', { mediaServerId: 'show-1', ruleGroupId: null, type: 'show' }],
+      [
+        'a season',
+        { mediaServerId: 'season-1', ruleGroupId: null, type: 'season' },
+      ],
+      [
+        'a legacy untyped row',
+        { mediaServerId: 'other-1', ruleGroupId: null, parent: 'season-1' },
+      ],
+    ])('skips a member %s exclusion cascades to', async (_label, exclusion) => {
+      arrangeDueMember([exclusion]);
+      getMetadataBatch.mockResolvedValue([
+        { id: 'episode-1', parentId: 'season-1', grandparentId: 'show-1' },
+      ]);
+
+      await collectionWorkerService.execute();
+
+      expect(getMetadataBatch).toHaveBeenCalledWith(['episode-1']);
+      expect(collectionHandler.handleMedia).not.toHaveBeenCalled();
+    });
+
+    it('does not read the hierarchy when no exclusion reaches past its own id', async () => {
+      arrangeDueMember([{ mediaServerId: 'other-1', ruleGroupId: null }]);
+
+      await collectionWorkerService.execute();
+
+      expect(getMetadataBatch).not.toHaveBeenCalled();
+      expect(collectionHandler.handleMedia).toHaveBeenCalled();
+    });
+
+    // A batch read omits what it could not resolve, so an unread hierarchy
+    // cannot show the member sits outside the cascade.
+    it.each([
+      ['fails', () => getMetadataBatch.mockRejectedValue(new Error('boom'))],
+      [
+        'answers for other ids only',
+        () => getMetadataBatch.mockResolvedValue([{ id: 'episode-2' }]),
+      ],
+    ])(
+      'leaves a member to the next run when the batch %s',
+      async (_l, fault) => {
+        arrangeDueMember([
+          { mediaServerId: 'show-9', ruleGroupId: null, type: 'show' },
+        ]);
+        fault();
+
+        await collectionWorkerService.execute();
+
+        expect(collectionHandler.handleMedia).not.toHaveBeenCalled();
+      },
+    );
   });
 
   it('captures the media title before handling and carries it on the handled event (#3249)', async () => {
@@ -389,7 +572,7 @@ describe('CollectionWorkerService', () => {
       "Skipping collection 'Radarr + Seerr' because no media is due for handling",
     );
     expect(logger.log).toHaveBeenCalledWith(
-      'Collection handler summary: 2 total (isActive), 0 skipped (Do Nothing), 2 skipped (no due media), 0 queued for handling',
+      'Collection handler summary: 2 total (isActive), 0 skipped (Do Nothing), 0 skipped (no window set), 2 skipped (no due media), 0 queued for handling',
     );
   });
 });

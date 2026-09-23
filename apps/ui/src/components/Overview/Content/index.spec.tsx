@@ -1,5 +1,5 @@
-import { cleanup, render, screen } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { fireEvent, render, screen } from '../../../test-utils/render'
+import { describe, expect, it, vi } from 'vitest'
 import OverviewContent from './index'
 
 vi.mock('../../Common/LoadingSpinner', () => ({
@@ -22,13 +22,21 @@ vi.mock('../../Common/MediaCard', () => ({
     episodeNumber,
     episodeTitle,
     summary,
+    id,
+    selectionMode,
+    selected,
+    onToggleSelection,
   }: {
     title: string
+    id: string
     exclusionId?: number
     seasonNumber?: number
     episodeNumber?: number
     episodeTitle?: string
     summary?: string
+    selectionMode?: boolean
+    selected?: boolean
+    onToggleSelection?: (mediaId: string, selected: boolean) => void
   }) => (
     <div>
       <span>{title}</span>
@@ -41,15 +49,19 @@ vi.mock('../../Common/MediaCard', () => ({
         {episodeTitle ?? 'none'}
       </span>
       <span data-testid={`summary-${title}`}>{summary ?? 'none'}</span>
+      {selectionMode ? (
+        <button
+          data-testid={`select-${title}`}
+          onClick={() => onToggleSelection?.(id, !selected)}
+        >
+          Select
+        </button>
+      ) : null}
     </div>
   ),
 }))
 
 describe('OverviewContent', () => {
-  afterEach(() => {
-    cleanup()
-  })
-
   it('uses the delayed shared spinner for the initial empty overview load', () => {
     render(
       <OverviewContent
@@ -58,7 +70,6 @@ describe('OverviewContent', () => {
         loading={true}
         extrasLoading={false}
         fetchData={vi.fn()}
-        libraryId="library-1"
       />,
     )
 
@@ -80,7 +91,6 @@ describe('OverviewContent', () => {
         loading={false}
         extrasLoading={true}
         fetchData={vi.fn()}
-        libraryId="library-1"
       />,
     )
 
@@ -109,7 +119,6 @@ describe('OverviewContent', () => {
         loading={false}
         extrasLoading={true}
         fetchData={vi.fn()}
-        libraryId="library-1"
       />,
     )
 
@@ -137,7 +146,6 @@ describe('OverviewContent', () => {
         loading={true}
         extrasLoading={false}
         fetchData={vi.fn()}
-        libraryId="library-1"
       />,
     )
 
@@ -162,11 +170,36 @@ describe('OverviewContent', () => {
         loading={false}
         extrasLoading={false}
         fetchData={vi.fn()}
-        libraryId="library-1"
       />,
     )
 
     expect(screen.getByTestId('excluded-Item One')).toBeTruthy()
+  })
+
+  it('passes selection state and changes through to overview cards', () => {
+    const onSelectionChange = vi.fn()
+
+    render(
+      <OverviewContent
+        data={[
+          {
+            id: '1',
+            title: 'Item One',
+            type: 'movie',
+          } as any,
+        ]}
+        dataFinished={true}
+        loading={false}
+        extrasLoading={false}
+        fetchData={vi.fn()}
+        selectionMode
+        selectedMediaIds={new Set(['1'])}
+        onToggleSelection={onSelectionChange}
+      />,
+    )
+
+    fireEvent.click(screen.getByTestId('select-Item One'))
+    expect(onSelectionChange).toHaveBeenCalledWith('1', false)
   })
 
   it('gives season cards their season number and the season description', () => {
@@ -186,7 +219,6 @@ describe('OverviewContent', () => {
         loading={false}
         extrasLoading={false}
         fetchData={vi.fn()}
-        libraryId="library-1"
       />,
     )
 
@@ -214,7 +246,6 @@ describe('OverviewContent', () => {
         loading={false}
         extrasLoading={false}
         fetchData={vi.fn()}
-        libraryId="library-1"
       />,
     )
 
@@ -245,7 +276,6 @@ describe('OverviewContent', () => {
         loading={false}
         extrasLoading={false}
         fetchData={vi.fn()}
-        libraryId="library-1"
       />,
     )
 

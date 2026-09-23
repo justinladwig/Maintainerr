@@ -1,22 +1,49 @@
-import type { MediaLibrary } from '@maintainerr/contracts'
-import {
-  cleanup,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { MediaServerType, type MediaLibrary } from '@maintainerr/contracts'
+import { fireEvent, render, screen, waitFor } from '../../test-utils/render'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { toast } from 'react-toastify'
 import { SearchContextProvider } from '../../contexts/search-context'
+import { useMediaServerType } from '../../hooks/useMediaServerType'
 import GetApiHandler from '../../utils/ApiHandler'
 import {
   getCollectionMediaSortConfig,
   getMediaLibrarySortConfig,
 } from '../Common/MediaLibrarySortControl'
+import type { MediaActionOutcome } from '../Common/MediaActionModal'
 import Overview, { buildLibraryContentQuery } from './index'
 
 vi.mock('../../utils/ApiHandler', () => ({
   default: vi.fn(),
+}))
+
+vi.mock('../../hooks/useMediaServerType', () => ({
+  useMediaServerType: vi.fn(),
+}))
+
+// The shared modal has its own spec; this only hands back an outcome.
+let submittedOutcome: MediaActionOutcome = {
+  action: 'exclusion-add',
+  succeededIds: [],
+  failedIds: [],
+}
+
+vi.mock('../Common/MediaActionModal', () => ({
+  default: ({
+    onSubmitted,
+  }: {
+    onSubmitted: (outcome: MediaActionOutcome) => void
+  }) => (
+    <button
+      data-testid="media-action-submit"
+      onClick={() => onSubmitted(submittedOutcome)}
+    >
+      Submit
+    </button>
+  ),
+}))
+
+vi.mock('react-toastify', () => ({
+  toast: { success: vi.fn(), error: vi.fn() },
 }))
 
 vi.mock('../Common/LibrarySwitcher', () => ({
@@ -33,10 +60,16 @@ vi.mock('./Content', () => ({
     data,
     fetchData,
     loading,
+    selectionMode,
+    selectedMediaIds,
+    onToggleSelection,
   }: {
     data: Array<{ id: string; title: string }>
     fetchData: () => void
     loading: boolean
+    selectionMode?: boolean
+    selectedMediaIds?: ReadonlySet<string>
+    onToggleSelection?: (mediaId: string, selected: boolean) => void
   }) => (
     <div>
       {loading ? <span data-testid="overview-content-loading" /> : null}
@@ -45,20 +78,60 @@ vi.mock('./Content', () => ({
       </button>
       <div data-testid="overview-items">
         {data.map((item) => (
-          <span key={item.id}>{item.title}</span>
+          <span key={item.id}>
+            {item.title}
+            <span data-testid={`overview-exclusion-${item.id}`}>
+              {(item as { maintainerrExclusionType?: string })
+                .maintainerrExclusionType ?? 'none'}
+            </span>
+            {selectionMode ? (
+              <button
+                data-testid={`overview-select-${item.id}`}
+                onClick={() =>
+                  onToggleSelection?.(item.id, !selectedMediaIds?.has(item.id))
+                }
+              >
+                Select
+              </button>
+            ) : null}
+          </span>
         ))}
       </div>
     </div>
   ),
 }))
 
+const buildMediaServerTypeResult = (
+  mediaServerType: MediaServerType,
+): ReturnType<typeof useMediaServerType> => ({
+  mediaServerType,
+  isLoading: false,
+  isPlex: mediaServerType === MediaServerType.PLEX,
+  isJellyfin: mediaServerType === MediaServerType.JELLYFIN,
+  isEmby: mediaServerType === MediaServerType.EMBY,
+  isMediaServerTypeSelected: true,
+  isSetupComplete: true,
+  isNotConfigured: false,
+})
+
 describe('Overview', () => {
   const getApiHandlerMock = vi.mocked(GetApiHandler)
+  const useMediaServerTypeMock = vi.mocked(useMediaServerType)
   let libraries: MediaLibrary[] | undefined
 
   beforeEach(() => {
     libraries = undefined
     getApiHandlerMock.mockReset()
+    submittedOutcome = {
+      action: 'exclusion-add',
+      succeededIds: [],
+      failedIds: [],
+    }
+    vi.mocked(toast.success).mockReset()
+    vi.mocked(toast.error).mockReset()
+    useMediaServerTypeMock.mockReturnValue(
+      buildMediaServerTypeResult(MediaServerType.PLEX),
+    )
 
     getApiHandlerMock.mockImplementation(async (path: string) => {
       if (path.startsWith('/media-server/overview/bootstrap?')) {
@@ -81,10 +154,6 @@ describe('Overview', () => {
 
       throw new Error(`Unexpected API request: ${path}`)
     })
-  })
-
-  afterEach(() => {
-    cleanup()
   })
 
   it('shows title ascending as the default overview option', () => {
@@ -114,6 +183,263 @@ describe('Overview', () => {
         sortOrder: 'desc',
       },
     })
+  })
+
+  it('adds studio sorting only for a media server with native support', () => {
+    expect(
+      getMediaLibrarySortConfig('show').options.some(
+        (option) => option.value === 'studio.asc',
+      ),
+    ).toBe(false)
+    expect(
+      getMediaLibrarySortConfig('show', true).options.some(
+        (option) => option.value === 'studio.asc',
+      ),
+    ).toBe(true)
+    expect(
+      getCollectionMediaSortConfig('show').options.some(
+        (option) => option.value === 'studio.asc',
+      ),
+    ).toBe(false)
+    expect(
+      getCollectionMediaSortConfig('show', false, true).options.some(
+        (option) => option.value === 'studio.asc',
+      ),
+    ).toBe(true)
+  })
+
+  it('shows studio sorting when Jellyfin is configured', async () => {
+    useMediaServerTypeMock.mockReturnValue(
+      buildMediaServerTypeResult(MediaServerType.JELLYFIN),
+    )
+
+    render(
+      <SearchContextProvider>
+        <Overview />
+      </SearchContextProvider>,
+    )
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole('option', { name: 'Studio (A-Z) Ascending' }),
+      ).toBeTruthy()
+    })
+  })
+
+  it('keeps failed bulk exclusions selected and reports the partial result', async () => {
+    libraries = [
+      {
+        id: 'movies-library',
+        title: 'Movies',
+        type: 'movie',
+      } as MediaLibrary,
+    ]
+    getApiHandlerMock.mockImplementation(async (path: string) => {
+      if (path.startsWith('/media-server/overview/bootstrap?')) {
+        return {
+          libraries,
+          selectedLibraryId: 'movies-library',
+          content: {
+            totalSize: 2,
+            items: [
+              { id: 'item-1', title: 'Item One', type: 'movie' },
+              { id: 'item-2', title: 'Item Two', type: 'movie' },
+            ],
+          },
+        }
+      }
+      throw new Error(`Unexpected API request: ${path}`)
+    })
+    submittedOutcome = {
+      action: 'exclusion-add',
+      succeededIds: ['item-1'],
+      failedIds: ['item-2'],
+    }
+
+    render(
+      <SearchContextProvider>
+        <Overview />
+      </SearchContextProvider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Item One')).toBeTruthy()
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Select items' }))
+    fireEvent.click(screen.getByTestId('overview-select-item-1'))
+    fireEvent.click(screen.getByTestId('overview-select-item-2'))
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Add/Exclude selected (2)' }),
+    )
+    fireEvent.click(screen.getByTestId('media-action-submit'))
+
+    await waitFor(() => {
+      expect(toast.error).toHaveBeenCalledWith(
+        '1 item excluded everywhere. 1 item could not be excluded everywhere; the failed items stay selected.',
+      )
+    })
+    expect(
+      screen.getByRole('button', { name: 'Add/Exclude selected (1)' }),
+    ).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Done selecting' })).toBeTruthy()
+  })
+
+  it('closes selection mode once a bulk exclusion leaves nothing selected', async () => {
+    libraries = [
+      { id: 'movies-library', title: 'Movies', type: 'movie' } as MediaLibrary,
+    ]
+    getApiHandlerMock.mockImplementation(async (path: string) => {
+      if (path.startsWith('/media-server/overview/bootstrap?')) {
+        return {
+          libraries,
+          selectedLibraryId: 'movies-library',
+          content: {
+            totalSize: 1,
+            items: [{ id: 'item-1', title: 'Item One', type: 'movie' }],
+          },
+        }
+      }
+      throw new Error(`Unexpected API request: ${path}`)
+    })
+    submittedOutcome = {
+      action: 'exclusion-add',
+      succeededIds: ['item-1'],
+      failedIds: [],
+    }
+
+    render(
+      <SearchContextProvider>
+        <Overview />
+      </SearchContextProvider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Item One')).toBeTruthy()
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Select items' }))
+    fireEvent.click(screen.getByTestId('overview-select-item-1'))
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Add/Exclude selected (1)' }),
+    )
+    fireEvent.click(screen.getByTestId('media-action-submit'))
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Select items' })).toBeTruthy()
+    })
+    expect(screen.queryByTestId('overview-select-item-1')).toBeNull()
+  })
+
+  it('reconciles visible child cards when their show is bulk excluded', async () => {
+    libraries = [
+      {
+        id: 'shows-library',
+        title: 'Shows',
+        type: 'show',
+      } as MediaLibrary,
+    ]
+    getApiHandlerMock.mockImplementation(async (path: string) => {
+      if (path.startsWith('/media-server/overview/bootstrap?')) {
+        return {
+          libraries,
+          selectedLibraryId: 'shows-library',
+          content: {
+            totalSize: 2,
+            items: [
+              { id: 'show-1', title: 'Sample Show', type: 'show' },
+              {
+                id: 'episode-1',
+                title: 'Sample Episode',
+                type: 'episode',
+                grandparentId: 'show-1',
+              },
+            ],
+          },
+        }
+      }
+      throw new Error(`Unexpected API request: ${path}`)
+    })
+    submittedOutcome = {
+      action: 'exclusion-add',
+      succeededIds: ['show-1'],
+      failedIds: [],
+    }
+
+    render(
+      <SearchContextProvider>
+        <Overview />
+      </SearchContextProvider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Sample Show')).toBeTruthy()
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Select items' }))
+    fireEvent.click(screen.getByTestId('overview-select-show-1'))
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Add/Exclude selected (1)' }),
+    )
+    fireEvent.click(screen.getByTestId('media-action-submit'))
+
+    // the cascade covers the visible episode even though only the show id
+    // was submitted
+    await waitFor(() => {
+      expect(
+        screen.getByTestId('overview-exclusion-episode-1').textContent,
+      ).toBe('global')
+    })
+    expect(screen.getByTestId('overview-exclusion-show-1').textContent).toBe(
+      'global',
+    )
+  })
+
+  it('clears selection and exits multi-select mode when done selecting', async () => {
+    libraries = [
+      {
+        id: 'movies-library',
+        title: 'Movies',
+        type: 'movie',
+      } as MediaLibrary,
+    ]
+    getApiHandlerMock.mockImplementation(async (path: string) => {
+      if (path.startsWith('/media-server/overview/bootstrap?')) {
+        return {
+          libraries,
+          selectedLibraryId: 'movies-library',
+          content: {
+            totalSize: 1,
+            items: [{ id: 'item-1', title: 'Item One', type: 'movie' }],
+          },
+        }
+      }
+      throw new Error(`Unexpected API request: ${path}`)
+    })
+
+    render(
+      <SearchContextProvider>
+        <Overview />
+      </SearchContextProvider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Item One')).toBeTruthy()
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Select items' }))
+    fireEvent.click(screen.getByTestId('overview-select-item-1'))
+    expect(
+      screen
+        .getByRole('button', { name: 'Add/Exclude selected (1)' })
+        .hasAttribute('disabled'),
+    ).toBe(false)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Done selecting' }))
+
+    expect(screen.getByRole('button', { name: 'Select items' })).toBeTruthy()
+    expect(screen.queryByTestId('overview-select-item-1')).toBeNull()
+    expect(
+      screen
+        .getByRole('button', { name: 'Add/Exclude selected' })
+        .hasAttribute('disabled'),
+    ).toBe(true)
   })
 
   it('bootstraps overview data in a single request before rendering the first page', async () => {
@@ -366,6 +692,65 @@ describe('Overview', () => {
     expect(getApiHandlerMock.mock.calls[2]?.[0]).toContain(
       'sort=title&sortOrder=asc',
     )
+  })
+
+  it('clears selected items when changing the overview sort', async () => {
+    libraries = [
+      {
+        id: 'shows-library',
+        title: 'Shows',
+        type: 'show',
+      } as MediaLibrary,
+    ]
+    getApiHandlerMock.mockImplementation(async (path: string) => {
+      if (path.startsWith('/media-server/overview/bootstrap?')) {
+        return {
+          libraries,
+          selectedLibraryId: 'shows-library',
+          content: {
+            totalSize: 1,
+            items: [{ id: 'item-1', title: 'Item One', type: 'show' }],
+          },
+        }
+      }
+      if (path.startsWith('/media-server/library/shows-library/content?')) {
+        return {
+          totalSize: 1,
+          items: [{ id: 'item-2', title: 'Item Two', type: 'show' }],
+        }
+      }
+      throw new Error(`Unexpected API request: ${path}`)
+    })
+
+    render(
+      <SearchContextProvider>
+        <Overview />
+      </SearchContextProvider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Item One')).toBeTruthy()
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Select items' }))
+    fireEvent.click(screen.getByTestId('overview-select-item-1'))
+    expect(
+      screen
+        .getByRole('button', { name: 'Add/Exclude selected (1)' })
+        .hasAttribute('disabled'),
+    ).toBe(false)
+
+    fireEvent.change(screen.getByLabelText('Sort overview items'), {
+      target: { value: 'title.desc' },
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText('Item Two')).toBeTruthy()
+    })
+    expect(
+      screen
+        .getByRole('button', { name: 'Add/Exclude selected' })
+        .hasAttribute('disabled'),
+    ).toBe(true)
   })
 
   it('keeps existing overview items visible while a refreshed request is in flight', async () => {

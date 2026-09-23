@@ -8,6 +8,7 @@ export interface PlexMetadata {
   title: string;
   summary?: string;
   year?: number;
+  studio?: string;
   Guid: {
     id: string;
   }[];
@@ -34,11 +35,16 @@ export interface PlexMetadata {
   Role?: PlexActor[];
   originallyAvailableAt: string;
   Media: Media[];
+  // A show's folder(s); only the single-item read carries it.
+  Location?: { path: string }[];
   Genre?: PlexGenre[];
   parentTitle?: string;
   grandparentTitle?: string;
   Rating?: PlexRating[];
   contentRating?: string;
+  // /library/metadata/{id} and /search carry these; a child listing does not.
+  librarySectionID?: number;
+  librarySectionTitle?: string;
 }
 
 export interface PlexMediaPart {

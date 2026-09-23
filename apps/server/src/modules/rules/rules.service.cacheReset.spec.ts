@@ -4,7 +4,7 @@ import {
   createMockServarrTagService,
 } from '../../../test/utils/data';
 import cacheManager, { Cache } from '../api/lib/cache';
-import { RulesDto } from './dtos/rules.dto';
+import { RuleGroupDto } from './dtos/ruleGroup.dto';
 import { RulesService } from './rules.service';
 
 /**
@@ -40,6 +40,8 @@ describe('RulesService.resetCacheIfGroupUsesRuleThatRequiresIt', () => {
       {} as any,
       createMockServarrTagService() as any,
       logger as any,
+      {} as any,
+      { getUsernames: jest.fn().mockResolvedValue([]) } as any,
     );
 
   const stubGetRuleConstants = (service: RulesService) => {
@@ -78,7 +80,7 @@ describe('RulesService.resetCacheIfGroupUsesRuleThatRequiresIt', () => {
         }),
       },
     ],
-  } as unknown as RulesDto;
+  } as unknown as RuleGroupDto;
 
   const spyOnCache = (cacheId: 'plextv' | 'plexguid' | 'jellyfin' | 'emby') => {
     const cache = cacheManager.getCache(cacheId) as Cache;

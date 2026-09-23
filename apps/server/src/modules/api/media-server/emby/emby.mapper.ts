@@ -127,12 +127,13 @@ export class EmbyMapper {
       parentGuid: parentId,
       grandparentGuid: grandparentId,
       type: EmbyMapper.toMediaItemType(item.Type),
-      addedAt: item.DateCreated ? new Date(item.DateCreated) : new Date(),
+      addedAt: new Date(item.DateCreated ?? ''),
       updatedAt: extras.DateLastSaved
         ? new Date(extras.DateLastSaved)
         : undefined,
       providerIds: EmbyMapper.extractProviderIds(item.ProviderIds),
       mediaSources: EmbyMapper.toMediaSources(item.MediaSources),
+      path: item.Path || undefined,
       library: {
         id: item.ParentId || '',
         title: '',
@@ -162,6 +163,9 @@ export class EmbyMapper {
       parentIndex: item.ParentIndexNumber ?? undefined,
       collections: undefined,
       labels: item.Tags || undefined,
+      studios: item.Studios?.map((studio) => studio.Name ?? '').filter(
+        (studio) => studio.length > 0,
+      ),
     };
   }
 

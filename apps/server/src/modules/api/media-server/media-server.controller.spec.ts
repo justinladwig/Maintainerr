@@ -1,4 +1,4 @@
-import { MediaItem } from '@maintainerr/contracts';
+import { MediaItem, MediaServerFeature } from '@maintainerr/contracts';
 import {
   BadRequestException,
   ServiceUnavailableException,
@@ -40,6 +40,7 @@ describe('MediaServerController', () => {
       searchLibraryContents: jest.fn().mockResolvedValue([]),
       getMetadata: jest.fn().mockResolvedValue(undefined),
       isSetup: jest.fn().mockReturnValue(false),
+      supportsFeature: jest.fn().mockReturnValue(false),
       updateCollectionVisibility: jest.fn().mockResolvedValue(undefined),
     } as unknown as jest.Mocked<IMediaServerService>;
 
@@ -115,6 +116,44 @@ describe('MediaServerController', () => {
         'lib1',
         { offset: 0, limit: 50, type: 'movie' },
       );
+    });
+
+    it('passes studio sorting to a supporting media server', async () => {
+      mockMediaServerService.supportsFeature.mockReturnValue(true);
+
+      await controller.getLibraryContent(
+        'lib1',
+        1,
+        50,
+        'movie',
+        'studio',
+        'asc',
+      );
+
+      expect(mockMediaServerService.supportsFeature).toHaveBeenCalledWith(
+        MediaServerFeature.LIBRARY_STUDIO_SORT,
+      );
+      expect(mockMediaServerService.getLibraryContents).toHaveBeenCalledWith(
+        'lib1',
+        {
+          offset: 0,
+          limit: 50,
+          type: 'movie',
+          sort: 'studio',
+          sortOrder: 'asc',
+        },
+      );
+    });
+
+    it('rejects studio sorting on a media server without native support', async () => {
+      mockMediaServerService.supportsFeature.mockReturnValue(false);
+
+      await expect(
+        controller.getLibraryContent('lib1', 1, 50, 'movie', 'studio', 'asc'),
+      ).rejects.toThrow(
+        'Studio sorting is not supported by the configured media server.',
+      );
+      expect(mockMediaServerService.getLibraryContents).not.toHaveBeenCalled();
     });
 
     it('should sort excluded items server-side before paging', async () => {
@@ -214,6 +253,90 @@ describe('MediaServerController', () => {
         offset: 0,
         limit: 2,
       });
+    });
+
+    // A page comes back short when the adapter drops a row of a kind the query
+    // did not ask for (#3550), so the next page re-reads the difference.
+    it('does not duplicate the overlap after a short page', async () => {
+      const showItem = (id: string, title: string): MediaItem => ({
+        id,
+        title,
+        guid: `guid-${id}`,
+        type: 'show',
+        addedAt: new Date(),
+        providerIds: {},
+        mediaSources: [],
+        library: { id: 'lib1', title: 'Shows' },
+      });
+      const alpha = showItem('1', 'Alpha');
+      const zulu = showItem('2', 'Zulu');
+      const bravo = showItem('3', 'Bravo');
+
+      mockMediaServerService.getLibraryContents
+        .mockResolvedValueOnce({
+          items: [alpha, zulu],
+          totalSize: 3,
+          offset: 0,
+          limit: 250,
+        })
+        .mockResolvedValueOnce({
+          items: [zulu, bravo],
+          totalSize: 3,
+          offset: 2,
+          limit: 250,
+        });
+      mediaItemEnrichmentService.enrichItems.mockResolvedValueOnce([
+        alpha,
+        zulu,
+        bravo,
+      ]);
+
+      await controller.getLibraryContent('lib1', 1, 10, 'show', 'excluded');
+
+      expect(mediaItemEnrichmentService.enrichItems).toHaveBeenCalledWith([
+        alpha,
+        zulu,
+        bravo,
+      ]);
+    });
+
+    it('keeps walking when a whole page was dropped rows', async () => {
+      const bravo = {
+        id: '3',
+        title: 'Bravo',
+        guid: 'guid-3',
+        type: 'show',
+        addedAt: new Date(),
+        providerIds: {},
+        mediaSources: [],
+        library: { id: 'lib1', title: 'Shows' },
+      } satisfies MediaItem;
+
+      mockMediaServerService.getLibraryContents
+        .mockResolvedValueOnce({
+          items: [],
+          totalSize: 600,
+          offset: 0,
+          limit: 250,
+        })
+        .mockResolvedValueOnce({
+          items: [bravo],
+          totalSize: 600,
+          offset: 250,
+          limit: 250,
+        });
+      mediaItemEnrichmentService.enrichItems.mockResolvedValueOnce([bravo]);
+
+      await controller.getLibraryContent('lib1', 1, 10, 'show', 'excluded');
+
+      expect(mockMediaServerService.getLibraryContents).toHaveBeenNthCalledWith(
+        2,
+        'lib1',
+        expect.objectContaining({ offset: 250 }),
+      );
+      expect(mediaItemEnrichmentService.enrichItems).toHaveBeenCalledWith([
+        bravo,
+      ]);
     });
 
     it('should warn when status sorting requires a large pre-pagination fetch', async () => {

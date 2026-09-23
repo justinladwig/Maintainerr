@@ -1,5 +1,8 @@
 import { Mocked, TestBed } from '@suites/unit';
-import { createMediaItem, createRulesDto } from '../../../../test/utils/data';
+import {
+  createMediaItem,
+  createRuleGroupDto,
+} from '../../../../test/utils/data';
 import { MaintainerrLogger } from '../../logging/logs.service';
 import { RuleConstanstService } from '../constants/constants.service';
 import {
@@ -157,7 +160,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
 
     await expect(
       ruleComparatorService.executeRulesWithData(
-        createRulesDto({ dataType: 'movie', rules }),
+        createRuleGroupDto({ dataType: 'movie', rules }),
         [mediaItem],
       ),
     ).rejects.toThrow('boom');
@@ -178,7 +181,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
     mockGetterSequence(null);
 
     const result = await ruleComparatorService.executeRulesWithData(
-      createRulesDto({ dataType: 'movie', rules }),
+      createRuleGroupDto({ dataType: 'movie', rules }),
       [mediaItem],
     );
 
@@ -219,7 +222,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
     mockGetterSequence(10, null);
 
     const result = await ruleComparatorService.executeRulesWithData(
-      createRulesDto({ dataType: 'movie', rules }),
+      createRuleGroupDto({ dataType: 'movie', rules }),
       [mediaItem],
     );
 
@@ -249,7 +252,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
     mockGetterSequence('HEVC 1080p');
 
     const result = await ruleComparatorService.executeRulesWithData(
-      createRulesDto({ dataType: 'movie', rules }),
+      createRuleGroupDto({ dataType: 'movie', rules }),
       [mediaItem],
     );
 
@@ -283,7 +286,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
     mockGetterSequence(null);
 
     const result = await ruleComparatorService.executeRulesWithData(
-      createRulesDto({ dataType: 'movie', rules }),
+      createRuleGroupDto({ dataType: 'movie', rules }),
       [mediaItem],
     );
 
@@ -321,7 +324,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
     mockGetterSequence(null);
 
     const result = await ruleComparatorService.executeRulesWithData(
-      createRulesDto({ dataType: 'movie', rules }),
+      createRuleGroupDto({ dataType: 'movie', rules }),
       [mediaItem],
     );
 
@@ -355,7 +358,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
     const startedAt = Date.now();
 
     const result = await ruleComparatorService.executeRulesWithData(
-      createRulesDto({ dataType: 'movie', rules }),
+      createRuleGroupDto({ dataType: 'movie', rules }),
       [mediaItem],
     );
 
@@ -388,7 +391,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
     mockGetterSequence(null);
 
     const result = await ruleComparatorService.executeRulesWithData(
-      createRulesDto({ dataType: 'movie', rules }),
+      createRuleGroupDto({ dataType: 'movie', rules }),
       [mediaItem],
     );
 
@@ -416,7 +419,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
     const startedAt = Date.now();
 
     const result = await ruleComparatorService.executeRulesWithData(
-      createRulesDto({ dataType: 'movie', rules }),
+      createRuleGroupDto({ dataType: 'movie', rules }),
       [mediaItem],
     );
 
@@ -448,7 +451,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
     mockGetterSequence('HEVC 1080p', null);
 
     const result = await ruleComparatorService.executeRulesWithData(
-      createRulesDto({ dataType: 'movie', rules }),
+      createRuleGroupDto({ dataType: 'movie', rules }),
       [mediaItem],
     );
 
@@ -484,7 +487,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
       mockGetterSequence(null);
 
       const result = await ruleComparatorService.executeRulesWithData(
-        createRulesDto({ dataType: 'movie', rules }),
+        createRuleGroupDto({ dataType: 'movie', rules }),
         [mediaItem],
       );
 
@@ -505,11 +508,40 @@ describe('RuleComparatorService.executeRulesWithData', () => {
       mockGetterSequence(undefined);
 
       const result = await ruleComparatorService.executeRulesWithData(
-        createRulesDto({ dataType: 'movie', rules }),
+        createRuleGroupDto({ dataType: 'movie', rules }),
         [mediaItem],
       );
 
       expect(result.data).toEqual([]);
+    });
+
+    // A failed lookup reported as "no entries for this item" reads as real data
+    // and hides the outage from whoever is debugging the rule (#3395).
+    it.each([
+      [undefined, true],
+      [null, false],
+    ])('reports %p as a failed lookup: %p', async (value, lookupFailed) => {
+      const rules = [
+        createStoredRule(1, {
+          operator: null,
+          action: RulePossibility.EXISTS,
+          firstVal: [Application.PLEX, 6],
+          section: 0,
+        }),
+      ];
+
+      mockGetterSequence(value);
+
+      await ruleComparatorService.executeRulesWithData(
+        createRuleGroupDto({ dataType: 'movie', rules }),
+        [createSingleMedia()],
+      );
+
+      expect(ruleConstanstService.getValueNullReason).toHaveBeenCalledWith(
+        [Application.PLEX, 6],
+        undefined,
+        { lookupFailed },
+      );
     });
 
     it('completes the run and logs a skip (not a crash) when a unary rule value is unavailable', async () => {
@@ -539,7 +571,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
       mockGetterSequence(undefined);
 
       const result = await ruleComparatorService.executeRulesWithData(
-        createRulesDto({ dataType: 'movie', rules }),
+        createRuleGroupDto({ dataType: 'movie', rules }),
         [mediaItem],
       );
 
@@ -604,7 +636,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
       mockGetterSequence(0, 0);
 
       const result = await ruleComparatorService.executeRulesWithData(
-        createRulesDto({ dataType: 'movie', rules }),
+        createRuleGroupDto({ dataType: 'movie', rules }),
         [mediaItem],
       );
 
@@ -620,7 +652,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
       mockGetterSequence(5, 5);
 
       const result = await ruleComparatorService.executeRulesWithData(
-        createRulesDto({ dataType: 'movie', rules }),
+        createRuleGroupDto({ dataType: 'movie', rules }),
         [mediaItem],
       );
 
@@ -636,7 +668,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
       mockGetterSequence(null, null);
 
       const result = await ruleComparatorService.executeRulesWithData(
-        createRulesDto({ dataType: 'movie', rules }),
+        createRuleGroupDto({ dataType: 'movie', rules }),
         [mediaItem],
       );
 
@@ -681,7 +713,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
       mockGetterSequence(0, 0);
 
       const result = await ruleComparatorService.executeRulesWithData(
-        createRulesDto({ dataType: 'movie', rules: overlappingRules }),
+        createRuleGroupDto({ dataType: 'movie', rules: overlappingRules }),
         [mediaItem],
       );
 
@@ -727,7 +759,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
       mockGetterSequence(1, 0, 2);
 
       const result = await ruleComparatorService.executeRulesWithData(
-        createRulesDto({ dataType: 'movie', rules }),
+        createRuleGroupDto({ dataType: 'movie', rules }),
         [matchedByFirstRule, matchedBySecondRule],
       );
 
@@ -793,7 +825,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
       mockGetterSequence(5, 15, 5, 15);
 
       const result = await ruleComparatorService.executeRulesWithData(
-        createRulesDto({ dataType: 'movie', rules: andRules }),
+        createRuleGroupDto({ dataType: 'movie', rules: andRules }),
         [inRange, tooHigh],
       );
 
@@ -820,7 +852,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
       mockGetterSequence(undefined);
 
       const result = await ruleComparatorService.executeRulesWithData(
-        createRulesDto({ dataType: 'movie', rules }),
+        createRuleGroupDto({ dataType: 'movie', rules }),
         [mediaItem],
       );
 
@@ -842,7 +874,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
       mockGetterSequence(null);
 
       const result = await ruleComparatorService.executeRulesWithData(
-        createRulesDto({ dataType: 'movie', rules }),
+        createRuleGroupDto({ dataType: 'movie', rules }),
         [mediaItem],
       );
 
@@ -864,7 +896,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
       mockGetterSequence(10, undefined);
 
       const result = await ruleComparatorService.executeRulesWithData(
-        createRulesDto({ dataType: 'movie', rules }),
+        createRuleGroupDto({ dataType: 'movie', rules }),
         [mediaItem],
       );
 
@@ -886,7 +918,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
       mockGetterSequence(5);
 
       const result = await ruleComparatorService.executeRulesWithData(
-        createRulesDto({ dataType: 'movie', rules }),
+        createRuleGroupDto({ dataType: 'movie', rules }),
         [mediaItem],
       );
 
@@ -932,7 +964,7 @@ describe('RuleComparatorService.executeRulesWithData', () => {
       );
 
       const resultPromise = ruleComparatorService.executeRulesWithData(
-        createRulesDto({ dataType: 'movie', rules }),
+        createRuleGroupDto({ dataType: 'movie', rules }),
         mediaItems,
       );
 

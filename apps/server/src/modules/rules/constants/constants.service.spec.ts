@@ -86,6 +86,17 @@ describe('RuleConstanstService', () => {
     );
   });
 
+  // A getter answering `undefined` never established the value. Reporting that
+  // as "has no entries" sent users hunting for missing data instead of a failed
+  // lookup (#3395).
+  it('separates a failed lookup from a confirmed empty value', () => {
+    expect(
+      service.getValueNullReason([Application.PLEX, 5], undefined, {
+        lookupFailed: true,
+      }),
+    ).toBe('Plex Collection titles could not be read for this item');
+  });
+
   describe('naming a value after the server it was read from', () => {
     // The getter routes every media-server app to the configured server and
     // looks the property id up there, so a rule left unmigrated after a server
@@ -182,4 +193,25 @@ describe('RuleConstanstService', () => {
       ).toEqual({ ruleTypeId: 0, value: '5' });
     });
   });
+});
+
+describe('RuleConstanstService with the real rule constants', () => {
+  // Uses the constructor-built RuleConstants so these round-trips break if the
+  // shared studios property (id 46) is removed or renamed on any server.
+  const service = new RuleConstanstService();
+
+  it.each([
+    [Application.PLEX, 'Plex.studios'],
+    [Application.JELLYFIN, 'Jellyfin.studios'],
+    [Application.EMBY, 'Emby.studios'],
+  ])(
+    'round-trips the studios identifier for application %i',
+    (application, identifier) => {
+      expect(service.getValueIdentifier([application, 46])).toBe(identifier);
+      expect(service.getValueFromIdentifier(identifier)).toEqual([
+        application,
+        46,
+      ]);
+    },
+  );
 });

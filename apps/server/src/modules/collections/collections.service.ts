@@ -1,16 +1,20 @@
 import {
   BasicResponseDto,
+  type BulkMediaItemResult,
+  type BulkMediaResponse,
   CollectionLogMeta,
   CollectionMediaSortField,
   compareMediaItemsBySort,
   type CompareMediaItemsOptions,
   ECollectionLogType,
+  getCollectionDeleteDate,
   isMediaType,
   MaintainerrEvent,
   MediaCollection,
   MediaItem,
   MediaItemType,
   MediaItemWithParent,
+  mediaLibraryStatusSortFields,
   MediaLibrarySortField,
   MediaServerFeature,
   MediaServerType,
@@ -24,9 +28,15 @@ import {
 } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { InjectRepository } from '@nestjs/typeorm';
+import { chunk } from 'lodash';
 import { Brackets, DataSource, In, LessThan, Not, Repository } from 'typeorm';
 import { CollectionLog } from '../../modules/collections/entities/collection_log.entities';
 import { getErrorMessage } from '../../utils/connection-error';
+import { readItemPresence } from '../api/media-server/item-presence.util';
+import {
+  ENRICHMENT_ID_CHUNK,
+  MediaItemEnrichmentService,
+} from '../api/media-server/media-item-enrichment.service';
 import { MediaServerFactory } from '../api/media-server/media-server.factory';
 import { IMediaServerService } from '../api/media-server/media-server.interface';
 import {
@@ -35,6 +45,7 @@ import {
 } from '../events/events.dto';
 import { MaintainerrLogger } from '../logging/logs.service';
 import { MetadataService } from '../metadata/metadata.service';
+import { OverlayProcessorService } from '../overlays/overlay-processor.service';
 import { Exclusion } from '../rules/entities/exclusion.entities';
 import { RuleGroup } from '../rules/entities/rule-group.entities';
 import { SettingsDataService } from '../settings/settings-data.service';
@@ -47,7 +58,11 @@ import {
   hasCollectionMediaManualMembership,
   hasCollectionMediaRuleMembership,
 } from './entities/collection_media.entities';
-import { CollectionMediaRuleRemoval } from './entities/collection_media_rule_removal.entities';
+import {
+  CollectionMediaRuleRemoval,
+  type CollectionMediaPendingDirection,
+} from './entities/collection_media_rule_removal.entities';
+import { unconfirmedIds } from '../api/media-server/mutation-outcome.util';
 import {
   AlterableMediaContext,
   CollectionMediaChange,
@@ -85,6 +100,14 @@ interface CollectionPreviewMediaRow {
 
 type CollectionMediaRemovalScope = 'all' | 'rule' | 'manual';
 
+// Each item resolves its own hierarchy against the media server, so this stays
+// modest to avoid over-driving it on a large selection.
+const BULK_COLLECTION_ACTION_CONCURRENCY = 5;
+
+// One bound parameter per id, so a collection with very many markers would
+// otherwise trip SQLite's 32766-variable cap (#3431).
+const RULE_REMOVAL_MARKER_CHUNK = 500;
+
 interface SharedManualCollectionReconciliationOptions {
   addedMediaServerIds?: Set<string>;
   removedMediaServerIds?: Set<string>;
@@ -117,6 +140,17 @@ export interface PostponeCollectionMediaResult {
 export interface CollectionAddResult {
   collection?: Collection;
   serverRejectedIds: string[];
+  /** Ids whose add was never answered, so it may or may not have been applied.
+   * Reported apart from a refusal because the two are not the same news for a
+   * user, and only a refusal is grounds for healing the collection. */
+  serverUnconfirmedIds?: string[];
+  /** Ids the server accepted but whose membership row failed to persist; the
+   * server add was rolled back, so nothing of the add survived. */
+  unpersistedIds?: string[];
+  /** Ids that had no media server collection to be added to. The server was
+   * never asked and no membership row was written, so this is neither a refusal
+   * nor a persistence failure - but it is not a success either. */
+  unlinkedIds?: string[];
 }
 
 export interface ContextActionResult extends CollectionAddResult {
@@ -126,6 +160,12 @@ export interface ContextActionResult extends CollectionAddResult {
 
 @Injectable()
 export class CollectionsService {
+  // In-flight size sweeps, keyed by collection. See updateCollectionTotalSize.
+  private readonly sizeSweeps = new Map<
+    number,
+    { done: Promise<void>; rerun: () => void }
+  >();
+
   constructor(
     @InjectRepository(Collection)
     private readonly collectionRepo: Repository<Collection>,
@@ -141,10 +181,12 @@ export class CollectionsService {
     private readonly exclusionRepo: Repository<Exclusion>,
     private readonly connection: DataSource,
     private readonly mediaServerFactory: MediaServerFactory,
+    private readonly mediaItemEnrichmentService: MediaItemEnrichmentService,
     private readonly settingsDataService: SettingsDataService,
     private readonly metadataService: MetadataService,
     private readonly eventEmitter: EventEmitter2,
     private readonly collectionPosterService: CollectionPosterService,
+    private readonly overlayProcessor: OverlayProcessorService,
     private readonly logger: MaintainerrLogger,
   ) {
     logger.setContext(CollectionsService.name);
@@ -256,13 +298,10 @@ export class CollectionsService {
 
     // Surface the resulting deadline (addDate + deleteAfterDays) so the caller
     // can confirm it. Null when the collection has no deletion window.
-    let deletionDate: Date | null = null;
-    if (collection.deleteAfterDays != null) {
-      deletionDate = new Date(newAddDate);
-      deletionDate.setDate(
-        deletionDate.getDate() + +collection.deleteAfterDays,
-      );
-    }
+    const deletionDate = getCollectionDeleteDate(
+      newAddDate,
+      collection.deleteAfterDays,
+    );
 
     return {
       collectionId,
@@ -352,6 +391,48 @@ export class CollectionsService {
     });
   }
 
+  /**
+   * Whether any OTHER Maintainerr collection points at the same media server
+   * collection, of either kind.
+   *
+   * Distinct from isMediaServerCollectionShared, which compares kinds on
+   * purpose for the contamination guards. Destroying a media server collection
+   * is not a same-kind question: a custom collection's rule group is pointing at
+   * one the user made, and deleting it because an automatic collection happened
+   * to empty first destroys the user's own collection.
+   *
+   * `undefined` means the lookup itself failed, which is not an answer either
+   * way - see the catch below.
+   */
+  public async isMediaServerCollectionLinkedElsewhere(
+    collection: Pick<Collection, 'id' | 'mediaServerId'>,
+  ): Promise<boolean | undefined> {
+    if (!collection.mediaServerId) {
+      return false;
+    }
+
+    try {
+      return (
+        (await this.collectionRepo.count({
+          where: {
+            mediaServerId: collection.mediaServerId,
+            ...(collection.id !== undefined ? { id: Not(collection.id) } : {}),
+          },
+        })) > 0
+      );
+    } catch (error) {
+      // Neither answer is safe to assume. "Linked" avoids the delete but still
+      // unlinks, orphaning the server collection and revoking this very guard;
+      // "not linked" authorises destroying one the user may own. Report the
+      // uncertainty and let the caller leave the collection alone.
+      this.logger.warn(
+        'Failed to determine whether a media server collection is linked elsewhere',
+      );
+      this.logger.debug(error);
+      return undefined;
+    }
+  }
+
   public async isMediaServerCollectionShared(
     collection: Pick<Collection, 'id' | 'mediaServerId' | 'manualCollection'>,
   ): Promise<boolean> {
@@ -384,7 +465,7 @@ export class CollectionsService {
 
   /**
    * Returns the set of media server IDs that are rule-owned by another
-   * automatic collection sharing this collection's media server collection.
+   * collection sharing this collection's media server collection.
    *
    * Throws on repository failure. Callers must treat a thrown error as
    * "ownership unknown" - silently defaulting to an empty set would
@@ -428,10 +509,16 @@ export class CollectionsService {
       return [];
     }
 
+    // Kind is irrelevant: a custom collection's member is as foreign to this
+    // rule as an automatic sibling's, and adopting it subjects it to this
+    // rule's deleteAfterDays and action. #2766 scoped this to automatic
+    // siblings because that was the report it fixed, which left an automatic
+    // collection that title-links onto a user's custom collection unguarded.
+    // Not the same question as isMediaServerCollectionShared, which compares
+    // kinds on purpose to decide delete-versus-leave on teardown.
     const siblings = await this.collectionRepo.find({
       where: {
         mediaServerId: collection.mediaServerId,
-        manualCollection: false,
         ...(collection.id !== undefined ? { id: Not(collection.id) } : {}),
       },
     });
@@ -454,21 +541,29 @@ export class CollectionsService {
   public async markRuleRemoved(
     collectionId: number,
     mediaServerIds: string[],
+    direction: CollectionMediaPendingDirection = 'remove',
   ): Promise<void> {
     if (mediaServerIds.length === 0) {
       return;
     }
 
+    // Upsert, not orIgnore: the row is unique on (collectionId, mediaServerId),
+    // and orIgnore leaves a conflicting row's direction untouched. An item that
+    // a rule removed and later matched again would keep direction 'remove', so
+    // an add that timed out would be reconciled as a lingering orphan and taken
+    // back off the server - undoing a write that had in fact committed.
+    // No .into(): the builder comes from the marker repository, so it already
+    // targets that table.
     await this.CollectionMediaRuleRemovalRepo.createQueryBuilder()
       .insert()
-      .orIgnore()
-      .into(CollectionMediaRuleRemoval)
       .values(
         mediaServerIds.map((mediaServerId) => ({
           collectionId,
           mediaServerId,
+          direction,
         })),
       )
+      .orUpdate(['direction'], ['collectionId', 'mediaServerId'])
       .execute();
   }
 
@@ -476,6 +571,46 @@ export class CollectionsService {
    * Drop the rule-removed marker for an item that is (re-)added to the
    * collection - by rule or manually - so it is never treated as an orphan.
    */
+  /**
+   * Drop markers whose removal succeeded. Markers exist to retry a FAILED
+   * removal; carrying a succeeded one means a hand re-add is removed again
+   * instead of adopted (#3344). Chunked so a collection with very many resolved
+   * markers can never exceed SQLite's bound-parameter limit.
+   */
+  private async clearRuleRemovedMarkers(
+    collectionId: number,
+    mediaServerIds: string[],
+  ): Promise<void> {
+    for (const ids of chunk(mediaServerIds, RULE_REMOVAL_MARKER_CHUNK)) {
+      await this.CollectionMediaRuleRemovalRepo.createQueryBuilder()
+        .delete()
+        .where('collectionId = :collectionId', { collectionId })
+        .andWhere('mediaServerId IN (:...ids)', { ids })
+        .execute();
+    }
+  }
+
+  /**
+   * The ids this collection changed but could not confirm, by direction: removals
+   * the media server may still hold, and adds it may have applied unannounced.
+   */
+  private async getRuleRemovedMarkers(
+    collectionId: number,
+  ): Promise<Map<string, CollectionMediaPendingDirection>> {
+    return new Map(
+      (
+        await this.CollectionMediaRuleRemovalRepo.createQueryBuilder('marker')
+          .select('marker.mediaServerId', 'mediaServerId')
+          .addSelect('marker.direction', 'direction')
+          .where('marker.collectionId = :collectionId', { collectionId })
+          .getRawMany<{
+            mediaServerId: string;
+            direction: CollectionMediaPendingDirection;
+          }>()
+      ).map((marker) => [marker.mediaServerId, marker.direction ?? 'remove']),
+    );
+  }
+
   public async clearRuleRemovedMarker(
     collectionId: number,
     mediaServerId: string,
@@ -519,14 +654,8 @@ export class CollectionsService {
       return orphanIds;
     }
 
-    const markers =
-      await this.CollectionMediaRuleRemovalRepo.createQueryBuilder('marker')
-        .select('marker.mediaServerId', 'mediaServerId')
-        .where('marker.collectionId = :collectionId', {
-          collectionId: collection.id,
-        })
-        .getRawMany<{ mediaServerId: string }>();
-    if (markers.length === 0) {
+    const markers = await this.getRuleRemovedMarkers(collection.id);
+    if (markers.size === 0) {
       return orphanIds;
     }
 
@@ -553,24 +682,54 @@ export class CollectionsService {
 
     const lingering: string[] = [];
     const resolved: string[] = [];
-    for (const marker of markers) {
-      const present = serverChildIds.has(marker.mediaServerId);
+    const heldUnconfirmedAdds: string[] = [];
+    for (const [markerId, direction] of markers) {
+      const present = serverChildIds.has(markerId);
       const memberOrSibling =
-        currentMemberIds.has(marker.mediaServerId) ||
-        siblingRuleOwnedIds.has(marker.mediaServerId) ||
-        siblingMemberIds.has(marker.mediaServerId);
-      if (present && !memberOrSibling) {
+        currentMemberIds.has(markerId) ||
+        siblingRuleOwnedIds.has(markerId) ||
+        siblingMemberIds.has(markerId);
+
+      if (memberOrSibling) {
+        // A member or a sibling's item: clear the stale marker either way.
+        resolved.push(markerId);
+        continue;
+      }
+
+      if (direction === 'add') {
+        // An add we could not confirm. Present means it did land, so it is ours
+        // and must not be adopted as a hand-added member - but it must not be
+        // self-heal-removed either, or a rule that still wants it would have it
+        // taken straight back out. Hold the marker until a membership row is
+        // written (which clears it) or the child is confirmed gone.
+        if (present) {
+          orphanIds.add(markerId);
+          heldUnconfirmedAdds.push(markerId);
+        } else if (childrenReadTrustworthy) {
+          resolved.push(markerId);
+        }
+        continue;
+      }
+
+      if (present) {
         // Present, ours, and not a current member: a lingering orphan the
         // server never dropped - self-heal it.
-        lingering.push(marker.mediaServerId);
-        orphanIds.add(marker.mediaServerId);
-      } else if (memberOrSibling || present || childrenReadTrustworthy) {
-        // A member/sibling item (clear the stale marker), or an item genuinely
-        // gone under a trustworthy read. Not our orphan - clear the marker.
-        resolved.push(marker.mediaServerId);
+        lingering.push(markerId);
+        orphanIds.add(markerId);
+      } else if (childrenReadTrustworthy) {
+        // Genuinely gone under a trustworthy read - clear the marker.
+        resolved.push(markerId);
       }
       // else: absent under an ambiguous (untrustworthy) read - keep the marker
       // and retry next run rather than clear it on a possibly-stale [] read.
+    }
+
+    if (heldUnconfirmedAdds.length > 0) {
+      // Otherwise undiagnosable: the item sits in the server collection while
+      // Maintainerr ignores it.
+      this.logger.log(
+        `Holding ${heldUnconfirmedAdds.length} item(s) in the media server collection for '${collection.title}' that a rule added but the server never confirmed: ${heldUnconfirmedAdds.join(', ')}. They are not manual additions and will not be handled.`,
+      );
     }
 
     // orphanIds is the critical output the caller uses to skip re-adoption.
@@ -581,7 +740,7 @@ export class CollectionsService {
     try {
       if (lingering.length > 0) {
         const mediaServer = await this.getMediaServer();
-        const failed = new Set(
+        const failed = unconfirmedIds(
           await mediaServer.removeBatchFromCollection(
             collection.mediaServerId,
             lingering,
@@ -603,21 +762,7 @@ export class CollectionsService {
         }
       }
 
-      // Chunk the id list so a collection with very many resolved markers can
-      // never exceed SQLite's bound-parameter limit (which would otherwise
-      // throw and re-churn the same oversized list every run).
-      const RESOLVE_CHUNK = 500;
-      for (let i = 0; i < resolved.length; i += RESOLVE_CHUNK) {
-        await this.CollectionMediaRuleRemovalRepo.createQueryBuilder()
-          .delete()
-          .where('collectionId = :collectionId', {
-            collectionId: collection.id,
-          })
-          .andWhere('mediaServerId IN (:...ids)', {
-            ids: resolved.slice(i, i + RESOLVE_CHUNK),
-          })
-          .execute();
-      }
+      await this.clearRuleRemovedMarkers(collection.id, resolved);
     } catch (error) {
       this.logger.warn(
         `Best-effort orphan self-heal/cleanup failed for '${collection.title}'; will retry next run.`,
@@ -654,7 +799,7 @@ export class CollectionsService {
         `[checkAutomaticMediaServerLink] Resyncing ${missingRuleOwnedIds.length} local rule-owned item(s) into media server collection ${collection.mediaServerId} for "${collection.title}"`,
       );
 
-      const failedItemIds = new Set(
+      const failedItemIds = unconfirmedIds(
         await mediaServer.addBatchToCollection(
           collection.mediaServerId,
           missingRuleOwnedIds,
@@ -819,7 +964,7 @@ export class CollectionsService {
     );
 
     if (missingRuleOwnedIds.length > 0) {
-      const failedItemIds = new Set(
+      const failedItemIds = unconfirmedIds(
         await mediaServer.addBatchToCollection(
           collection.mediaServerId,
           missingRuleOwnedIds,
@@ -1088,35 +1233,53 @@ export class CollectionsService {
       return metadataByMediaServerId;
     }
 
-    const missingMetadataResults = await Promise.allSettled(
-      missingMediaServerIds.map(async (mediaServerId) => ({
-        mediaServerId,
-        mediaItem: await mediaServer.getMetadata(mediaServerId),
-      })),
+    // One read per batch of ids rather than one per row. Every row lands here
+    // when the collection read above failed, which is exactly when the server is
+    // least able to answer a request each.
+    for (const mediaItem of await mediaServer.getMetadataBatch(
+      missingMediaServerIds,
+    )) {
+      metadataByMediaServerId.set(mediaItem.id, mediaItem);
+    }
+
+    const unresolvedIds = missingMediaServerIds.filter(
+      (mediaServerId) => !metadataByMediaServerId.has(mediaServerId),
     );
 
-    missingMetadataResults.forEach((result, index) => {
-      const mediaServerId = missingMediaServerIds[index];
-
-      if (result.status === 'fulfilled') {
-        if (result.value.mediaItem) {
-          metadataByMediaServerId.set(mediaServerId, result.value.mediaItem);
-          return;
-        }
-
-        this.logger.debug(
-          `Missing metadata for collection media with mediaServerId=${mediaServerId}; skipping item without deleting`,
-        );
-        return;
-      }
-
+    if (unresolvedIds.length > 0) {
+      // An id the server did not answer for is skipped, never deleted: this read
+      // cannot tell a missing item from a failed one.
       this.logger.debug(
-        `Failed to fetch metadata for collection media with mediaServerId=${mediaServerId}`,
+        `No metadata for ${unresolvedIds.length} of ${entities.length} collection media rows; skipping them without deleting: ${unresolvedIds.slice(0, 10).join(', ')}`,
       );
-      this.logger.debug(result.reason);
-    });
+    }
 
     return metadataByMediaServerId;
+  }
+
+  /**
+   * A copy carrying the state no media server knows, for the sorts that compare
+   * it. Separate from the map the response is built from, so which fields the
+   * response carries never depends on how it was sorted. Only for those sorts,
+   * as the library path also gates it.
+   */
+  private async withMaintainerrStatusForSort(
+    sort: CollectionMediaSortField | undefined,
+    metadataByMediaServerId: Map<string, MediaItem>,
+  ): Promise<Map<string, MediaItem>> {
+    if (
+      sort === undefined ||
+      !(mediaLibraryStatusSortFields as readonly string[]).includes(sort) ||
+      metadataByMediaServerId.size === 0
+    ) {
+      return metadataByMediaServerId;
+    }
+
+    const enrichedItems = await this.mediaItemEnrichmentService.enrichItems([
+      ...metadataByMediaServerId.values(),
+    ]);
+
+    return new Map(enrichedItems.map((item) => [item.id, item]));
   }
 
   private async hydrateCollectionMediaWithMetadata(
@@ -1149,29 +1312,22 @@ export class CollectionsService {
     ];
 
     if (parentIds.length > 0) {
-      const parentMetadataResults = await Promise.allSettled(
-        parentIds.map(async (parentId) => ({
-          parentId,
-          mediaItem: await mediaServer.getMetadata(parentId),
-        })),
-      );
+      // One read per batch of ids rather than one per parent. Emby and Jellyfin
+      // put a movie under its library folder, so a collection stored one folder
+      // per film has about as many parents as it has rows.
+      for (const parent of await mediaServer.getMetadataBatch(parentIds)) {
+        parentMetadataById.set(parent.id, parent);
+      }
 
-      parentMetadataResults.forEach((result, index) => {
-        const parentId = parentIds[index];
+      const unresolved = parentIds.length - parentMetadataById.size;
 
-        if (result.status === 'fulfilled') {
-          if (result.value.mediaItem) {
-            parentMetadataById.set(parentId, result.value.mediaItem);
-          }
-
-          return;
-        }
-
+      if (unresolved > 0) {
+        // Counted, not one line each. A parent that does not resolve only costs
+        // the item its parent title and artwork, so the row is still returned.
         this.logger.debug(
-          `Failed to fetch parent metadata for collection media parentId=${parentId}`,
+          `No metadata for ${unresolved} of ${parentIds.length} collection media parents`,
         );
-        this.logger.debug(result.reason);
-      });
+      }
     }
 
     return entities
@@ -1254,7 +1410,20 @@ export class CollectionsService {
       );
       return;
     }
-    if (!collection.mediaServerId) {
+    // The status sorts compare Maintainerr-side state this hydrate never
+    // resolves, so every comparison would tie and the pushed order would be
+    // arbitrary. The rule group form withholds them; refuse one that arrives
+    // anyway.
+    if (
+      (mediaLibraryStatusSortFields as readonly string[]).includes(parsed.sort)
+    ) {
+      this.logger.warn(
+        `Ignoring collection sort '${sortKey}' on collection ${collection.id}: status sorts cannot be pushed to the media server`,
+      );
+      return;
+    }
+    // Nothing to push to for a collection with no link, or one that opted out.
+    if (!collection.mediaServerId || collection.keepInMaintainerrOnly) {
       return;
     }
 
@@ -1319,35 +1488,50 @@ export class CollectionsService {
     entities: Exclusion[],
     mediaServer: IMediaServerService,
   ): Promise<Exclusion[]> {
-    const results = await Promise.allSettled(
-      entities.map(async (el) => {
-        const mediaItem = await mediaServer.getMetadata(
-          el.mediaServerId.toString(),
-        );
+    if (entities.length === 0) {
+      return [];
+    }
 
+    // One batched read for the rows and one for their deduped parents, not a
+    // request per row - the same shape as the collection media hydrate.
+    const metadataById = new Map<string, MediaItem>();
+    for (const mediaItem of await mediaServer.getMetadataBatch([
+      ...new Set(entities.map((el) => el.mediaServerId.toString())),
+    ])) {
+      metadataById.set(mediaItem.id, mediaItem);
+    }
+
+    const parentMetadataById = new Map<string, MediaItem>();
+    const parentIds = [
+      ...new Set(
+        [...metadataById.values()]
+          .map((mediaItem) => mediaItem.grandparentId ?? mediaItem.parentId)
+          .filter((parentId): parentId is string => Boolean(parentId)),
+      ),
+    ];
+    if (parentIds.length > 0) {
+      for (const parent of await mediaServer.getMetadataBatch(parentIds)) {
+        parentMetadataById.set(parent.id, parent);
+      }
+    }
+
+    return entities
+      .map((el) => {
+        const mediaItem = metadataById.get(el.mediaServerId.toString());
+
+        // A row the server did not answer for stays hidden, as before.
         if (!mediaItem) {
-          return { ...el, mediaData: undefined };
+          return undefined;
         }
 
         const parentId = mediaItem.grandparentId ?? mediaItem.parentId;
-        const parentItem = parentId
-          ? await mediaServer.getMetadata(parentId)
-          : undefined;
-
         el.mediaData = {
           ...mediaItem,
-          parentItem,
+          parentItem: parentId ? parentMetadataById.get(parentId) : undefined,
         };
         return el;
-      }),
-    );
-
-    return results
-      .filter(
-        (result): result is PromiseFulfilledResult<Exclusion> =>
-          result.status === 'fulfilled' && result.value.mediaData !== undefined,
-      )
-      .map((result) => result.value);
+      })
+      .filter((el): el is Exclusion => el !== undefined);
   }
 
   public async getCollectionMediaWithServerDataAndPaging(
@@ -1429,6 +1613,11 @@ export class CollectionsService {
         mediaServer,
       );
 
+      const sortMetadata = await this.withMaintainerrStatusForSort(
+        sort,
+        metadataByMediaServerId,
+      );
+
       const sortableEntities = entities.filter((entity) =>
         metadataByMediaServerId.has(entity.mediaServerId),
       );
@@ -1442,8 +1631,8 @@ export class CollectionsService {
       const sortedPageEntities = sortableEntities
         .sort((leftItem, rightItem) =>
           compareMediaItemsBySort(
-            metadataByMediaServerId.get(leftItem.mediaServerId)!,
-            metadataByMediaServerId.get(rightItem.mediaServerId)!,
+            sortMetadata.get(leftItem.mediaServerId)!,
+            sortMetadata.get(rightItem.mediaServerId)!,
             sort,
             sortOrder,
             compareOptions,
@@ -1476,20 +1665,16 @@ export class CollectionsService {
     const mediaServer = await this.getMediaServer();
     let removedCount = 0;
 
-    for (const entry of allMedia) {
-      // Only remove a row when the media server *confirms* the item is gone.
-      // `itemExists` returns false solely on a 404/empty result and throws on
-      // an inconclusive check (network / 5xx / auth), unlike `getMetadata`
-      // which returns undefined for both absent and failed reads - so a
-      // transient blip can no longer delete a still-present item's row.
-      let exists = true;
-      try {
-        exists = await mediaServer.itemExists(entry.mediaServerId);
-      } catch (error) {
-        this.logger.debug(error);
-      }
+    // `missing` is a confirmed absence only, so a transient failure never
+    // deletes a still-present item's row.
+    const { missing } = await readItemPresence(
+      mediaServer,
+      allMedia.map((entry) => entry.mediaServerId),
+      (error) => this.logger.debug(error),
+    );
 
-      if (!exists) {
+    for (const entry of allMedia) {
+      if (missing.has(entry.mediaServerId)) {
         await this.CollectionMediaRepo.delete(entry.id);
         removedCount++;
       }
@@ -1910,7 +2095,8 @@ export class CollectionsService {
       if (
         !empty &&
         (collection.manualCollection == undefined ||
-          !collection.manualCollection)
+          !collection.manualCollection) &&
+        !collection.keepInMaintainerrOnly
       ) {
         // Create collection via media server abstraction
         mediaCollection = await mediaServer.createCollection({
@@ -2032,6 +2218,9 @@ export class CollectionsService {
               createdCollection.dbCollection?.mediaServerId ||
               createdCollection.dbCollection?.id?.toString(),
             dbId: createdCollection.dbCollection.id,
+            manualCollection: Boolean(
+              createdCollection.dbCollection?.manualCollection,
+            ),
           },
           media,
           false,
@@ -2091,34 +2280,43 @@ export class CollectionsService {
           !collection.manualCollection &&
           collection.libraryId === dbCollection.libraryId // Library must match
         ) {
-          // Update collection metadata on media server
-          try {
-            await mediaServer.updateCollection({
-              libraryId: collection.libraryId,
-              collectionId: dbCollection.mediaServerId,
-              title: collection.title,
-              summary: collection?.description,
-              sortTitle: sanitizedSortTitle ?? undefined,
-            });
-          } catch (error) {
-            this.logger.warn(
-              'Failed to update collection metadata on media server',
-            );
-            this.logger.debug(error);
-          }
-          // Handle visibility settings (Plex-only feature)
-          if (
-            mediaServer.supportsFeature(
-              MediaServerFeature.COLLECTION_VISIBILITY,
-            )
-          ) {
-            await mediaServer.updateCollectionVisibility({
-              libraryId: dbCollection.libraryId,
-              collectionId: dbCollection.mediaServerId,
-              recommended: collection.visibleOnRecommended,
-              ownHome: collection.visibleOnHome,
-              sharedHome: collection.visibleOnHome,
-            });
+          // This collection is about to be torn down, so metadata and visibility
+          // are writes it opted out of. The standalone collection endpoint does
+          // not carry the flag, hence the fall back to the stored value.
+          const keptInMaintainerrOnly =
+            collection.keepInMaintainerrOnly ??
+            dbCollection.keepInMaintainerrOnly;
+
+          if (!keptInMaintainerrOnly) {
+            // Update collection metadata on media server
+            try {
+              await mediaServer.updateCollection({
+                libraryId: collection.libraryId,
+                collectionId: dbCollection.mediaServerId,
+                title: collection.title,
+                summary: collection?.description,
+                sortTitle: sanitizedSortTitle ?? undefined,
+              });
+            } catch (error) {
+              this.logger.warn(
+                'Failed to update collection metadata on media server',
+              );
+              this.logger.debug(error);
+            }
+            // Handle visibility settings (Plex-only feature)
+            if (
+              mediaServer.supportsFeature(
+                MediaServerFeature.COLLECTION_VISIBILITY,
+              )
+            ) {
+              await mediaServer.updateCollectionVisibility({
+                libraryId: dbCollection.libraryId,
+                collectionId: dbCollection.mediaServerId,
+                recommended: collection.visibleOnRecommended,
+                ownHome: collection.visibleOnHome,
+                sharedHome: collection.visibleOnHome,
+              });
+            }
           }
         } else {
           // if the type, manual collection, or library changed - reset the media server collection
@@ -2129,9 +2327,21 @@ export class CollectionsService {
               dbCollection.manualCollectionName ||
             collection.libraryId !== dbCollection.libraryId
           ) {
-            if (!dbCollection.manualCollection) {
-              // Don't remove the collections if it was a manual one
-              await mediaServer.deleteCollection(dbCollection.mediaServerId);
+            // A manual collection is left alone entirely; one a sibling rule
+            // group shares is left standing with only this collection's items
+            // taken out (#2766). The link is dropped either way, so say when
+            // something was left behind.
+            if (
+              !(
+                await this.deleteMediaServerCollection(
+                  dbCollection,
+                  'resetting',
+                )
+              ).ok
+            ) {
+              this.logger.warn(
+                `Media server collection ${dbCollection.mediaServerId} for '${dbCollection.title}' may need to be removed manually`,
+              );
             }
             collection.mediaServerId = null;
           }
@@ -2291,6 +2501,15 @@ export class CollectionsService {
     const mediaServer = await this.getMediaServer();
     // checks and fixes automatic collection link
     if (!collection.manualCollection) {
+      // Kept in Maintainerr only: the reconciled state is "no media server
+      // collection". Tearing down here rather than at every caller also makes
+      // it self-healing - a delete the server refused keeps the link, and the
+      // next run reconciles again. Never fall through to the title relink
+      // below, which would adopt a same-titled collection and undo the opt-in.
+      if (collection.keepInMaintainerrOnly) {
+        return await this.stopMediaServerSync(collection);
+      }
+
       let serverColl: MediaCollection | undefined = undefined;
       const originalMediaServerId = collection.mediaServerId; // Track if we already had a link
 
@@ -2546,6 +2765,223 @@ export class CollectionsService {
   }
 
   /**
+   * Why this collection cannot take the item, or undefined when it can. An
+   * inconclusive lookup answers undefined: a blip must never block a real add.
+   */
+  private async explainRejectedAdd(
+    mediaServer: IMediaServerService,
+    mediaId: string,
+    collection: Collection | undefined,
+  ): Promise<string | undefined> {
+    // itemExists is the only read that separates "gone" from "could not ask":
+    // it throws on the second, which is what keeps a blip from blocking an add.
+    try {
+      if (!(await mediaServer.itemExists(mediaId))) {
+        return 'Failed - not found on the media server';
+      }
+    } catch (error) {
+      this.logger.debug(error);
+      return undefined;
+    }
+
+    // A collection bound to one library refuses a foreign id on its own, but
+    // silently drops it from a mixed batch, leaving a row for an add that
+    // never happened.
+    const libraryId = collection?.libraryId;
+    if (
+      !libraryId ||
+      mediaServer.supportsFeature(MediaServerFeature.CROSS_LIBRARY_COLLECTIONS)
+    ) {
+      return undefined;
+    }
+
+    let item: MediaItem | undefined;
+    try {
+      item = await mediaServer.getMetadata(mediaId);
+    } catch (error) {
+      this.logger.debug(error);
+      return undefined;
+    }
+
+    // An unread library cannot disprove membership, and existence is settled.
+    return item?.library?.id && item.library.id !== libraryId
+      ? "Failed - not in this collection's library"
+      : undefined;
+  }
+
+  /**
+   * Resolution is bounded-parallel, but the write is a **single** batched call.
+   * The write path find-or-creates the media server collection, which is not
+   * safe to run concurrently against the same collection: parallel first adds
+   * each create their own, leaving duplicates beside the linked one (#3344).
+   */
+  async bulkMediaCollectionAction(
+    mediaIds: string[],
+    collectionId: number | undefined,
+    action: 'add' | 'remove',
+    mediaType: MediaItemType,
+    context?: AlterableMediaContext,
+  ): Promise<BulkMediaResponse> {
+    const uniqueMediaIds = [...new Set(mediaIds)];
+    const resultById = new Map<string, BulkMediaItemResult>();
+    const mediaServer = await this.getMediaServer();
+    const collection =
+      collectionId !== undefined
+        ? await this.collectionRepo.findOne({ where: { id: collectionId } })
+        : undefined;
+
+    if (collectionId !== undefined && !collection) {
+      throw new NotFoundException(`Collection ${collectionId} not found`);
+    }
+
+    const fail = (mediaId: string, message: string) =>
+      resultById.set(mediaId, { mediaId, code: 0, message });
+
+    const resolvedByMediaId = new Map<string, string[]>();
+    for (const batch of chunk(
+      uniqueMediaIds,
+      BULK_COLLECTION_ACTION_CONCURRENCY,
+    )) {
+      await Promise.all(
+        batch.map(async (mediaId) => {
+          try {
+            if (action === 'add') {
+              const rejection = await this.explainRejectedAdd(
+                mediaServer,
+                mediaId,
+                collection,
+              );
+
+              if (rejection) {
+                fail(mediaId, rejection);
+                return;
+              }
+            }
+
+            const ids = await mediaServer.getAllIdsForContextAction(
+              collection?.type,
+              context
+                ? { type: context.type, id: String(context.id) }
+                : { type: mediaType, id: mediaId },
+              mediaId,
+            );
+
+            if (ids.length === 0) {
+              fail(mediaId, 'Failed - nothing this collection can take');
+              return;
+            }
+
+            resolvedByMediaId.set(mediaId, ids);
+          } catch (error) {
+            this.logger.warn(
+              `Bulk collection ${action} could not resolve media ${mediaId}`,
+            );
+            this.logger.debug(error);
+            fail(mediaId, 'Failed - see server logs');
+          }
+        }),
+      );
+    }
+
+    const media = [
+      ...new Set([...resolvedByMediaId.values()].flat()),
+    ].map<CollectionMediaChange>((mediaServerId) => ({ mediaServerId }));
+
+    if (media.length > 0) {
+      const failAllResolved = (message: string) => {
+        for (const mediaId of resolvedByMediaId.keys()) {
+          fail(mediaId, message);
+        }
+      };
+
+      try {
+        if (action === 'add') {
+          const result = await this.addToCollectionInternal(
+            collectionId,
+            media,
+            true,
+          );
+
+          if (!result.collection) {
+            // The helper swallows its own failures so a rule run survives one
+            // bad collection; an interactive caller has to be told.
+            failAllResolved('Failed - the collection could not be updated');
+          } else {
+            const rejected = new Set(result.serverRejectedIds);
+            const unconfirmed = new Set(result.serverUnconfirmedIds ?? []);
+            const unpersisted = new Set(result.unpersistedIds ?? []);
+            const unlinked = new Set(result.unlinkedIds ?? []);
+            for (const [mediaId, ids] of resolvedByMediaId) {
+              if (ids.some((id) => rejected.has(id))) {
+                fail(mediaId, 'Failed - refused by the media server');
+              } else if (ids.some((id) => unlinked.has(id))) {
+                fail(
+                  mediaId,
+                  'Failed - this collection has no media server collection to add to',
+                );
+              } else if (ids.some((id) => unconfirmed.has(id))) {
+                fail(
+                  mediaId,
+                  'Failed - the media server did not answer in time, so it is unclear whether this was added',
+                );
+              } else if (ids.some((id) => unpersisted.has(id))) {
+                fail(mediaId, 'Failed - the collection could not be updated');
+              }
+            }
+          }
+        } else if (collectionId === undefined) {
+          const result = await this.removeFromAllCollections(media);
+          if (result.code !== 1) {
+            failAllResolved('Failed - the collections could not be updated');
+          }
+        } else if (!(await this.removeFromCollection(collectionId, media))) {
+          failAllResolved('Failed - the collection could not be updated');
+        } else {
+          // The helper answers the collection even when the media server
+          // refused some children, but it only deletes the rows the server
+          // confirmed - so a row still present is a removal that did not
+          // happen. Chunked because a show selection can resolve to enough
+          // episode ids to pass SQLite's parameter cap (#3431).
+          const remaining = new Set<string>();
+          for (const idBatch of chunk(
+            media.map((m) => m.mediaServerId),
+            ENRICHMENT_ID_CHUNK,
+          )) {
+            for (const row of (await this.CollectionMediaRepo.find({
+              where: { collectionId, mediaServerId: In(idBatch) },
+            })) ?? []) {
+              remaining.add(row.mediaServerId);
+            }
+          }
+          // A surviving row only establishes that the removal was not confirmed.
+          // It cannot say whether the server refused it or simply never answered
+          // - and a media server that answers late may well have applied it - so
+          // the message must not assert a refusal.
+          for (const [mediaId, ids] of resolvedByMediaId) {
+            if (ids.some((id) => remaining.has(id))) {
+              fail(
+                mediaId,
+                'Failed - the media server did not confirm the removal',
+              );
+            }
+          }
+        }
+      } catch (error) {
+        this.logger.warn(`Bulk collection ${action} failed`);
+        this.logger.debug(error);
+        failAllResolved('Failed - see server logs');
+      }
+    }
+
+    return {
+      results: uniqueMediaIds.map(
+        (mediaId): BulkMediaItemResult =>
+          resultById.get(mediaId) ?? { mediaId, code: 1 },
+      ),
+    };
+  }
+
+  /**
    * Drives the manual add/remove modal. Reports what the media server refused
    * so the caller can tell the user, rather than answering "done" to an action
    * that changed nothing.
@@ -2616,14 +3052,27 @@ export class CollectionsService {
         true,
       );
       return {
-        ...result,
         collection: orFail(result.collection),
+        // A rolled-back add left nothing behind either, so the caller reports
+        // it alongside the refusals.
+        serverRejectedIds: [
+          ...result.serverRejectedIds,
+          ...(result.unpersistedIds ?? []),
+        ],
+        // Both kept apart from the refusals: the server never answered for one
+        // and was never asked for the other, so neither is a refusal, and
+        // reporting either as success is the false-success #3383 removed.
+        serverUnconfirmedIds: result.serverUnconfirmedIds,
+        unlinkedIds: result.unlinkedIds,
         resolvedCount: handleMedia.length,
       };
     }
 
     if (!collectionDbId) {
-      await this.removeFromAllCollections(handleMedia);
+      const result = await this.removeFromAllCollections(handleMedia);
+      if (result && result.code !== 1) {
+        orFail(undefined);
+      }
       return { serverRejectedIds: [], resolvedCount: handleMedia.length };
     }
 
@@ -2636,6 +3085,17 @@ export class CollectionsService {
     };
   }
 
+  /**
+   * Add media to a collection, creating or relinking its media server
+   * collection first if that is missing.
+   *
+   * An EMPTY `media` list is meaningful and load-bearing, not a no-op: the
+   * find-or-create still runs, and the existing members are read from the
+   * database and pushed to the collection it creates. That is how the rule
+   * executor rebuilds a link that went missing, without running every current
+   * member back through the membership update - which would re-mark provenance
+   * and write an "Added" log record per item, per run.
+   */
   async addToCollection(
     collectionDbId: number,
     media: CollectionMediaChange[],
@@ -2723,6 +3183,9 @@ export class CollectionsService {
           !collectionMedia.find((el) => el.mediaServerId === m.mediaServerId),
       );
       let rejectedByServer: string[] = [];
+      let unconfirmedByServer: string[] = [];
+      let unpersistedIds: string[] = [];
+      let unlinkedIds: string[] = [];
 
       if (collection) {
         if (!skipAutomaticLinkCheck) {
@@ -2733,7 +3196,8 @@ export class CollectionsService {
         // This happens when: 1) we have new items to add, OR 2) we have existing items but no media server collection
         const needsMediaServerCollection =
           !collection.mediaServerId &&
-          (newMedia.length > 0 || collectionMedia.length > 0);
+          (newMedia.length > 0 || collectionMedia.length > 0) &&
+          !collection.keepInMaintainerrOnly;
 
         // Create media server collection if needed
         if (needsMediaServerCollection) {
@@ -2826,7 +3290,7 @@ export class CollectionsService {
               this.logger.log(
                 `Syncing ${collectionMedia.length} existing items to newly created media server collection`,
               );
-              const failedItemIds = new Set(
+              const failedItemIds = unconfirmedIds(
                 await mediaServer.addBatchToCollection(
                   collection.mediaServerId,
                   collectionMedia.map(
@@ -2911,17 +3375,36 @@ export class CollectionsService {
           );
         }
 
-        // add new children to collection
-        if (newMedia.length > 0 && collection.mediaServerId) {
-          const { serverRejectedIds, persistedIds } =
+        // add new children to collection. Kept in Maintainerr only means there is
+        // no media-server collection to add to, but membership must still persist
+        // locally - that row is what rules, actions and overlays run on.
+        const keepInMaintainerrOnly = Boolean(collection.keepInMaintainerrOnly);
+        if (
+          newMedia.length > 0 &&
+          (collection.mediaServerId || keepInMaintainerrOnly)
+        ) {
+          const { serverRejectedIds, serverUnconfirmedIds, persistedIds } =
             await this.addChildrenToCollection(
-              { mediaServerId: collection.mediaServerId, dbId: collection.id },
+              {
+                mediaServerId: collection.mediaServerId ?? '',
+                dbId: collection.id,
+                manualCollection: Boolean(collection.manualCollection),
+              },
               newMedia,
               manual,
-              skipMediaServerAdd,
+              skipMediaServerAdd || keepInMaintainerrOnly,
               manualMembershipSource,
             );
           rejectedByServer = [...serverRejectedIds];
+          unconfirmedByServer = [...serverUnconfirmedIds];
+          unpersistedIds = newMedia
+            .map((m) => m.mediaServerId)
+            .filter(
+              (id) =>
+                !serverRejectedIds.has(id) &&
+                !serverUnconfirmedIds.has(id) &&
+                !persistedIds.has(id),
+            );
 
           // Only notify for items whose membership was persisted - both
           // server-rejected items and locally-rolled-back items never
@@ -2947,10 +3430,12 @@ export class CollectionsService {
             this.healedCollectionIds.delete(collection.id);
           }
 
-          // Every add rejected by the server: if the collection is also
-          // empty it is unpopulatable in place - heal by delete so the
-          // next pass recreates it fresh. Keyed to server rejections only;
-          // local persistence failures must never delete the collection.
+          // Every add REFUSED by the server: if the collection is also empty it
+          // is unpopulatable in place - heal by delete so the next pass
+          // recreates it fresh. Keyed to refusals the server actually answered:
+          // local persistence failures must never delete the collection, and
+          // neither must a run whose every write merely went unanswered, which
+          // says nothing about whether the collection can hold them.
           if (serverRejectedIds.size >= newMedia.length) {
             const deleted =
               await this.deleteEmptyCollectionRejectingAdds(collection);
@@ -2959,6 +3444,18 @@ export class CollectionsService {
               collection = await this.saveCollection(collection);
             }
           }
+        } else if (newMedia.length > 0) {
+          // No media server collection to add to, and not a collection kept in
+          // Maintainerr only. Nothing was written locally or remotely, so
+          // answering with an empty rejection list would report a silent no-op
+          // as a success. A failed find-or-create above (an unresolvable manual
+          // collection name, or a library search that threw) lands here.
+          unlinkedIds = newMedia.map(
+            (collectionMediaItem) => collectionMediaItem.mediaServerId,
+          );
+          this.logger.warn(
+            `Could not add ${unlinkedIds.length} item(s) to '${collection.title}': it has no media server collection to add them to.`,
+          );
         }
 
         // Push collection sort to the media server when membership changed
@@ -2978,10 +3475,18 @@ export class CollectionsService {
           });
         }
 
-        // Update cached total size (non-blocking)
-        this.updateCollectionTotalSize(collectionDbId).catch(() => {});
+        // The shared-manual paths insert rows of their own and shrink newMedia.
+        if (newMedia.length > 0 || isSharedManualCollection) {
+          void this.updateCollectionTotalSize(collectionDbId);
+        }
 
-        return { collection, serverRejectedIds: rejectedByServer };
+        return {
+          collection,
+          serverRejectedIds: rejectedByServer,
+          serverUnconfirmedIds: unconfirmedByServer,
+          unpersistedIds,
+          unlinkedIds,
+        };
       } else {
         this.logger.warn("Collection doesn't exist.");
       }
@@ -3091,12 +3596,14 @@ export class CollectionsService {
       const representativeCollection = siblingCollectionsGroup[0];
 
       if (representativeCollection.mediaServerId) {
-        const failedItemIds = await mediaServer.removeBatchFromCollection(
-          representativeCollection.mediaServerId,
-          [mediaServerId],
+        const failedItemIds = unconfirmedIds(
+          await mediaServer.removeBatchFromCollection(
+            representativeCollection.mediaServerId,
+            [mediaServerId],
+          ),
         );
 
-        if (failedItemIds.includes(mediaServerId)) {
+        if (failedItemIds.has(mediaServerId)) {
           this.logger.warn(
             `Couldn't prune media ${mediaServerId} from sibling collection ${representativeCollection.mediaServerId}`,
           );
@@ -3183,6 +3690,10 @@ export class CollectionsService {
                     manualCollection: collection.manualCollection,
                   },
                   childrenMedia,
+                  // Deliberately not gated on the opt-in: a retained link means
+                  // the teardown has not landed, and skipping the removal leaves
+                  // a footprint nothing tracks for the leave to unlink over
+                  // (#2766).
                   skipMediaServerRemove,
                 ),
               )
@@ -3224,19 +3735,32 @@ export class CollectionsService {
         if (
           collectionMedia.length <= 0 &&
           !collection.manualCollection &&
-          collection.mediaServerId
+          collection.mediaServerId &&
+          // Kept in Maintainerr only: the removals above never reached the
+          // server, so unlinking here would strand them - and their markers -
+          // for a sibling to adopt. stopMediaServerSync owns this teardown and
+          // runs later in the same rule execution.
+          !collection.keepInMaintainerrOnly
         ) {
-          // Another rule group with the same title may share this media
-          // server collection. Deleting it would also wipe the sibling rule's
-          // items, so just unlink locally and let the sibling keep ownership.
-          const isShared = await this.isMediaServerCollectionShared(collection);
+          // Another Maintainerr collection may point at this media server
+          // collection. Deleting it would also wipe that one's items, so just
+          // unlink locally and let it keep ownership. Asked of either kind:
+          // now that a custom collection's members are no longer adopted here,
+          // an automatic collection can genuinely reach zero members while a
+          // custom one still points at the same collection - and that one is
+          // the user's own.
+          const linkedElsewhere =
+            await this.isMediaServerCollectionLinkedElsewhere(collection);
 
-          if (isShared) {
+          // A failed lookup answers neither branch: unlinking on a guess
+          // strands the server collection, deleting on a guess can destroy one
+          // the user owns. Leave it linked and let the next run decide.
+          if (linkedElsewhere === true) {
             collection = await this.collectionRepo.save({
               ...collection,
               mediaServerId: null,
             });
-          } else {
+          } else if (linkedElsewhere === false) {
             try {
               await mediaServer.deleteCollection(collection.mediaServerId);
               collection = await this.collectionRepo.save({
@@ -3249,9 +3773,12 @@ export class CollectionsService {
             }
           }
         }
-      }
 
-      this.updateCollectionTotalSize(collectionDbId).catch(() => {});
+        // The shared-manual reconcile adds and drops rows of its own.
+        if (removedItemIds.size > 0 || isSharedManualCollection) {
+          void this.updateCollectionTotalSize(collectionDbId);
+        }
+      }
 
       return collection;
     } catch (error) {
@@ -3478,10 +4005,16 @@ export class CollectionsService {
   async removeFromAllCollections(media: CollectionMediaChange[]) {
     try {
       const collections = await this.collectionRepo.find();
+      let removedEverywhere = true;
       for (const collection of collections) {
-        await this.removeFromCollection(collection.id, media);
+        // The helper reports its own failure by answering nothing rather than
+        // throwing, so discarding the result reads a failed removal as done.
+        const removed = await this.removeFromCollection(collection.id, media);
+        removedEverywhere = removedEverywhere && removed !== undefined;
       }
-      return { status: 'OK', code: 1, message: 'Success' };
+      return removedEverywhere
+        ? { status: 'OK', code: 1, message: 'Success' }
+        : { status: 'NOK', code: 0, message: 'Failed' };
     } catch (error) {
       this.logger.warn(
         'An error occurred while removing media from all collections',
@@ -3493,7 +4026,6 @@ export class CollectionsService {
 
   async deleteCollection(collectionDbId: number): Promise<BasicResponseDto> {
     try {
-      const mediaServer = await this.getMediaServer();
       let collection = await this.collectionRepo.findOne({
         where: { id: collectionDbId },
       });
@@ -3507,26 +4039,34 @@ export class CollectionsService {
 
       collection = await this.checkAutomaticMediaServerLink(collection);
 
-      if (collection.mediaServerId && !collection.manualCollection) {
-        try {
-          await mediaServer.deleteCollection(collection.mediaServerId);
-        } catch (error) {
-          // The media server says why it refused - Plex names its own
-          // "allow media deletion" setting - and this is a dead end until the
-          // user acts on it, so the reason has to reach them.
-          const reason = getErrorMessage(
-            error,
-            'Failed to delete collection from media server',
-          );
-          this.logger.warn(`Failed to delete collection: ${reason}`);
-          this.logger.debug(error);
-          return {
-            status: 'NOK',
-            code: 0,
-            message: reason,
-          };
-        }
+      const teardown = await this.deleteMediaServerCollection(
+        collection,
+        'deleting',
+      );
+
+      if (!teardown.ok) {
+        // The media server says why it refused - Plex names its own "allow
+        // media deletion" setting - and this is a dead end until the user acts
+        // on it, so the reason has to reach them. Leaving the row behind keeps
+        // the collection recoverable rather than orphaning what is still there.
+        return {
+          status: 'NOK',
+          code: 0,
+          message:
+            teardown.reason ?? 'Failed to delete collection from media server',
+        };
       }
+      // The state rows cascade away with the collection, so the posters have
+      // to be restored while they can still be found.
+      try {
+        await this.overlayProcessor.revertCollection(collection.id);
+      } catch (error) {
+        this.logger.warn(
+          `Failed to revert the overlays of collection "${collection.title}"; deleting it anyway`,
+        );
+        this.logger.debug(error);
+      }
+
       return await this.RemoveCollectionFromDB(collection);
     } catch (error) {
       this.logger.warn(
@@ -3537,27 +4077,245 @@ export class CollectionsService {
     }
   }
 
-  public async deactivateCollection(collectionDbId: number) {
+  /**
+   * Tear down a collection's media-server collection, keeping the local rows.
+   * Never blocks on an unreachable server, and reports failure so the caller can
+   * keep the link rather than orphaning it (#3344). Manual collections point at
+   * a user-created collection, so they are left alone.
+   *
+   * Returns true when no media-server collection is left behind.
+   */
+  private async deleteMediaServerCollection(
+    collection: Collection,
+    context: string,
+  ): Promise<{ ok: boolean; reason?: string; shared?: boolean }> {
+    if (collection.manualCollection || !collection.mediaServerId) {
+      return { ok: true };
+    }
+
+    // A sibling rule group with the same title points at this same collection.
+    // Deleting it would take theirs with it, so leave it standing and take only
+    // our own items out (#2766/#3344). Every teardown goes through here, so no
+    // caller can delete a shared collection by reaching past this.
+    if (await this.isMediaServerCollectionShared(collection)) {
+      return {
+        ok: await this.leaveSharedMediaServerCollection(collection),
+        shared: true,
+      };
+    }
+
     try {
       const mediaServer = await this.getMediaServer();
+      await mediaServer.deleteCollection(collection.mediaServerId);
+      return { ok: true };
+    } catch (error) {
+      const reason = getErrorMessage(
+        error,
+        'Failed to delete collection from media server',
+      );
+      this.logger.warn(
+        `Failed to delete media server collection ${collection.mediaServerId} for '${collection.title}' - ${context} anyway and keeping the link: ${reason}`,
+      );
+      this.logger.debug(error);
+      return { ok: false, reason };
+    }
+  }
+
+  /**
+   * Take this collection's own members out of the media server collection it
+   * shares with a sibling rule group, leaving whatever the sibling also holds.
+   * A child no sibling holds would read as a foreign addition on their next run
+   * and be adopted as a manual member of the wrong rule (#2766), force-kept
+   * under that rule's deleteAfterDays.
+   *
+   * Returns true when nothing of ours is left behind.
+   */
+  private async leaveSharedMediaServerCollection(
+    collection: Collection,
+  ): Promise<boolean> {
+    try {
+      const siblingHeld = await this.getSiblingMemberMediaServerIds(collection);
+      const memberIds = (
+        await this.CollectionMediaRepo.find({
+          where: { collectionId: collection.id },
+        })
+      ).map((member) => member.mediaServerId);
+      // A rule-removed item has no row - only its marker records that the server
+      // may still be holding it, and nothing reconciles that marker once we
+      // unlink. Take those out too, or the sibling adopts them (#2766/#3298).
+      const markerIds = [
+        ...(await this.getRuleRemovedMarkers(collection.id)).keys(),
+      ];
+      const ownIds = [...new Set([...memberIds, ...markerIds])].filter(
+        (mediaServerId) => !siblingHeld.has(mediaServerId),
+      );
+
+      if (ownIds.length === 0) {
+        return true;
+      }
+
+      const mediaServer = await this.getMediaServer();
+      // The batch reports the ids it could not remove rather than throwing. Any
+      // one left behind is a foreign child to the sibling, so this counts as a
+      // failure and the link stays until a later run clears it.
+      const failed = unconfirmedIds(
+        await mediaServer.removeBatchFromCollection(
+          collection.mediaServerId,
+          ownIds,
+        ),
+      );
+
+      // A marker whose removal landed is resolved, even when others failed:
+      // keeping it would make a later hand re-add look like an orphan and be
+      // removed again (#3344). The failed ones stay, to retry with the link.
+      await this.clearRuleRemovedMarkers(
+        collection.id,
+        markerIds.filter((markerId) => !failed.has(markerId)),
+      );
+
+      if (failed.size > 0) {
+        this.logger.warn(
+          `The media server kept ${failed.size} of '${collection.title}'s items in the collection it shares - keeping the link so the next run retries`,
+        );
+        return false;
+      }
+
+      return true;
+    } catch (error) {
+      this.logger.warn(
+        `Could not take '${collection.title}' out of the media server collection it shares - keeping the link so the next run retries`,
+      );
+      this.logger.debug(error);
+      return false;
+    }
+  }
+
+  /**
+   * Release this collection's media server collection before a crucial setting
+   * change repurposes it. A sibling rule group may point at the same collection,
+   * so that one is left standing with only this collection's items taken out;
+   * otherwise the old library's items are cleaned up, which drops a per-library
+   * collection outright. Must run before the local rows go, since those are how
+   * we know which items are ours. False means something was left behind.
+   */
+  public async releaseMediaServerCollectionForReset(
+    collection: Collection,
+  ): Promise<boolean> {
+    if (!collection.mediaServerId) {
+      return true;
+    }
+
+    if (await this.isMediaServerCollectionShared(collection)) {
+      return this.leaveSharedMediaServerCollection(collection);
+    }
+
+    try {
+      const mediaServer = await this.getMediaServer();
+      await mediaServer.cleanupCollectionForLibrary(
+        collection.mediaServerId,
+        collection.libraryId,
+        !!collection.manualCollection,
+      );
+      return true;
+    } catch (error) {
+      this.logger.debug(error);
+      return false;
+    }
+  }
+
+  /**
+   * Turning "keep in Maintainerr only" on removes the collection from the media
+   * server while every local row stays: membership, rules, actions, overlays and
+   * *arr tags are unaffected. Called from the rule-group save so the teardown is
+   * immediate, and from `checkAutomaticMediaServerLink` so it retries: a failed
+   * delete keeps the link rather than orphaning it (#3344), and returns the
+   * collection unchanged.
+   */
+  public async stopMediaServerSync(
+    collection: Collection,
+  ): Promise<Collection> {
+    if (!collection.mediaServerId) {
+      return collection;
+    }
+
+    if ((await this.deleteMediaServerCollection(collection, 'continuing')).ok) {
+      this.logger.log(
+        `Removed the media server collection for '${collection.title}' - it is now kept in Maintainerr only`,
+      );
+
+      // A rule-removal marker only means "the media server may still be holding
+      // this". The teardown just established that it is not, and once the link
+      // is gone reconcileRuleRemovedOrphans returns early, so nothing would ever
+      // clear them. Left behind they are applied to whatever collection a later
+      // re-link creates, where an item present but not a member - one the user
+      // added by hand - is read as a lingering orphan and taken back out. Same
+      // wipe deactivateCollection does, for the same reason: the FK cascade
+      // cannot fire while the collection row survives.
+      //
+      // One transaction because either half alone is a defect: markers without
+      // the unlink leave a still-linked collection with no record of what a rule
+      // removed, and the next run adopts exactly those items as manual members;
+      // the unlink without the delete strands the markers for good, since every
+      // later call returns early once mediaServerId is gone.
+      const unlinked = await this.connection.transaction(async (manager) => {
+        const saved = await manager.withRepository(this.collectionRepo).save({
+          ...collection,
+          mediaServerId: null,
+        });
+
+        await manager
+          .withRepository(this.CollectionMediaRuleRemovalRepo)
+          .delete({ collectionId: collection.id });
+
+        return saved;
+      });
+
+      // saveCollection would have emitted this; after the commit, so a listener
+      // never reads a state that may still roll back.
+      this.eventEmitter.emit(MaintainerrEvent.Collection_Updated, {
+        collection: unlinked,
+        oldCollection: collection,
+      });
+
+      return unlinked;
+    }
+
+    return collection;
+  }
+
+  public async deactivateCollection(
+    collectionDbId: number,
+  ): Promise<BasicResponseDto> {
+    try {
       const collection = await this.collectionRepo.findOne({
         where: { id: collectionDbId },
       });
 
-      // Deactivating must not be blocked by an unreachable server, but
-      // dropping the link on a failed delete orphans the collection (#3344).
-      let mediaServerCollectionRemoved = true;
-      if (!collection.manualCollection && collection.mediaServerId) {
-        try {
-          await mediaServer.deleteCollection(collection.mediaServerId);
-        } catch (error) {
-          mediaServerCollectionRemoved = false;
-          this.logger.warn(
-            `Failed to delete media server collection ${collection.mediaServerId} for '${collection.title}' - deactivating anyway and keeping the link`,
-          );
-          this.logger.debug(error);
-        }
+      const teardown = await this.deleteMediaServerCollection(
+        collection,
+        'deactivating',
+      );
+
+      // Our items are still on a collection a sibling rule group shares. The
+      // rows and markers below are the only record of them, and an inactive
+      // collection never runs again to retry - wiping them here would hand the
+      // sibling those items to adopt as manual members (#2766). An unreachable
+      // server still must not block a plain deactivation (#3344), so this only
+      // refuses when the shared leave itself failed.
+      if (!teardown.ok && teardown.shared) {
+        this.logger.warn(
+          `Not deactivating '${collection.title}': its items could not be taken out of the media server collection it shares with another rule group`,
+        );
+        return {
+          status: 'NOK',
+          code: 0,
+          message:
+            teardown.reason ??
+            'Could not take this collection out of the media server collection it shares with another rule group',
+        };
       }
+
+      const mediaServerCollectionRemoved = teardown.ok;
 
       await this.CollectionMediaRepo.delete({ collectionId: collection.id });
       // Deactivation tears down the media-server collection but keeps the
@@ -3591,12 +4349,18 @@ export class CollectionsService {
           isActive: false,
         });
       }
+
+      return { status: 'OK', code: 1, message: 'Success' };
     } catch (error) {
       this.logger.warn(
         'An error occurred while performing collection actions.',
       );
       this.logger.debug(error);
-      return undefined;
+      return {
+        status: 'NOK',
+        code: 0,
+        message: 'An error occurred while deactivating the collection',
+      };
     }
   }
 
@@ -3644,14 +4408,26 @@ export class CollectionsService {
    * the server but failed local persistence and got rolled back.
    */
   private async addChildrenToCollection(
-    collectionIds: { mediaServerId: string; dbId: number },
+    collectionIds: {
+      mediaServerId: string;
+      dbId: number;
+      manualCollection: boolean;
+    },
     childrenMedia: CollectionMediaChange[],
     manual = false,
     skipMediaServerAdd = false,
     manualMembershipSource = CollectionMediaManualMembershipSource.LOCAL,
-  ): Promise<{ serverRejectedIds: Set<string>; persistedIds: Set<string> }> {
+  ): Promise<{
+    serverRejectedIds: Set<string>;
+    serverUnconfirmedIds: Set<string>;
+    persistedIds: Set<string>;
+  }> {
     if (childrenMedia.length === 0)
-      return { serverRejectedIds: new Set(), persistedIds: new Set() };
+      return {
+        serverRejectedIds: new Set(),
+        serverUnconfirmedIds: new Set(),
+        persistedIds: new Set(),
+      };
 
     const mediaServer = await this.getMediaServer();
 
@@ -3662,15 +4438,47 @@ export class CollectionsService {
     );
 
     let failedItemIds = new Set<string>();
+    let refusedIds = new Set<string>();
+    let unconfirmedAddIds: string[] = [];
     const persistedIds = new Set<string>();
 
     if (!skipMediaServerAdd) {
-      failedItemIds = new Set(
-        await mediaServer.addBatchToCollection(
-          collectionIds.mediaServerId,
-          childrenMedia.map((childMedia) => childMedia.mediaServerId),
-        ),
+      const outcome = await mediaServer.addBatchToCollection(
+        collectionIds.mediaServerId,
+        childrenMedia.map((childMedia) => childMedia.mediaServerId),
       );
+      failedItemIds = unconfirmedIds(outcome);
+      refusedIds = new Set(outcome.refused);
+      unconfirmedAddIds = outcome.unknown;
+    }
+
+    // An unanswered add may still have been applied, leaving a server child no
+    // row accounts for. The marker makes the next run reconcile that child
+    // rather than adopt it as a hand-added member.
+    //
+    // Not for a manual add (`manual` is the membership, not the collection's
+    // kind): adoption is what fulfils that request, and no rule would re-add it,
+    // so a marker would strand the item on the server forever. Not for a manual
+    // or unlinked collection either - neither reconciles markers, as on the
+    // removal side. Best-effort: never fail the add.
+    if (
+      unconfirmedAddIds.length > 0 &&
+      !manual &&
+      !collectionIds.manualCollection &&
+      collectionIds.mediaServerId
+    ) {
+      try {
+        await this.markRuleRemoved(
+          collectionIds.dbId,
+          unconfirmedAddIds,
+          'add',
+        );
+      } catch (error) {
+        this.logger.warn(
+          `Failed to record unconfirmed add markers for collection ${collectionIds.dbId}`,
+        );
+        this.logger.debug(error);
+      }
     }
 
     for (const childMedia of childrenMedia) {
@@ -3698,6 +4506,14 @@ export class CollectionsService {
         );
         this.logger.debug(error);
 
+        // Only undo an add we actually made. When the item was already on the
+        // server (a manual-membership sync, or a collection kept in Maintainerr
+        // only) there is nothing to roll back, and removing it would destroy
+        // server state over a local write failure - the next run re-syncs it.
+        if (skipMediaServerAdd) {
+          continue;
+        }
+
         try {
           await mediaServer.removeFromCollection(
             collectionIds.mediaServerId,
@@ -3712,7 +4528,11 @@ export class CollectionsService {
       }
     }
 
-    return { serverRejectedIds: failedItemIds, persistedIds };
+    return {
+      serverRejectedIds: refusedIds,
+      serverUnconfirmedIds: new Set(unconfirmedAddIds),
+      persistedIds,
+    };
   }
 
   /**
@@ -3765,7 +4585,7 @@ export class CollectionsService {
     let failedItemIds = new Set<string>();
     if (collectionIds.mediaServerId && !skipMediaServerRemove) {
       const mediaServer = await this.getMediaServer();
-      failedItemIds = new Set(
+      failedItemIds = unconfirmedIds(
         await mediaServer.removeBatchFromCollection(
           collectionIds.mediaServerId,
           childrenMedia.map((childMedia) => childMedia.mediaServerId),
@@ -3815,16 +4635,21 @@ export class CollectionsService {
     // genuine manual addition. Manual collections never reconcile markers, so
     // writing them there would only accumulate dead rows.
     // Best-effort: a marker write must never fail an already-committed removal.
+    // A marker records that the media server may still be holding an item a rule
+    // removed. With no collection there to hold one it can never be reconciled,
+    // so writing it would just accumulate a dead row per removal. A retained
+    // link still counts - that is the failed-teardown case the leave reads.
     const removedIdSet = new Set(removedItemIds);
-    const removedByRuleIds = collectionIds.manualCollection
-      ? []
-      : childrenMedia
-          .filter(
-            (childMedia) =>
-              childMedia.reason?.type === 'media_removed_by_rule' &&
-              removedIdSet.has(childMedia.mediaServerId),
-          )
-          .map((childMedia) => childMedia.mediaServerId);
+    const removedByRuleIds =
+      collectionIds.manualCollection || !collectionIds.mediaServerId
+        ? []
+        : childrenMedia
+            .filter(
+              (childMedia) =>
+                childMedia.reason?.type === 'media_removed_by_rule' &&
+                removedIdSet.has(childMedia.mediaServerId),
+            )
+            .map((childMedia) => childMedia.mediaServerId);
     try {
       await this.markRuleRemoved(collectionIds.dbId, removedByRuleIds);
     } catch (error) {
@@ -3887,6 +4712,7 @@ export class CollectionsService {
             sportarrQualityProfileId:
               collection.sportarrQualityProfileId ?? null,
             tagInArr: collection.tagInArr ?? false,
+            keepInMaintainerrOnly: collection.keepInMaintainerrOnly ?? false,
             sortTitle: collection.sortTitle,
             mediaServerSort: collection.mediaServerSort ?? null,
             overlayEnabled: collection.overlayEnabled ?? false,
@@ -4224,11 +5050,44 @@ export class CollectionsService {
   }
 
   /**
-   * Calculate and cache the total file size (in bytes) for a collection.
+   * Calculate and cache the total file size (in bytes) for a collection, one
+   * sweep per collection at a time. A call while a sweep runs flags a
+   * follow-up instead of starting another, so removals made during a sweep
+   * share one more read rather than each opening an overlapping one (#3716).
+   * Resolves once the size reflects the membership at the time of the call.
+   */
+  updateCollectionTotalSize(collectionId: number): Promise<void> {
+    const running = this.sizeSweeps.get(collectionId);
+    if (running) {
+      running.rerun();
+      return running.done;
+    }
+
+    let again = false;
+    const done = (async () => {
+      try {
+        do {
+          again = false;
+          await this.sweepCollectionSize(collectionId);
+        } while (again);
+      } finally {
+        this.sizeSweeps.delete(collectionId);
+      }
+    })();
+    this.sizeSweeps.set(collectionId, {
+      done,
+      rerun: () => {
+        again = true;
+      },
+    });
+    return done;
+  }
+
+  /**
    * Sums sizeBytes from mediaSources on each media item.
    * For show/season items without direct file sizes, traverses children.
    */
-  async updateCollectionTotalSize(collectionId: number): Promise<void> {
+  private async sweepCollectionSize(collectionId: number): Promise<void> {
     try {
       const collection = await this.collectionRepo.findOne({
         where: { id: collectionId },
@@ -4250,10 +5109,25 @@ export class CollectionsService {
       let totalBytes = 0;
       let hasAnySize = false;
 
+      // One read for the whole collection; per row it opened a request per
+      // item against the media server on every handling run (#3449).
+      const metadataById = new Map(
+        (
+          await mediaServer.getMetadataBatch(
+            collectionMedia.map((media) => media.mediaServerId),
+          )
+        ).map((item) => [item.id, item]),
+      );
+
       for (const media of collectionMedia) {
-        const itemSize = await this.resolveItemSize(
+        const metadata = metadataById.get(media.mediaServerId);
+
+        // Absent means gone or unreadable; either way keep the cached size.
+        if (!metadata) continue;
+
+        const itemSize = await this.resolveSizeFromMetadata(
           mediaServer,
-          media.mediaServerId,
+          metadata,
         );
 
         if (itemSize != null && itemSize > 0) {
@@ -4272,6 +5146,13 @@ export class CollectionsService {
           });
         }
       }
+
+      // A read that answered for nothing is a failed read, not an empty
+      // collection: Emby 500s a whole batch over one unparseable id. Writing
+      // null there would erase a known total, so keep the last one until a
+      // read succeeds - a permanently bad id keeps poisoning its batch, so
+      // that may not be the next run. Same principle as the per-row size above.
+      if (metadataById.size === 0) return;
 
       await this.collectionRepo.update(collectionId, {
         totalSizeBytes: hasAnySize ? totalBytes : null,
@@ -4293,9 +5174,31 @@ export class CollectionsService {
     mediaServer: IMediaServerService,
     mediaServerId: string,
   ): Promise<number | null> {
+    let metadata: MediaItem | undefined;
+
     try {
-      const metadata = await mediaServer.getMetadata(mediaServerId);
-      if (!metadata) return null;
+      metadata = await mediaServer.getMetadata(mediaServerId);
+    } catch (error) {
+      this.logger.debug(`Failed to get size for media ${mediaServerId}`);
+      this.logger.debug(error);
+      return null;
+    }
+
+    return metadata
+      ? this.resolveSizeFromMetadata(mediaServer, metadata)
+      : null;
+  }
+
+  /**
+   * Size of an already-read item: its own files, or its children's for a show
+   * or season that carries none. Null when nothing usable resolved, so one
+   * bad item cannot fail the collection's total.
+   */
+  private async resolveSizeFromMetadata(
+    mediaServer: IMediaServerService,
+    metadata: MediaItem,
+  ): Promise<number | null> {
+    try {
       const directSize = this.sumMediaSourceSizes(metadata);
       if (directSize > 0) return directSize;
       if (metadata.type === 'show' || metadata.type === 'season') {
@@ -4307,7 +5210,7 @@ export class CollectionsService {
       }
       return null;
     } catch (error) {
-      this.logger.debug(`Failed to get size for media ${mediaServerId}`);
+      this.logger.debug(`Failed to get size for media ${metadata.id}`);
       this.logger.debug(error);
       return null;
     }
@@ -4344,26 +5247,5 @@ export class CollectionsService {
     }
 
     return total;
-  }
-
-  /**
-   * Get all active collections that have overlayEnabled=true,
-   * including their collectionMedia relation for processing.
-   */
-  async getCollectionsWithOverlayEnabled(): Promise<
-    (Collection & { collectionMedia: CollectionMedia[] })[]
-  > {
-    const collections = await this.collectionRepo.find({
-      where: { overlayEnabled: true, isActive: true },
-    });
-
-    for (const coll of collections) {
-      coll.collectionMedia =
-        (await this.CollectionMediaRepo.find({
-          where: { collectionId: coll.id },
-        })) ?? [];
-    }
-
-    return collections;
   }
 }

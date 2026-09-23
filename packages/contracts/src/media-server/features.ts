@@ -16,6 +16,10 @@ export const MEDIA_SERVER_FEATURES: Record<
     MediaServerFeature.PLAYLISTS,
     MediaServerFeature.COLLECTION_POSTER,
     MediaServerFeature.COLLECTION_SORT,
+    // Verified against a live PMS 1.43.3: listings carry studio and sort=studio
+    // genuinely sorts, though /library/sections/{id}/sorts never advertises it.
+    MediaServerFeature.LIBRARY_STUDIO_SORT,
+    MediaServerFeature.TRUSTWORTHY_EMPTY_COLLECTION,
   ]),
   [MediaServerType.JELLYFIN]: new Set([
     MediaServerFeature.LABELS, // Tags in Jellyfin
@@ -23,12 +27,15 @@ export const MEDIA_SERVER_FEATURES: Record<
     MediaServerFeature.COLLECTION_POSTER,
     MediaServerFeature.CROSS_LIBRARY_COLLECTIONS, // BoxSets are server-global
     MediaServerFeature.OVERLAY_LANDSCAPE_IMAGE, // `Thumb` image type
+    MediaServerFeature.LIBRARY_STUDIO_SORT,
     // Jellyfin has no central history endpoint, but /Items answers watch state
     // in bulk per user, which is all this flag gates (#3337).
     MediaServerFeature.CENTRAL_WATCH_HISTORY,
     // Note: COLLECTION_VISIBILITY not supported
     // Note: WATCHLIST not supported (no API)
     // Note: COLLECTION_SORT not supported - no boxset reorder API; ForcedSortName has global side-effects.
+    // Note: TRUSTWORTHY_EMPTY_COLLECTION not supported - the BoxSet API can
+    // answer with no children during a brief sync delay after a modification.
   ]),
   [MediaServerType.EMBY]: new Set([
     MediaServerFeature.LABELS,
@@ -36,6 +43,9 @@ export const MEDIA_SERVER_FEATURES: Record<
     MediaServerFeature.COLLECTION_POSTER,
     MediaServerFeature.CROSS_LIBRARY_COLLECTIONS, // BoxSets are server-global
     MediaServerFeature.OVERLAY_LANDSCAPE_IMAGE, // `Thumb` image type, same .NET ancestor as Jellyfin
+    // Verified on Emby 4.9.5: Fields=Studios returns data and SortBy=Studio
+    // genuinely sorts (asc differs from the SortName baseline).
+    MediaServerFeature.LIBRARY_STUDIO_SORT,
     // Conservative defaults mirroring Jellyfin:
     // - COLLECTION_VISIBILITY: Emby has no Plex-style home/recommended pinning.
     // - WATCHLIST: no public watchlist API.
@@ -45,6 +55,7 @@ export const MEDIA_SERVER_FEATURES: Record<
     // - COLLECTION_SORT: Emby exposes DisplayOrder = PremiereDate | SortName
     //   on a BoxSet but no item-move/reorder endpoint, so Maintainerr's
     //   "push an explicit ordered list of item IDs" contract isn't satisfiable.
+    // - TRUSTWORTHY_EMPTY_COLLECTION: same .NET BoxSet sync delay as Jellyfin.
   ]),
 }
 

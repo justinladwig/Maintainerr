@@ -32,6 +32,7 @@ describe('RulesService.updateRules', () => {
       ruleMigrationService: unknown;
       eventEmitter: unknown;
       servarrTagService: unknown;
+      ruleUsersService: unknown;
     }> = {},
   ) =>
     new RulesService(
@@ -53,6 +54,10 @@ describe('RulesService.updateRules', () => {
       (overrides.eventEmitter ?? {}) as any,
       (overrides.servarrTagService ?? createMockServarrTagService()) as any,
       logger as any,
+      {} as any,
+      (overrides.ruleUsersService ?? {
+        getUsernames: jest.fn().mockResolvedValue([]),
+      }) as any,
     );
 
   // Let the fire-and-forget membership reconcile settle before asserting on it.
@@ -332,6 +337,7 @@ describe('RulesService.updateRules', () => {
     const collectionService = {
       getCollection: jest.fn().mockResolvedValue(dbCollection),
       saveCollection: jest.fn().mockResolvedValue(undefined),
+      releaseMediaServerCollectionForReset: jest.fn().mockResolvedValue(true),
       addLogRecord: jest.fn().mockResolvedValue(undefined),
       updateCollection: jest.fn().mockResolvedValue({
         dbCollection: { id: 42 },
@@ -381,11 +387,10 @@ describe('RulesService.updateRules', () => {
       notifications: [],
     } as any);
 
-    expect(mediaServer.cleanupCollectionForLibrary).toHaveBeenCalledWith(
-      'server-collection-id',
-      'old-library',
-      true,
-    );
+    // the old library and the manual flag travel on dbCollection
+    expect(
+      collectionService.releaseMediaServerCollectionForReset,
+    ).toHaveBeenCalledWith(dbCollection);
     expect(collectionMediaRepository.delete).toHaveBeenCalledWith({
       collectionId: group.collectionId,
     });
@@ -422,12 +427,14 @@ describe('RulesService.updateRules', () => {
       manualCollectionName: 'Shared Collection',
       visibleOnHome: true,
       visibleOnRecommended: true,
+      deleteAfterDays: 30,
     };
 
     const collectionMediaRepository = { delete: jest.fn() };
     const collectionService = {
       getCollection: jest.fn().mockResolvedValue(dbCollection),
       saveCollection: jest.fn().mockResolvedValue(undefined),
+      releaseMediaServerCollectionForReset: jest.fn().mockResolvedValue(true),
       addLogRecord: jest.fn().mockResolvedValue(undefined),
       updateCollection: jest
         .fn()
@@ -476,6 +483,9 @@ describe('RulesService.updateRules', () => {
         manualCollectionName: 'Shared Collection',
         visibleOnHome: true,
         visibleOnRecommended: true,
+        // The field that decides whether files get deleted: clearing it made
+        // the whole collection due at once.
+        deleteAfterDays: 30,
       }),
     );
     expect(result).toEqual({
@@ -494,6 +504,7 @@ describe('RulesService.updateRules', () => {
       const collectionService = {
         getCollection: jest.fn().mockResolvedValue({ id: 42 }),
         saveCollection: jest.fn().mockResolvedValue(undefined),
+        releaseMediaServerCollectionForReset: jest.fn().mockResolvedValue(true),
         addLogRecord: jest.fn().mockResolvedValue(undefined),
         updateCollection: jest
           .fn()
@@ -571,6 +582,7 @@ describe('RulesService.updateRules', () => {
     const collectionService = {
       getCollection: jest.fn().mockResolvedValue(dbCollection),
       saveCollection: jest.fn().mockResolvedValue(undefined),
+      releaseMediaServerCollectionForReset: jest.fn().mockResolvedValue(true),
       addLogRecord: jest.fn().mockResolvedValue(undefined),
       updateCollection: jest.fn().mockResolvedValue({
         dbCollection: freshCollection,
@@ -712,6 +724,7 @@ describe('RulesService.updateRules', () => {
     const collectionService = {
       getCollection: jest.fn().mockResolvedValue(dbCollection),
       saveCollection: jest.fn().mockResolvedValue(undefined),
+      releaseMediaServerCollectionForReset: jest.fn().mockResolvedValue(true),
       addLogRecord: jest.fn().mockResolvedValue(undefined),
       updateCollection: jest
         .fn()
@@ -795,6 +808,7 @@ describe('RulesService.updateRules', () => {
     const collectionService = {
       getCollection: jest.fn().mockResolvedValue(dbCollection),
       saveCollection: jest.fn().mockResolvedValue(undefined),
+      releaseMediaServerCollectionForReset: jest.fn().mockResolvedValue(true),
       addLogRecord: jest.fn().mockResolvedValue(undefined),
       updateCollection: jest
         .fn()
@@ -858,5 +872,187 @@ describe('RulesService.updateRules', () => {
       [],
       [{ mediaServerId: 'm1', tmdbId: 1, tvdbId: null }],
     );
+  });
+
+  // A per-user rule keeps working on the items it can still resolve and pauses
+  // on the rest, so an account that has since gone must not block every later
+  // edit to the group it sits in.
+  describe('a user the media server no longer reports', () => {
+    const perUserRule = (username: string) => ({
+      operator: null,
+      action: RulePossibility.BIGGER,
+      firstVal: [Application.TAUTULLI, 9],
+      customVal: { ruleTypeId: 0, value: '3' },
+      username,
+      section: 0,
+    });
+
+    const updateWith = (username: string, savedUsername?: string) => {
+      const service = createRulesService({
+        ruleGroupRepository: {
+          findOne: jest.fn().mockResolvedValue({ id: 1, collectionId: 1 }),
+        },
+        ruleUsersService: {
+          getUsernames: jest.fn().mockResolvedValue(['alice']),
+        },
+      });
+      jest
+        .spyOn(service, 'getRules')
+        .mockResolvedValue(
+          savedUsername
+            ? ([
+                { ruleJson: JSON.stringify(perUserRule(savedUsername)) },
+              ] as never)
+            : ([] as never),
+        );
+
+      return service.updateRules({
+        id: 1,
+        libraryId: '1',
+        name: 'Per-user group',
+        description: '',
+        useRules: true,
+        isActive: true,
+        rules: [perUserRule(username)],
+        collection: { keepLogsForMonths: 6 },
+      } as never);
+    };
+
+    it('keeps a user the group already saved', async () => {
+      // The save itself runs past validation into repositories this test does
+      // not stand up, so assert only on what is under test: it is not the
+      // username that stops it.
+      const outcome = await updateWith('bob', 'bob').catch((error) => error);
+
+      expect(outcome).not.toMatchObject({
+        result: "The media server has no user named 'bob'",
+      });
+    });
+
+    it('still rejects one the group never had', async () => {
+      await expect(updateWith('bob')).resolves.toMatchObject({
+        code: 0,
+        result: "The media server has no user named 'bob'",
+      });
+    });
+  });
+  // #11: turning "keep in Maintainerr only" on tears down the media-server
+  // collection. Keyed on the flag, not on the toggle transition: a failed delete
+  // keeps the link, so every later save retries it. Turning it back off needs
+  // nothing - the next run recreates it through the ordinary add path.
+  describe('keep in Maintainerr only', () => {
+    const saveWith = async ({
+      dbCollection,
+      savedCollection,
+      params = {},
+    }: {
+      dbCollection: Record<string, unknown>;
+      savedCollection: Record<string, unknown>;
+      params?: Record<string, unknown>;
+    }) => {
+      const group = { id: 5, collectionId: 42, dataType: 'movie' };
+      const collectionService = {
+        getCollection: jest.fn().mockResolvedValue(dbCollection),
+        saveCollection: jest.fn().mockResolvedValue(undefined),
+        releaseMediaServerCollectionForReset: jest.fn().mockResolvedValue(true),
+        addLogRecord: jest.fn().mockResolvedValue(undefined),
+        updateCollection: jest
+          .fn()
+          .mockResolvedValue({ dbCollection: savedCollection }),
+        stopMediaServerSync: jest.fn().mockResolvedValue(undefined),
+      };
+
+      const service = createRulesService({
+        rulesRepository: { delete: jest.fn(), save: jest.fn() },
+        ruleGroupRepository: { findOne: jest.fn().mockResolvedValue(group) },
+        collectionMediaRepository: { delete: jest.fn() },
+        exclusionRepo: { delete: jest.fn() },
+        collectionService,
+        mediaServerFactory: {
+          getService: jest.fn().mockReturnValue({
+            cleanupCollectionForLibrary: jest.fn().mockResolvedValue(undefined),
+            getLibraries: jest
+              .fn()
+              .mockResolvedValue([
+                { id: 'lib-1', title: 'Movies', type: 'movie' },
+              ]),
+          }),
+        },
+      });
+      jest
+        .spyOn(service as any, 'createOrUpdateGroup')
+        .mockResolvedValue(group.id);
+
+      await service.updateRules({
+        id: group.id,
+        libraryId: 'lib-1',
+        dataType: 'movie',
+        name: 'Kept local',
+        description: '',
+        rules: [],
+        useRules: true,
+        isActive: true,
+        keepInMaintainerrOnly: true,
+        collection: { keepLogsForMonths: 6 },
+        ...params,
+      } as any);
+
+      return collectionService;
+    };
+
+    it('removes the media server collection when it is turned on', async () => {
+      const savedCollection = {
+        id: 42,
+        keepInMaintainerrOnly: true,
+        mediaServerId: 'coll-1',
+      };
+      const collectionService = await saveWith({
+        dbCollection: { id: 42, keepInMaintainerrOnly: false },
+        savedCollection,
+      });
+
+      expect(collectionService.updateCollection).toHaveBeenCalledWith(
+        expect.objectContaining({ keepInMaintainerrOnly: true }),
+      );
+      expect(collectionService.stopMediaServerSync).toHaveBeenCalledWith(
+        savedCollection,
+      );
+    });
+
+    it('retries on a later save when an earlier delete left the link behind', async () => {
+      const savedCollection = {
+        id: 42,
+        keepInMaintainerrOnly: true,
+        mediaServerId: 'coll-1',
+      };
+      const collectionService = await saveWith({
+        dbCollection: { id: 42, keepInMaintainerrOnly: true },
+        savedCollection,
+      });
+
+      expect(collectionService.stopMediaServerSync).toHaveBeenCalledWith(
+        savedCollection,
+      );
+    });
+
+    it('never keeps a custom collection in Maintainerr only - the two are exclusive', async () => {
+      const collectionService = await saveWith({
+        dbCollection: { id: 42 },
+        savedCollection: { id: 42 },
+        params: {
+          name: 'Custom collection',
+          collection: {
+            manualCollection: true,
+            manualCollectionName: 'Shared Collection',
+            keepLogsForMonths: 6,
+          },
+        },
+      });
+
+      expect(collectionService.updateCollection).toHaveBeenCalledWith(
+        expect.objectContaining({ keepInMaintainerrOnly: false }),
+      );
+      expect(collectionService.stopMediaServerSync).not.toHaveBeenCalled();
+    });
   });
 });

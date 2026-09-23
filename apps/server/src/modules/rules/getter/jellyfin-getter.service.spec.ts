@@ -8,13 +8,16 @@ import {
   WatchRecord,
 } from '@maintainerr/contracts';
 import { Mocked, TestBed } from '@suites/unit';
-import { createRulesDto } from '../../../../test/utils/data';
+import { createRuleGroupDto } from '../../../../test/utils/data';
 
 const LIBRARY_ID = 'lib-1';
 
 import cacheManager from '../../api/lib/cache';
 import { JellyfinAdapterService } from '../../api/media-server/jellyfin/jellyfin-adapter.service';
+import { MaintainerrLogger } from '../../logging/logs.service';
+import { ArrLookupCache } from '../helpers/arr-lookup-cache';
 import { JellyfinGetterService } from './jellyfin-getter.service';
+import { MetadataRuleValueService } from './metadata-rule-value.service';
 
 // Helper to create mock MediaItem
 const createMediaItem = (overrides: Partial<MediaItem> = {}): MediaItem => ({
@@ -98,6 +101,8 @@ const createMediaPlaylist = (
 describe('JellyfinGetterService', () => {
   let jellyfinGetterService: JellyfinGetterService;
   let jellyfinAdapter: Mocked<JellyfinAdapterService>;
+  let metadataRuleValueService: Mocked<MetadataRuleValueService>;
+  let logger: Mocked<MaintainerrLogger>;
 
   const JELLYFIN_IS_WATCHED_PROP_ID = 42;
 
@@ -108,6 +113,8 @@ describe('JellyfinGetterService', () => {
 
     jellyfinGetterService = unit;
     jellyfinAdapter = unitRef.get(JellyfinAdapterService);
+    metadataRuleValueService = unitRef.get(MetadataRuleValueService);
+    logger = unitRef.get(MaintainerrLogger);
 
     // Default: Jellyfin is set up
     jellyfinAdapter.isSetup.mockReturnValue(true);
@@ -116,6 +123,39 @@ describe('JellyfinGetterService', () => {
   afterEach(() => {
     cacheManager.getCache('jellyfin')?.flush();
     jest.clearAllMocks();
+  });
+
+  describe('studios (id 46)', () => {
+    const STUDIOS_PROP_ID = 46;
+
+    it('delegates to the shared metadata resolution with the run cache', async () => {
+      const mediaItem = createMediaItem();
+      const cache = new ArrLookupCache();
+      metadataRuleValueService.getStudios.mockResolvedValue(['Studio One']);
+
+      await expect(
+        jellyfinGetterService.get(
+          STUDIOS_PROP_ID,
+          mediaItem,
+          'movie',
+          createRuleGroupDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
+          cache,
+        ),
+      ).resolves.toEqual(['Studio One']);
+      expect(metadataRuleValueService.getStudios).toHaveBeenCalledWith(
+        mediaItem,
+        cache,
+      );
+      expect(jellyfinAdapter.getMetadata).not.toHaveBeenCalled();
+    });
+
+    it('preserves undefined so a failed lookup stays transient', async () => {
+      metadataRuleValueService.getStudios.mockResolvedValue(undefined);
+
+      await expect(
+        jellyfinGetterService.get(STUDIOS_PROP_ID, createMediaItem(), 'movie'),
+      ).resolves.toBeUndefined();
+    });
   });
 
   describe('when Jellyfin is not configured', () => {
@@ -127,7 +167,7 @@ describe('JellyfinGetterService', () => {
         0, // addDate
         mediaItem,
         'movie',
-        createRulesDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toBeNull();
@@ -250,7 +290,7 @@ describe('JellyfinGetterService', () => {
           id,
           mediaItem,
           'movie',
-          createRulesDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
+          createRuleGroupDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
         );
 
         expect(response).toEqual(expected);
@@ -282,7 +322,7 @@ describe('JellyfinGetterService', () => {
         11,
         seasonItem,
         'season',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual(['Drama', 'Mystery']);
@@ -312,7 +352,7 @@ describe('JellyfinGetterService', () => {
         11,
         episodeItem,
         'episode',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual(['Sci-Fi']);
@@ -337,7 +377,7 @@ describe('JellyfinGetterService', () => {
         11,
         seasonItem,
         'season',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual([]);
@@ -361,7 +401,7 @@ describe('JellyfinGetterService', () => {
         11,
         episodeItem,
         'episode',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual([]);
@@ -384,7 +424,7 @@ describe('JellyfinGetterService', () => {
         44,
         mediaItem,
         'movie',
-        createRulesDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toBe(6.9);
@@ -407,7 +447,7 @@ describe('JellyfinGetterService', () => {
         1,
         mediaItem,
         'movie',
-        createRulesDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual(['Alice', 'Bob']);
@@ -432,7 +472,7 @@ describe('JellyfinGetterService', () => {
         1,
         mediaItem,
         'movie',
-        createRulesDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual(['Bob', 'user-missing', 'Alice']);
@@ -449,7 +489,7 @@ describe('JellyfinGetterService', () => {
         1,
         mediaItem,
         'movie',
-        createRulesDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual([]);
@@ -475,7 +515,7 @@ describe('JellyfinGetterService', () => {
         39,
         mediaItem,
         'movie',
-        createRulesDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual(['Bob', 'user-missing', 'Alice']);
@@ -512,7 +552,7 @@ describe('JellyfinGetterService', () => {
         40, // sw_favoritedBy
         episodeItem,
         'episode',
-        createRulesDto({ dataType: 'episode', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'episode', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual(['Bob']);
@@ -566,7 +606,7 @@ describe('JellyfinGetterService', () => {
         41, // sw_favoritedBy_including_parent
         episodeItem,
         'episode',
-        createRulesDto({ dataType: 'episode', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'episode', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual(['Alice', 'Bob', 'Carol', 'Dave']);
@@ -603,7 +643,7 @@ describe('JellyfinGetterService', () => {
         5,
         mediaItem,
         'movie',
-        createRulesDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toBe(3);
@@ -624,7 +664,7 @@ describe('JellyfinGetterService', () => {
         JELLYFIN_IS_WATCHED_PROP_ID,
         mediaItem,
         'movie',
-        createRulesDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toBe(true);
@@ -643,7 +683,7 @@ describe('JellyfinGetterService', () => {
         JELLYFIN_IS_WATCHED_PROP_ID,
         mediaItem,
         'movie',
-        createRulesDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toBe(false);
@@ -675,7 +715,7 @@ describe('JellyfinGetterService', () => {
           title: ' Manual Picks ',
         }),
       ];
-      const ruleGroup = createRulesDto({
+      const ruleGroup = createRuleGroupDto({
         dataType: 'movie',
         libraryId: mediaItem.library.id,
         name: ' movie cleanup ',
@@ -729,7 +769,7 @@ describe('JellyfinGetterService', () => {
         19,
         mediaItem,
         'movie',
-        createRulesDto({
+        createRuleGroupDto({
           dataType: 'movie',
           libraryId: mediaItem.library.id,
           name: ' cleanup a ',
@@ -739,7 +779,7 @@ describe('JellyfinGetterService', () => {
         19,
         mediaItem,
         'movie',
-        createRulesDto({
+        createRuleGroupDto({
           dataType: 'movie',
           libraryId: mediaItem.library.id,
           name: ' cleanup b ',
@@ -801,7 +841,7 @@ describe('JellyfinGetterService', () => {
         },
       );
 
-      const ruleGroup = createRulesDto({
+      const ruleGroup = createRuleGroupDto({
         dataType: 'episode',
         libraryId: episodeItem.library.id,
         name: ' show cleanup ',
@@ -824,6 +864,104 @@ describe('JellyfinGetterService', () => {
     });
   });
 
+  describe('collection rules on a server that lists item collections', () => {
+    it('reads collection_names (id: 19) from the item route without scanning', async () => {
+      const mediaItem = createMediaItem({ id: 'movie-direct', type: 'movie' });
+      jellyfinAdapter.getMetadata.mockResolvedValue(mediaItem);
+      jellyfinAdapter.getCollectionsContaining.mockResolvedValue([
+        createMediaCollection({ id: 'collection-a', title: ' Saga ' }),
+      ]);
+
+      const names = await jellyfinGetterService.get(
+        19,
+        mediaItem,
+        'movie',
+        createRuleGroupDto({
+          dataType: 'movie',
+          libraryId: mediaItem.library.id,
+        }),
+      );
+
+      expect(names).toEqual(['Saga']);
+      expect(jellyfinAdapter.getCollectionsContaining).toHaveBeenCalledWith(
+        'movie-direct',
+      );
+      expect(jellyfinAdapter.getCollections).not.toHaveBeenCalled();
+      expect(jellyfinAdapter.getCollectionChildren).not.toHaveBeenCalled();
+    });
+
+    it('scans the rule group library, not the episode parent, when the route is missing', async () => {
+      const episodeItem = createMediaItem({
+        id: 'episode-scan',
+        type: 'episode' as MediaItemType,
+        parentId: 'season-1',
+        grandparentId: 'show-1',
+        library: { id: 'season-1', title: '' },
+      });
+      jellyfinAdapter.getMetadata.mockResolvedValue(episodeItem);
+      jellyfinAdapter.getCollectionsContaining.mockResolvedValue(undefined);
+      jellyfinAdapter.getCollections.mockResolvedValue([]);
+
+      await jellyfinGetterService.get(
+        25,
+        episodeItem,
+        'episode',
+        createRuleGroupDto({ dataType: 'episode', libraryId: 'library-1' }),
+      );
+
+      expect(jellyfinAdapter.getCollections).toHaveBeenCalledWith('library-1');
+    });
+
+    it('unions the item, season and show routes for sw_collections (id: 25) and dedupes', async () => {
+      const episodeItem = createMediaItem({
+        id: 'episode-direct',
+        type: 'episode' as MediaItemType,
+        parentId: 'season-1',
+        grandparentId: 'show-1',
+      });
+      jellyfinAdapter.getMetadata.mockImplementation(async (itemId: string) => {
+        if (itemId === 'episode-direct') return episodeItem;
+        if (itemId === 'season-1')
+          return createMediaItem({
+            id: 'season-1',
+            type: 'season' as MediaItemType,
+            parentId: 'show-1',
+          });
+        if (itemId === 'show-1')
+          return createMediaItem({
+            id: 'show-1',
+            type: 'show' as MediaItemType,
+          });
+        return undefined;
+      });
+      jellyfinAdapter.getCollectionsContaining.mockImplementation(
+        async (itemId: string) => {
+          if (itemId === 'season-1')
+            return [createMediaCollection({ id: 'c-season', title: 'Season' })];
+          if (itemId === 'show-1')
+            return [
+              createMediaCollection({ id: 'c-season', title: 'Season' }),
+              createMediaCollection({ id: 'c-show', title: 'Show' }),
+            ];
+          return [];
+        },
+      );
+
+      const count = await jellyfinGetterService.get(
+        25,
+        episodeItem,
+        'episode',
+        createRuleGroupDto({
+          dataType: 'episode',
+          libraryId: episodeItem.library.id,
+        }),
+      );
+
+      expect(count).toBe(2);
+      expect(jellyfinAdapter.getCollectionChildren).not.toHaveBeenCalled();
+    });
+  });
+
   describe('lastViewedAt (id: 7)', () => {
     it('should return the most recent watch date', async () => {
       const mediaItem = createMediaItem();
@@ -840,7 +978,7 @@ describe('JellyfinGetterService', () => {
         7,
         mediaItem,
         'movie',
-        createRulesDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual(new Date('2024-06-15'));
@@ -856,7 +994,7 @@ describe('JellyfinGetterService', () => {
         7,
         mediaItem,
         'movie',
-        createRulesDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toBeNull();
@@ -874,7 +1012,7 @@ describe('JellyfinGetterService', () => {
         7,
         mediaItem,
         'movie',
-        createRulesDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toBeUndefined();
@@ -928,7 +1066,7 @@ describe('JellyfinGetterService', () => {
         7,
         showItem,
         'show',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual(new Date('2026-03-06'));
@@ -968,10 +1106,106 @@ describe('JellyfinGetterService', () => {
         7,
         seasonItem,
         'season',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual(new Date('2026-03-04'));
+    });
+  });
+
+  describe('lastPlayedAt (id 47)', () => {
+    it('aggregates the newest episode playback attempt for a season', async () => {
+      const season = createMediaItem({ id: 'season-1', type: 'season' });
+      const episodes = [
+        createMediaItem({ id: 'episode-1', type: 'episode' }),
+        createMediaItem({ id: 'episode-2', type: 'episode' }),
+      ];
+      jellyfinAdapter.getMetadata.mockResolvedValue(season);
+      jellyfinAdapter.getChildrenMetadata.mockResolvedValue(episodes);
+      jellyfinAdapter.getLastPlayedAt.mockImplementation(
+        async (itemId: string) =>
+          itemId === 'episode-1'
+            ? new Date('2024-06-01T00:00:00.000Z')
+            : new Date('2024-06-04T00:00:00.000Z'),
+      );
+
+      await expect(
+        jellyfinGetterService.get(47, season, 'season'),
+      ).resolves.toEqual(new Date('2024-06-04T00:00:00.000Z'));
+      expect(jellyfinAdapter.getChildrenMetadata).toHaveBeenCalledWith(
+        'season-1',
+        'episode',
+        true,
+      );
+    });
+
+    it('walks a show season by season and reads each episode once', async () => {
+      const show = createMediaItem({ id: 'show-1', type: 'show' });
+      jellyfinAdapter.getMetadata.mockResolvedValue(show);
+      jellyfinAdapter.getChildrenMetadata.mockImplementation(
+        async (itemId: string) =>
+          itemId === 'show-1'
+            ? [createMediaItem({ id: 'season-1', type: 'season' })]
+            : [createMediaItem({ id: 'episode-1', type: 'episode' })],
+      );
+      jellyfinAdapter.getLastPlayedAt.mockResolvedValue(
+        new Date('2024-06-02T00:00:00.000Z'),
+      );
+
+      await expect(
+        jellyfinGetterService.get(47, show, 'show'),
+      ).resolves.toEqual(new Date('2024-06-02T00:00:00.000Z'));
+      // A non-container parentId makes Jellyfin answer for the whole library,
+      // so only the show is expanded into seasons.
+      expect(jellyfinAdapter.getChildrenMetadata).toHaveBeenCalledWith(
+        'show-1',
+        'season',
+        true,
+      );
+      expect(jellyfinAdapter.getLastPlayedAt).toHaveBeenCalledTimes(1);
+      expect(jellyfinAdapter.getLastPlayedAt).toHaveBeenCalledWith(
+        'episode-1',
+        undefined,
+      );
+    });
+
+    // Only a container may be expanded: Jellyfin answers a non-container
+    // parentId with the whole library.
+    it.each(['movie', 'episode'] as const)(
+      'reads a %s directly, passing the library so the snapshot can answer',
+      async (type) => {
+        const mediaItem = createMediaItem({ id: `${type}-1`, type });
+        jellyfinAdapter.getMetadata.mockResolvedValue(mediaItem);
+        jellyfinAdapter.getLastPlayedAt.mockResolvedValue(
+          new Date('2024-06-01T00:00:00.000Z'),
+        );
+
+        await expect(
+          jellyfinGetterService.get(
+            47,
+            mediaItem,
+            type,
+            createRuleGroupDto({ dataType: type, libraryId: LIBRARY_ID }),
+          ),
+        ).resolves.toEqual(new Date('2024-06-01T00:00:00.000Z'));
+        expect(jellyfinAdapter.getChildrenMetadata).not.toHaveBeenCalled();
+        expect(jellyfinAdapter.getLastPlayedAt).toHaveBeenCalledWith(
+          `${type}-1`,
+          LIBRARY_ID,
+        );
+      },
+    );
+
+    it('preserves lookup failure as undefined', async () => {
+      const mediaItem = createMediaItem({ id: 'movie-1', type: 'movie' });
+      jellyfinAdapter.getMetadata.mockResolvedValue(mediaItem);
+      jellyfinAdapter.getLastPlayedAt.mockRejectedValue(
+        new Error('lookup failed'),
+      );
+
+      await expect(
+        jellyfinGetterService.get(47, mediaItem, 'movie'),
+      ).resolves.toBeUndefined();
     });
   });
 
@@ -1022,10 +1256,74 @@ describe('JellyfinGetterService', () => {
         12,
         showItem,
         'show',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual(['Bob']);
+    });
+
+    it('sw_allEpisodesSeenBySinceAdded (id: 49) intersects post-add viewers for a show', async () => {
+      const showItem = createMediaItem({
+        id: 'show-all-seen-since-added',
+        type: 'show' as MediaItemType,
+        addedAt: new Date('2024-01-01T00:00:00.000Z'),
+      });
+
+      jellyfinAdapter.getMetadata.mockResolvedValue(
+        createMediaItem({
+          ...showItem,
+          addedAt: new Date('2024-06-01T00:00:00.000Z'),
+        }),
+      );
+      jellyfinAdapter.getUsers.mockResolvedValue([
+        createMediaUser({ id: 'user-1', name: 'Alice' }),
+        createMediaUser({ id: 'user-2', name: 'Bob' }),
+      ]);
+      jellyfinAdapter.getDescendantEpisodeWatchHistory.mockResolvedValue(
+        createDescendantWatchHistory({
+          'episode-1': [
+            {
+              userId: 'user-1',
+              watchedAt: new Date('2024-06-01T00:00:01.000Z'),
+            },
+            {
+              userId: 'user-1',
+              watchedAt: new Date('2024-06-02T00:00:00.000Z'),
+            },
+            {
+              userId: 'user-2',
+              watchedAt: new Date('2024-06-01T00:00:00.000Z'),
+            },
+            {
+              userId: 'user-ghost',
+              watchedAt: new Date('2024-06-02T00:00:00.000Z'),
+            },
+          ],
+          'episode-2': [
+            {
+              userId: 'user-1',
+              watchedAt: new Date('2024-06-03T00:00:00.000Z'),
+            },
+            {
+              userId: 'user-2',
+              watchedAt: new Date('2024-06-03T00:00:00.000Z'),
+            },
+            {
+              userId: 'user-ghost',
+              watchedAt: new Date('2024-06-03T00:00:00.000Z'),
+            },
+          ],
+        }),
+      );
+
+      await expect(
+        jellyfinGetterService.get(
+          49,
+          showItem,
+          'show',
+          createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        ),
+      ).resolves.toEqual(['Alice']);
     });
 
     // A failed sweep must never read as "never watched" - the item is skipped
@@ -1055,7 +1353,7 @@ describe('JellyfinGetterService', () => {
           propertyId,
           showItem,
           'show',
-          createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+          createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
         );
 
         expect(response).toBeUndefined();
@@ -1099,7 +1397,7 @@ describe('JellyfinGetterService', () => {
         14,
         showItem,
         'show',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toBe(3);
@@ -1129,7 +1427,7 @@ describe('JellyfinGetterService', () => {
         16,
         seasonItem,
         'season',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual(new Date('2026-01-12'));
@@ -1177,7 +1475,7 @@ describe('JellyfinGetterService', () => {
         27,
         showItem,
         'show',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual(new Date('2026-02-08'));
@@ -1216,7 +1514,7 @@ describe('JellyfinGetterService', () => {
         29,
         episodeItem,
         'episode',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual(new Date('2026-03-10'));
@@ -1290,7 +1588,7 @@ describe('JellyfinGetterService', () => {
         13,
         showItem,
         'show',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual(new Date('2026-03-06'));
@@ -1343,7 +1641,7 @@ describe('JellyfinGetterService', () => {
         13,
         seasonItem,
         'season',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       // ep-2 is the highest-numbered watched episode; its rewatch wins.
@@ -1380,7 +1678,7 @@ describe('JellyfinGetterService', () => {
         13,
         seasonItem,
         'season',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toBeNull();
@@ -1418,7 +1716,7 @@ describe('JellyfinGetterService', () => {
         13,
         seasonItem,
         'season',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual(new Date('2026-02-01'));
@@ -1464,10 +1762,199 @@ describe('JellyfinGetterService', () => {
         13,
         seasonItem,
         'season',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual(new Date('2026-03-01'));
+    });
+  });
+
+  describe('sw_lastViewedAtThroughSeason (id: 48)', () => {
+    const ruleGroup = createRuleGroupDto({
+      dataType: 'show',
+      libraryId: LIBRARY_ID,
+    });
+
+    const getSeasonViewDate = (seasonIndex: number | undefined) => {
+      const season = createMediaItem({
+        id: 'target-season',
+        type: 'season',
+        index: seasonIndex,
+        parentId: 'show-1',
+      });
+      jellyfinAdapter.getMetadata.mockResolvedValue(season);
+
+      return jellyfinGetterService.get(48, season, 'season', ruleGroup);
+    };
+
+    it('holds an unnumbered season without reporting a read failure', async () => {
+      const season = createMediaItem({
+        id: 'season-unknown',
+        type: 'season',
+        index: undefined,
+        parentId: 'show-1',
+      });
+      jellyfinAdapter.getMetadata.mockResolvedValue(season);
+
+      await expect(
+        jellyfinGetterService.get(48, season, 'season', ruleGroup),
+      ).resolves.toBeUndefined();
+      expect(logger.warn).not.toHaveBeenCalled();
+      expect(jellyfinAdapter.getChildrenMetadata).not.toHaveBeenCalled();
+    });
+
+    it('returns null when applied to a non-season item', async () => {
+      const show = createMediaItem({ id: 'show-1', type: 'show' });
+      jellyfinAdapter.getMetadata.mockResolvedValue(show);
+
+      await expect(
+        jellyfinGetterService.get(48, show, 'show', ruleGroup),
+      ).resolves.toBeNull();
+    });
+
+    const mockShow = (
+      seasons: MediaItem[],
+      watchedBy: Record<string, Array<Partial<WatchRecord>>>,
+    ) => {
+      jellyfinAdapter.getChildrenMetadata.mockImplementation(
+        async (parentId: string, childType?: MediaItemType) => {
+          if (parentId === 'show-1' && childType === 'season') return seasons;
+          return [
+            createMediaItem({
+              id: `${parentId}-episode`,
+              type: 'episode',
+            }),
+          ];
+        },
+      );
+      jellyfinAdapter.getDescendantEpisodeWatchHistory.mockResolvedValue(
+        createDescendantWatchHistory(watchedBy),
+      );
+    };
+
+    it('returns the chronological maximum from current episodes through the target season', async () => {
+      mockShow(
+        [
+          createMediaItem({ id: 'specials', type: 'season', index: 0 }),
+          createMediaItem({ id: 'season-1', type: 'season', index: 1 }),
+          createMediaItem({ id: 'season-2', type: 'season', index: 2 }),
+          createMediaItem({ id: 'season-3', type: 'season', index: 3 }),
+          createMediaItem({
+            id: 'season-unknown',
+            type: 'season',
+            index: undefined,
+          }),
+        ],
+        {
+          'deleted-episode': [{ watchedAt: new Date('2026-08-01') }],
+          'specials-episode': [{ watchedAt: new Date('2026-06-01') }],
+          'season-1-episode': [{ watchedAt: new Date('2026-04-20') }],
+          'season-2-episode': [{ watchedAt: new Date('2026-03-01') }],
+          'season-3-episode': [
+            { watchedAt: new Date('2026-07-01') },
+            { watchedAt: new Date('invalid') },
+          ],
+        },
+      );
+
+      await expect(getSeasonViewDate(2)).resolves.toEqual(
+        new Date('2026-04-20'),
+      );
+      expect(
+        jellyfinAdapter.getDescendantEpisodeWatchHistory,
+      ).toHaveBeenCalledTimes(1);
+      expect(
+        jellyfinAdapter.getDescendantEpisodeWatchHistory,
+      ).toHaveBeenCalledWith('show-1', LIBRARY_ID);
+      expect(jellyfinAdapter.getChildrenMetadata).toHaveBeenCalledWith(
+        'show-1',
+        'season',
+        true,
+      );
+      for (const seasonId of ['season-1', 'season-2']) {
+        expect(jellyfinAdapter.getChildrenMetadata).toHaveBeenCalledWith(
+          seasonId,
+          'episode',
+          true,
+        );
+      }
+      for (const seasonId of ['specials', 'season-3', 'season-unknown']) {
+        expect(jellyfinAdapter.getChildrenMetadata).not.toHaveBeenCalledWith(
+          seasonId,
+          'episode',
+          true,
+        );
+      }
+    });
+
+    it.each(['season', 'episode'] as const)(
+      'returns undefined for a qualifying %s with no id',
+      async (missingIdOn) => {
+        const seasonId = missingIdOn === 'season' ? '' : 'season-1';
+        const episodeId = missingIdOn === 'episode' ? '' : 'episode-1';
+        jellyfinAdapter.getChildrenMetadata.mockImplementation(
+          async (parentId: string, childType?: MediaItemType) =>
+            parentId === 'show-1' && childType === 'season'
+              ? [createMediaItem({ id: seasonId, type: 'season', index: 1 })]
+              : [createMediaItem({ id: episodeId, type: 'episode' })],
+        );
+        jellyfinAdapter.getDescendantEpisodeWatchHistory.mockResolvedValue(
+          createDescendantWatchHistory({
+            [episodeId]: [{ watchedAt: new Date('2026-04-20') }],
+          }),
+        );
+
+        await expect(getSeasonViewDate(1)).resolves.toBeUndefined();
+      },
+    );
+
+    it('uses only specials when evaluating Season 0', async () => {
+      mockShow(
+        [
+          createMediaItem({ id: 'specials', type: 'season', index: 0 }),
+          createMediaItem({ id: 'season-1', type: 'season', index: 1 }),
+        ],
+        {
+          'specials-episode': [{ watchedAt: new Date('2026-02-01') }],
+          'season-1-episode': [{ watchedAt: new Date('2026-03-01') }],
+        },
+      );
+
+      await expect(getSeasonViewDate(0)).resolves.toEqual(
+        new Date('2026-02-01'),
+      );
+      expect(jellyfinAdapter.getChildrenMetadata).toHaveBeenCalledWith(
+        'specials',
+        'episode',
+        true,
+      );
+      expect(jellyfinAdapter.getChildrenMetadata).not.toHaveBeenCalledWith(
+        'season-1',
+        'episode',
+        true,
+      );
+    });
+
+    it('returns null when qualifying episodes have no dated history', async () => {
+      mockShow(
+        [createMediaItem({ id: 'season-1', type: 'season', index: 1 })],
+        {
+          'season-1-episode': [{ watchedAt: undefined }],
+        },
+      );
+
+      await expect(getSeasonViewDate(1)).resolves.toBeNull();
+    });
+
+    it('returns undefined for an invalid qualifying watch date', async () => {
+      mockShow(
+        [createMediaItem({ id: 'season-1', type: 'season', index: 1 })],
+        {
+          'season-1-episode': [{ watchedAt: new Date('invalid') }],
+        },
+      );
+
+      await expect(getSeasonViewDate(1)).resolves.toBeUndefined();
     });
   });
 
@@ -1518,7 +2005,7 @@ describe('JellyfinGetterService', () => {
         15, // sw_viewedEpisodes
         showItem,
         'show',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toBe(2); // 2 episodes have been watched
@@ -1551,7 +2038,7 @@ describe('JellyfinGetterService', () => {
         15,
         showItem,
         'show',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toBe(0);
@@ -1598,7 +2085,7 @@ describe('JellyfinGetterService', () => {
         17, // sw_amountOfViews
         showItem,
         'show',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toBe(5); // 3 + 2 = 5 total views
@@ -1631,7 +2118,7 @@ describe('JellyfinGetterService', () => {
         17,
         showItem,
         'show',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toBe(0);
@@ -1661,13 +2148,13 @@ describe('JellyfinGetterService', () => {
         21,
         mediaItem,
         'movie',
-        createRulesDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
       );
       const count = await jellyfinGetterService.get(
         20,
         mediaItem,
         'movie',
-        createRulesDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
       );
 
       expect(names).toEqual(['Friday Queue']);
@@ -1710,7 +2197,7 @@ describe('JellyfinGetterService', () => {
         21,
         showItem,
         'show',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual(['Show Queue']);
@@ -1736,7 +2223,7 @@ describe('JellyfinGetterService', () => {
           id,
           mediaItem,
           type,
-          createRulesDto({ dataType: type, libraryId: LIBRARY_ID }),
+          createRuleGroupDto({ dataType: type, libraryId: LIBRARY_ID }),
         );
 
         expect(response).toBe(expected);
@@ -1770,7 +2257,7 @@ describe('JellyfinGetterService', () => {
         id,
         mediaItem,
         'movie',
-        createRulesDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toBe(expected);
@@ -1814,7 +2301,7 @@ describe('JellyfinGetterService', () => {
           id,
           seasonItem,
           'season',
-          createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+          createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
         );
 
         expect(response).toBe(expected);
@@ -1844,7 +2331,7 @@ describe('JellyfinGetterService', () => {
         35,
         episodeItem,
         'episode',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toBe(9.1);
@@ -1863,7 +2350,7 @@ describe('JellyfinGetterService', () => {
         999, // Unknown property ID
         mediaItem,
         'movie',
-        createRulesDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toBeNull();
@@ -1899,7 +2386,7 @@ describe('JellyfinGetterService', () => {
         SW_WATCHERS_PROP_ID,
         showItem,
         'show',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual(['Alice', 'Bob']);
@@ -1926,7 +2413,7 @@ describe('JellyfinGetterService', () => {
         SW_WATCHERS_PROP_ID,
         showItem,
         'show',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual([]);
@@ -1951,7 +2438,7 @@ describe('JellyfinGetterService', () => {
         SW_WATCHERS_PROP_ID,
         seasonItem,
         'season',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual(['Bob']);
@@ -1977,7 +2464,7 @@ describe('JellyfinGetterService', () => {
         SW_WATCHERS_PROP_ID,
         episodeItem,
         'episode',
-        createRulesDto({ dataType: 'episode', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'episode', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual(['Bob']);
@@ -2008,10 +2495,134 @@ describe('JellyfinGetterService', () => {
         SW_WATCHERS_PROP_ID,
         showItem,
         'show',
-        createRulesDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toEqual(['user-ghost']);
+    });
+  });
+
+  describe('sw_watchersSinceAdded (id: 50)', () => {
+    const cutoff = new Date('2024-06-01T00:00:00.000Z');
+
+    const setTarget = (type: 'show' | 'season') => {
+      const target = createMediaItem({
+        id: `${type}-1`,
+        type,
+        addedAt: cutoff,
+      });
+      jellyfinAdapter.getMetadata.mockResolvedValue(target);
+      jellyfinAdapter.getUsers.mockResolvedValue([
+        createMediaUser({ id: 'user-1', name: 'Alice' }),
+        createMediaUser({ id: 'user-2', name: 'Bob' }),
+      ]);
+      return target;
+    };
+
+    const get = (propertyId: number, target: MediaItem) =>
+      jellyfinGetterService.get(
+        propertyId,
+        target,
+        target.type,
+        createRuleGroupDto({ dataType: 'show', libraryId: LIBRARY_ID }),
+      );
+
+    it.each(['show', 'season'] as const)(
+      'unions views strictly after the %s was added, keeping unknown accounts',
+      async (type) => {
+        const target = setTarget(type);
+        jellyfinAdapter.getDescendantEpisodeWatchHistory.mockResolvedValue(
+          createDescendantWatchHistory({
+            'episode-1': [
+              { userId: 'user-1', watchedAt: cutoff },
+              {
+                userId: 'user-2',
+                watchedAt: new Date('2024-05-31T23:59:59.000Z'),
+              },
+              {
+                userId: 'user-ghost',
+                watchedAt: new Date('2024-06-01T00:00:02.000Z'),
+              },
+            ],
+            'episode-2': [
+              {
+                userId: 'user-1',
+                watchedAt: new Date('2024-06-01T00:00:03.000Z'),
+              },
+            ],
+          }),
+        );
+
+        await expect(get(50, target)).resolves.toEqual(['Alice', 'user-ghost']);
+      },
+    );
+
+    it.each([49, 50])(
+      'bounds property %i by the target addedAt, not the episode addedAt',
+      async (propertyId) => {
+        const target = setTarget('season');
+        // Upgraded episode: Jellyfin recreated it after the retained watch.
+        jellyfinAdapter.getChildrenMetadata.mockResolvedValue([
+          createMediaItem({
+            id: 'episode-1',
+            type: 'episode',
+            addedAt: new Date('2024-07-01T00:00:00.000Z'),
+          }),
+        ]);
+        jellyfinAdapter.getDescendantEpisodeWatchHistory.mockResolvedValue(
+          createDescendantWatchHistory({
+            'episode-1': [
+              {
+                userId: 'user-1',
+                watchedAt: new Date('2024-06-02T00:00:00.000Z'),
+              },
+            ],
+          }),
+        );
+
+        await expect(get(propertyId, target)).resolves.toEqual(['Alice']);
+      },
+    );
+
+    it.each([
+      ['missing', undefined as unknown as Date],
+      ['malformed', new Date('invalid')],
+    ])(
+      'returns undefined for ids 49 and 50 when the target addedAt is %s',
+      async (_, addedAt) => {
+        const target = setTarget('season');
+        jellyfinAdapter.getMetadata.mockResolvedValue({ ...target, addedAt });
+        jellyfinAdapter.getDescendantEpisodeWatchHistory.mockResolvedValue(
+          createDescendantWatchHistory({
+            'episode-1': [
+              {
+                userId: 'user-1',
+                watchedAt: new Date('2024-06-01T00:00:01.000Z'),
+              },
+            ],
+          }),
+        );
+
+        for (const propertyId of [49, 50]) {
+          await expect(get(propertyId, target)).resolves.toBeUndefined();
+        }
+      },
+    );
+
+    it.each([
+      ['skips a dateless completed watch', undefined, []],
+      ['fails on a malformed watch date', new Date('invalid'), undefined],
+    ])('%s for ids 49 and 50', async (_, watchedAt, expected) => {
+      const target = setTarget('season');
+      jellyfinAdapter.getDescendantEpisodeWatchHistory.mockResolvedValue(
+        createDescendantWatchHistory({
+          'episode-1': [{ userId: 'user-1', watchedAt }],
+        }),
+      );
+
+      for (const propertyId of [49, 50]) {
+        await expect(get(propertyId, target)).resolves.toEqual(expected);
+      }
     });
   });
 
@@ -2024,7 +2635,7 @@ describe('JellyfinGetterService', () => {
         0,
         mediaItem,
         'movie',
-        createRulesDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toBeUndefined();
@@ -2041,7 +2652,7 @@ describe('JellyfinGetterService', () => {
         0,
         mediaItem,
         'movie',
-        createRulesDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toBeUndefined();
@@ -2101,7 +2712,7 @@ describe('JellyfinGetterService', () => {
         COLLECTION_SIBLINGS_PROP_ID,
         libItem,
         'movie',
-        createRulesDto({
+        createRuleGroupDto({
           dataType: 'movie',
           libraryId: libItem.library.id,
           name: 'Movie cleanup',
@@ -2152,7 +2763,10 @@ describe('JellyfinGetterService', () => {
         COLLECTION_SIBLINGS_PROP_ID,
         libItem,
         'movie',
-        createRulesDto({ dataType: 'movie', libraryId: libItem.library.id }),
+        createRuleGroupDto({
+          dataType: 'movie',
+          libraryId: libItem.library.id,
+        }),
       );
 
       expect(result).toBeNull();
@@ -2197,7 +2811,7 @@ describe('JellyfinGetterService', () => {
         COLLECTION_SIBLINGS_PROP_ID,
         libItem,
         'movie',
-        createRulesDto({
+        createRuleGroupDto({
           dataType: 'movie',
           libraryId: libItem.library.id,
           name: 'Movie cleanup',
@@ -2234,7 +2848,7 @@ describe('JellyfinGetterService', () => {
           propertyId,
           episodeItem,
           'episode',
-          createRulesDto({ dataType: 'episode', libraryId: LIBRARY_ID }),
+          createRuleGroupDto({ dataType: 'episode', libraryId: LIBRARY_ID }),
         );
 
         expect(response).toEqual(expected);
@@ -2254,7 +2868,7 @@ describe('JellyfinGetterService', () => {
         7,
         movieItem,
         'movie',
-        createRulesDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
+        createRuleGroupDto({ dataType: 'movie', libraryId: LIBRARY_ID }),
       );
 
       expect(response).toBeNull();

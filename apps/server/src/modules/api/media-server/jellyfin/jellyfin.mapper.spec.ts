@@ -84,17 +84,17 @@ describe('JellyfinMapper', () => {
 
     it('should handle undefined provider ids', () => {
       const result = JellyfinMapper.extractProviderIds(undefined);
-      expect(result).toEqual({ imdb: [], tmdb: [], tvdb: [] });
+      expect(result).toEqual({ imdb: [], tmdb: [], tvdb: [], sportarr: [] });
     });
 
     it('should handle null provider ids', () => {
       const result = JellyfinMapper.extractProviderIds(null);
-      expect(result).toEqual({ imdb: [], tmdb: [], tvdb: [] });
+      expect(result).toEqual({ imdb: [], tmdb: [], tvdb: [], sportarr: [] });
     });
 
     it('should handle empty provider ids', () => {
       const result = JellyfinMapper.extractProviderIds({});
-      expect(result).toEqual({ imdb: [], tmdb: [], tvdb: [] });
+      expect(result).toEqual({ imdb: [], tmdb: [], tvdb: [], sportarr: [] });
     });
   });
 
@@ -138,6 +138,7 @@ describe('JellyfinMapper', () => {
         ],
         Overview: 'Test summary',
         UserData: {
+          Key: 'episode123',
           PlayCount: 5,
           LastPlayedDate: '2021-01-03T00:00:00.000Z',
           Played: true,
@@ -179,6 +180,16 @@ describe('JellyfinMapper', () => {
         expect(result.type).toBe('episode');
       });
 
+      it('carries the item path', () => {
+        expect(JellyfinMapper.toMediaItem(episodeItem).path).toBeUndefined();
+        expect(
+          JellyfinMapper.toMediaItem({
+            ...episodeItem,
+            Path: '/media/series/Show A/Season 1/Show A - S01E01.mkv',
+          }).path,
+        ).toBe('/media/series/Show A/Season 1/Show A - S01E01.mkv');
+      });
+
       it('should convert timestamps to Date objects', () => {
         const result = JellyfinMapper.toMediaItem(episodeItem);
 
@@ -187,6 +198,15 @@ describe('JellyfinMapper', () => {
         expect(result.lastViewedAt).toEqual(
           new Date('2021-01-03T00:00:00.000Z'),
         );
+      });
+
+      it('keeps a missing DateCreated invalid instead of using the current time', () => {
+        const result = JellyfinMapper.toMediaItem({
+          ...episodeItem,
+          DateCreated: undefined,
+        });
+
+        expect(Number.isNaN(result.addedAt.getTime())).toBe(true);
       });
 
       it('should extract provider IDs correctly', () => {
@@ -331,6 +351,7 @@ describe('JellyfinMapper', () => {
           DateCreated: '2021-01-01T00:00:00.000Z',
           Overview: 'A test movie',
           ProductionYear: 2021,
+          Studios: [{ Name: 'Studio One' }, { Name: 'Studio Two' }],
           ProviderIds: {
             Imdb: 'tt1234567',
             Tmdb: '12345',
@@ -348,6 +369,7 @@ describe('JellyfinMapper', () => {
         expect(result.type).toBe('movie');
         expect(result.summary).toBe('A test movie');
         expect(result.year).toBe(2021);
+        expect(result.studios).toEqual(['Studio One', 'Studio Two']);
       });
 
       it('should handle missing optional fields', () => {
@@ -362,7 +384,12 @@ describe('JellyfinMapper', () => {
         expect(result.id).toBe('minimal123');
         expect(result.title).toBe('Minimal Item');
         expect(result.parentId).toBeUndefined();
-        expect(result.providerIds).toEqual({ imdb: [], tmdb: [], tvdb: [] });
+        expect(result.providerIds).toEqual({
+          imdb: [],
+          tmdb: [],
+          tvdb: [],
+          sportarr: [],
+        });
         expect(result.mediaSources).toEqual([]);
         expect(result.genres).toEqual([]);
       });

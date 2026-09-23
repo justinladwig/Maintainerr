@@ -1,11 +1,14 @@
+import { Trans, useLingui } from '@lingui/react/macro'
 import { InformationCircleIcon } from '@heroicons/react/solid'
 import { type VersionResponse } from '@maintainerr/contracts'
 import { useEffect, useState } from 'react'
 import GetApiHandler from '../../../utils/ApiHandler'
 import { startsWithDigit } from '../../../utils/version'
+import BrandLink from '../../Common/BrandLink'
 import Releases from './Releases'
 
 const AboutSettings = () => {
+  const { t } = useLingui()
   // Maintainerr Timezone
   const [timezone, setTimezone] = useState<string>('')
   useEffect(() => {
@@ -66,7 +69,7 @@ const AboutSettings = () => {
 
   return (
     <>
-      <title>About - Maintainerr</title>
+      <title>{t`About - Maintainerr`}</title>
       <div className="h-full w-full">
         <div className="mt-6 rounded-md border border-maintainerr-600 bg-maintainerr/20 p-4 backdrop-blur-sm">
           <div className="flex">
@@ -75,8 +78,10 @@ const AboutSettings = () => {
             </div>
             <div className="ml-3 flex-1 md:flex md:justify-between">
               <p className="text-sm leading-5 text-gray-100">
-                This is BETA software. Features may be broken and/or unstable.
-                Please report any issues on GitHub!
+                <Trans>
+                  If you find any broken features and/or are experiencing
+                  instability, please report it on GitHub!
+                </Trans>
               </p>
               <p className="mt-3 text-sm leading-5 md:mt-0 md:ml-6">
                 <a
@@ -93,13 +98,15 @@ const AboutSettings = () => {
         </div>
         {/* Maintainerr Portion */}
         <div className="section mb-2 h-full w-full">
-          <h3 className="heading">About Maintainerr</h3>
+          <h3 className="heading">
+            <Trans>About Maintainerr</Trans>
+          </h3>
         </div>
         <hr className="my-2 h-px border-0 bg-gray-200 dark:bg-gray-700"></hr>
         <div className="section my-2">
           <div className="form-row my-2">
             <label htmlFor="name" className="text-label">
-              Version
+              <Trans>Version</Trans>
             </label>
             <div className="form-input">
               <div className="form-input-field">
@@ -112,7 +119,7 @@ const AboutSettings = () => {
           <hr className="my-2 h-px border-0 bg-gray-200 dark:bg-gray-700"></hr>
           <div className="form-row my-2">
             <label htmlFor="name" className="text-label">
-              Container Config Path
+              <Trans>Container Config Path</Trans>
             </label>
             <div className="form-input">
               <div className="form-input-field">
@@ -125,7 +132,7 @@ const AboutSettings = () => {
           <hr className="my-2 h-px border-0 bg-gray-200 dark:bg-gray-700"></hr>
           <div className="form-row my-2">
             <label htmlFor="name" className="text-label">
-              Time Zone
+              <Trans>Time Zone</Trans>
             </label>
             <div className="form-input">
               <div className="form-input-field">
@@ -138,7 +145,7 @@ const AboutSettings = () => {
           <hr className="my-2 h-px border-0 bg-gray-200 dark:bg-gray-700"></hr>
           <div className="form-row my-2">
             <label htmlFor="name" className="text-label">
-              Number Of Rules
+              <Trans>Number Of Rules</Trans>
             </label>
             <div className="form-input">
               <div className="form-input-field">
@@ -151,7 +158,7 @@ const AboutSettings = () => {
           <hr className="my-2 h-px border-0 bg-gray-200 dark:bg-gray-700"></hr>
           <div className="form-row my-2">
             <label htmlFor="name" className="text-label">
-              Total Media in Collections
+              <Trans>Total Media in Collections</Trans>
             </label>
             <div className="form-input">
               <div className="form-input-field">
@@ -164,7 +171,7 @@ const AboutSettings = () => {
           <hr className="my-2 h-px border-0 bg-gray-200 dark:bg-gray-700"></hr>
           <div className="form-row my-2">
             <label htmlFor="name" className="text-label">
-              Community Rules
+              <Trans>Community Rules</Trans>
             </label>
             <div className="form-input">
               <div className="form-input-field">
@@ -179,22 +186,22 @@ const AboutSettings = () => {
         {/* End Maintainerr Portion */}
         {/* Useful Links */}
         <div className="section mb-2 h-full w-full">
-          <h3 className="heading">Useful Links</h3>
+          <h3 className="heading">
+            <Trans>Useful Links</Trans>
+          </h3>
         </div>
         <hr className="my-2 h-px border-0 bg-gray-200 dark:bg-gray-700"></hr>
         <div className="section my-2">
           <div className="form-row my-2">
-            <label className="text-label"> Documentation </label>
+            <label className="text-label">
+              {' '}
+              <Trans>Documentation</Trans>{' '}
+            </label>
             <div className="form-input">
               <div className="form-input-field font-bold text-maintainerr-600 underline">
-                <a
-                  className="hover:text-maintainerrdark-800"
-                  href="https://docs.maintainerr.info"
-                  target="_blank"
-                  rel="noreferrer"
-                >
+                <BrandLink external href="https://docs.maintainerr.info">
                   https://docs.maintainerr.info
-                </a>
+                </BrandLink>
               </div>
             </div>
           </div>
@@ -205,14 +212,9 @@ const AboutSettings = () => {
             <label className="text-label"> Discord </label>
             <div className="form-input">
               <div className="form-input-field font-bold text-maintainerr-600 underline">
-                <a
-                  className="hover:text-maintainerrdark-800"
-                  href="https://discord.gg/WP4ZW2QYwk"
-                  target="_blank"
-                  rel="noreferrer"
-                >
+                <BrandLink external href="https://discord.gg/WP4ZW2QYwk">
                   https://discord.gg/WP4ZW2QYwk
-                </a>
+                </BrandLink>
               </div>
             </div>
           </div>
@@ -220,17 +222,15 @@ const AboutSettings = () => {
         <hr className="my-2 h-px border-0 bg-gray-200 dark:bg-gray-700"></hr>
         <div className="section my-2">
           <div className="form-row my-2">
-            <label className="text-label"> Feature Requests </label>
+            <label className="text-label">
+              {' '}
+              <Trans>Feature Requests</Trans>{' '}
+            </label>
             <div className="form-input">
               <div className="form-input-field font-bold text-maintainerr-600 underline">
-                <a
-                  className="hover:text-maintainerrdark-800"
-                  href="https://features.maintainerr.info"
-                  target="_blank"
-                  rel="noreferrer"
-                >
+                <BrandLink external href="https://features.maintainerr.info">
                   https://features.maintainerr.info
-                </a>
+                </BrandLink>
               </div>
             </div>
           </div>
@@ -238,39 +238,54 @@ const AboutSettings = () => {
         <hr className="my-2 h-px border-0 bg-gray-200 dark:bg-gray-700"></hr>
         <div className="section my-2">
           <div className="form-row my-2">
-            <label className="text-label"> Services Status </label>
+            <label className="text-label">
+              {' '}
+              <Trans>Services Status</Trans>{' '}
+            </label>
             <div className="form-input">
               <div className="form-input-field font-bold text-maintainerr-600 underline">
-                <a
-                  className="hover:text-maintainerrdark-800"
-                  href="https://status.maintainerr.info"
-                  target="_blank"
-                  rel="noreferrer"
-                >
+                <BrandLink external href="https://status.maintainerr.info">
                   https://status.maintainerr.info
-                </a>
+                </BrandLink>
               </div>
             </div>
           </div>
         </div>
         <hr className="my-2 h-px border-0 bg-gray-200 dark:bg-gray-700"></hr>
         <div className="section mb-2 h-full w-full">
-          <h3 className="heading">Loving Maintainerr?</h3>
+          <h3 className="heading">
+            <Trans>Loving Maintainerr?</Trans>
+          </h3>
         </div>
         <hr className="my-2 h-px border-0 bg-gray-200 dark:bg-gray-700"></hr>
         <div className="section my-2">
           <div className="form-row my-2">
-            <label className="text-label">Donations Welcome</label>
+            <label className="text-label">
+              <Trans>Donations Welcome</Trans>
+            </label>
             <div className="form-input">
               <div className="form-input-field font-bold text-maintainerr-600">
-                <a
-                  className="pr-2 underline hover:text-maintainerrdark-800"
+                <BrandLink
+                  external
                   href="https://opencollective.com/maintainerr"
-                  target="_blank"
-                  rel="noreferrer"
                 >
                   OpenCollective
-                </a>
+                </BrandLink>
+              </div>
+            </div>
+          </div>
+        </div>
+        <hr className="my-2 h-px border-0 bg-gray-200 dark:bg-gray-700"></hr>
+        <div className="section my-2">
+          <div className="form-row my-2">
+            <label className="text-label">
+              <Trans>Telemetry</Trans>
+            </label>
+            <div className="form-input">
+              <div className="form-input-field font-bold text-maintainerr-600">
+                <BrandLink to="/settings/telemetry">
+                  <Trans>Help us improve it</Trans>
+                </BrandLink>
               </div>
             </div>
           </div>

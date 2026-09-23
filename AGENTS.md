@@ -29,6 +29,7 @@ For the broader system architecture map, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
 **Task-specific - read only when the task calls for it (don't load them every session):**
 
+- [i18n.instructions.md](.github/instructions/i18n.instructions.md) - when adding or changing any user-facing text in the UI: which macro to use, what must never be translated, and the ICU quoting trap.
 - [release-review.instructions.md](.github/instructions/release-review.instructions.md) - when auditing a release candidate before tagging.
 - [ARCHITECTURE.md](ARCHITECTURE.md) - before changing cross-module boundaries.
 
@@ -78,8 +79,10 @@ This is a **TypeScript monorepo** managed with **Turborepo** and **Yarn workspac
 
 ## Development Environment
 
-The development environment runs inside **`devbox`** - a rootless Docker container
-managed by `~/infra/compose.yml` on the host. This IS the devcontainer for this project.
+The development environment runs inside **`devbox`** - a rootless **podman** container
+managed by systemd quadlets in `~/infra/podman/quadlet/` on the host. This IS the
+devcontainer for this project. There is no docker on the host: no binary, no daemon, no
+socket.
 
 - `devbox` mounts the repo at `/workspace` and has Node 26 + Yarn 4.11 pre-installed.
   Work directly inside the container at `/workspace` - open your editor/agent here,
@@ -90,12 +93,17 @@ managed by `~/infra/compose.yml` on the host. This IS the devcontainer for this 
 - Agent state (Claude, Copilot, VS Code server/extensions, SSH, Git config) is mounted
   into `/root` from the host, so it persists across container restarts and recreates.
   Leave those mounts as configured.
-- `~/infra/compose.yml` (which defines `devbox`) is live server config on the host,
-  outside this git repo. Treat it as operational state, not project code.
+- `~/infra/podman/quadlet/devbox-app.container` (which defines `devbox`) is live server
+  config on the host, outside this git repo. Treat it as operational state, not project
+  code.
+- **`/tmp` inside the box does not survive.** The quadlet runs `podman run --rm --replace`,
+  so every restart recreates the container and wipes its writable layer. Anything you want
+  to keep goes under `/workspace` (a bind mount) - never `/tmp`.
 - `yarn dev` serves UI on port 3000 and API on port 6246. Logs at `/tmp/yarn-dev.log`.
 
-**Dev media servers** (Plex, Jellyfin, Emby) run as separate rootless Docker containers
-in `~/dev-media.compose.yml`, reachable from inside `devbox` by hostname:
+**Dev media servers** (Plex, Jellyfin, Emby) run as separate rootless podman containers,
+each its own quadlet in `~/infra/podman/quadlet/`, reachable from inside `devbox` by
+hostname:
 - Plex → `http://dev-plex:32400`
 - Jellyfin → `http://dev-jellyfin:8096`
 - Emby → `http://dev-emby:8096`
@@ -110,11 +118,16 @@ Three trust levels, privilege descending: **`root`@host** (everything) › **`ma
 (`dev-plex`, `dev-radarr`, …) to test and seed against it, but you **cannot break out** to
 the host - and that boundary is enforced from above you, so you can't disable it:
 
-- **Read-only Docker** - the socket-proxy allows `ps`/`logs`, never `start`/`stop`/`exec`/`create`.
+- **No container engine at all** - there is no docker/podman client, no socket and no
+  `DOCKER_*` variable in here. Read-only container status comes from a text snapshot the
+  host refreshes at `/host/containers`; it is data, never an API handle.
 - **Host egress firewall** - outbound is default-deny to an allowlist (GitHub, npm, Anthropic,
-  Plex/TMDB) plus the internal docker network; `NET_ADMIN` is stripped from the container.
-- **Rootless + `cap_drop: ALL` + `no-new-privileges`** - even container-root is an unprivileged
-  subuid, never the host user.
+  Plex/TMDB) plus the local podman networks. The rules live in a separate netns holder that
+  installs them before this container starts, so they cannot be altered from in here.
+  DNS is equally confined: the only resolver you can reach is the allowlisting one.
+- **`DropCapability=ALL` + `NoNewPrivileges` + rootless** - this container holds *zero*
+  capabilities, bounding set included, so they cannot be regained. Even container-root is
+  an unprivileged subuid, never the host user.
 
 Don't fight these (e.g. trying to `exec` into another container, or reaching a non-allowlisted
 host) - they're intentional, not bugs. Operator-side detail lives in `~/infra/README.md`.
@@ -161,7 +174,7 @@ GitHub quality workflows include a separate YAML lint job:
 yamllint -s .
 ```
 
-The formatting, TypeScript lint, and test workflows use Node.js 24, then run:
+The formatting, TypeScript lint, and test workflows use Node.js 26, then run:
 
 ```bash
 corepack install
@@ -234,6 +247,43 @@ yarn workspace @maintainerr/contracts build
 - **Entities**: TypeORM entities for database models
 - **Modules**: Feature-based module organization
 - **Events**: Use Nest.js EventEmitter for decoupled communication
+
+#### Collection links and manual membership
+
+The same bug has been fixed **a dozen times** (e23361e1, #2440, #2663, #2766,
+#3129, #3248, #3298, #3327, #3344, #3383, #3583, b5e4206a): an item is wrongly
+set as **manual**. A manual member of an automatic collection is force-kept, so
+the rule can never remove it, yet it still ages into that collection's
+`deleteAfterDays` and is deleted from disk. Treat it as one bug class, not a
+dozen incidents.
+
+The class regenerates because the adoption decision *defaults to adopting* and
+subtracts known-innocent cases, and every subtraction is computed from
+`collection_media` rows. Any bug whose symptom is a **missing** row is therefore
+invisible to guards of that shape. Adding a sixth guard of the same kind is not a
+fix.
+
+Anything that clears, reassigns or skips `collection.mediaServerId` has to leave
+all five guards standing:
+
+1. Rule-removed stays removed (`collection_media_rule_removal` markers).
+2. Items a sibling rule group holds are never adopted. Siblings are matched on
+   *shared `mediaServerId`*, so dropping a link silently revokes this guard, and
+   whatever that collection left on the media server is then adopted by the rule
+   group still pointing at it.
+3. The run that first links a collection must not import its existing children.
+4. An unreadable child list is never read as "empty".
+5. A mutation whose outcome is unknown is never recorded as refused. A media
+   server that never answered may still have applied the write, so an add that
+   went unanswered records a `direction: 'add'` marker instead of nothing. The
+   read side has been hardened against this four times (#3211, #3248, #3344,
+   #3413); the write side only once.
+
+Reproduce with two same-titled rule groups matching DIFFERENT items. Identical
+rules hide the bug, because both groups own everything and nothing looks foreign.
+For the unanswered-write half, put a proxy in front of the media server that
+forwards the mutation and then holds the response past the client timeout: the
+server commits, the client gives up, and the two disagree.
 
 #### Frontend Patterns
 
@@ -314,33 +364,25 @@ The application integrates with several external services:
 - **Seerr**: Request management system
 - **Tautulli**: Plex analytics and statistics
 - **Streamystats**: Jellyfin item-level analytics surfaced on media details
+- **Sportarr**: Sports league management API, plus its metadata API for league artwork
 
 When working with these integrations:
 
-- Use proper error handling and retry logic (axios-retry)
+- Retry through `applyHttpRetry` (`modules/api/lib/httpRetry.ts`), never a
+  per-client axios-retry config: it already answers a 429 with the wait the
+  server declared, capped, so hand-rolled rate-limit handling only drifts
 - Implement caching where appropriate (node-cache)
-- Follow rate limiting best practices
+- Prefer one batched call per run over one per item: see the Seerr request
+  prefetch (#3152), the batched collection writes, and the removal-notification
+  batching (#3500)
 - Use TypeScript interfaces for external API responses
 
 ## External API Documentation
 
-Reference the following OpenAPI specifications and API documentation when working with external service integrations:
-
-### Media Management Services
-
-- **Sonarr**: [OpenAPI Specification](https://raw.githubusercontent.com/Sonarr/Sonarr/develop/src/Sonarr.Api.V3/openapi.json)
-- **Radarr**: [OpenAPI Specification](https://raw.githubusercontent.com/Radarr/Radarr/develop/src/Radarr.Api.V3/openapi.json)
-- **Tautulli**: [API Reference Documentation](https://docs.tautulli.com/extending-tautulli/api-reference)
-
-### Request Management Services
-
-- **Seerr**: [Documentation](https://docs.seerr.dev/) | [Source](https://github.com/seerr-team/seerr)
-
-### Media Server Services
-
-- **Plex**: [OpenAPI Specification](https://raw.githubusercontent.com/LukeHagar/plex-api-spec/refs/heads/main/src/pms-spec.yaml) | [Additional Documentation](https://www.plexopedia.com/plex-media-server/api/)
-
-These specifications provide comprehensive type definitions and endpoint documentation for creating robust integrations with proper TypeScript typing.
+Do not add API doc URLs here. Machine-readable OpenAPI specs live in `SPECS` in
+[tools/api-spec-drift.mjs](tools/api-spec-drift.mjs), which fetches each one
+weekly so the list stays verified. References that have no fetchable spec live in
+[implementation.instructions.md](.github/instructions/implementation.instructions.md).
 
 ## Testing Guidelines
 
@@ -392,7 +434,7 @@ degrade gracefully.
 
 ### Environment Setup
 
-- **Node.js**: Version 22.13.0+ or 24.11.0+ (the floor is Node 22, raised from TypeORM 1.0.0's 20.19 requirement by the `@eslint-react` lint toolchain, which needs Node 22+; the Docker image and devcontainer ship Node 26)
+- **Node.js**: 26+ (root `package.json` `engines` is the source of truth; Docker, the devcontainer and every workflow ship Node 26)
 - **Package Manager**: Yarn 4.11 (managed via corepack)
 - **Data Directory**: Requires `data/` folder with proper permissions for development
 

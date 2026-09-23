@@ -1,12 +1,8 @@
-import { cleanup, render, screen } from '@testing-library/react'
-import { afterEach, describe, expect, it } from 'vitest'
+import { render, screen } from '../../test-utils/render'
+import { describe, expect, it } from 'vitest'
 import TestingButton, { getTestingButtonType } from './TestingButton'
 
 describe('TestingButton', () => {
-  afterEach(() => {
-    cleanup()
-  })
-
   it('keeps the committed success test button styling after a successful test', () => {
     render(
       <TestingButton type="button" isPending={false} feedbackStatus={true} />,

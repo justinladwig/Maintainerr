@@ -60,6 +60,7 @@ describe('EmbyMapper', () => {
         imdb: ['tt1234567'],
         tmdb: [],
         tvdb: [],
+        sportarr: [],
       });
     });
 
@@ -68,6 +69,7 @@ describe('EmbyMapper', () => {
         imdb: [],
         tmdb: ['12345'],
         tvdb: [],
+        sportarr: [],
       });
     });
 
@@ -76,6 +78,7 @@ describe('EmbyMapper', () => {
         imdb: [],
         tmdb: [],
         tvdb: ['67890'],
+        sportarr: [],
       });
     });
 
@@ -84,6 +87,7 @@ describe('EmbyMapper', () => {
         imdb: [],
         tmdb: [],
         tvdb: [],
+        sportarr: [],
       });
     });
 
@@ -92,6 +96,7 @@ describe('EmbyMapper', () => {
         imdb: [],
         tmdb: [],
         tvdb: [],
+        sportarr: [],
       });
     });
 
@@ -100,6 +105,7 @@ describe('EmbyMapper', () => {
         imdb: [],
         tmdb: [],
         tvdb: [],
+        sportarr: [],
       });
     });
   });
@@ -232,7 +238,18 @@ describe('EmbyMapper', () => {
         },
       ],
       Tags: ['HD', '4K'],
+      Studios: [{ Name: 'Studio One' }, { Name: '' }, {}],
     };
+
+    it('carries the item path', () => {
+      expect(EmbyMapper.toMediaItem(baseItem).path).toBeUndefined();
+      expect(
+        EmbyMapper.toMediaItem({
+          ...baseItem,
+          Path: '/media/movies/Movie A (2021)/Movie A (2021).mkv',
+        }).path,
+      ).toBe('/media/movies/Movie A (2021)/Movie A (2021).mkv');
+    });
 
     it('converts ISO timestamps to Date objects', () => {
       const result = EmbyMapper.toMediaItem(baseItem);
@@ -240,6 +257,15 @@ describe('EmbyMapper', () => {
       expect(result.addedAt).toEqual(new Date('2021-01-01T00:00:00.000Z'));
       expect(result.lastViewedAt).toEqual(new Date('2021-01-03T00:00:00.000Z'));
     });
+
+    it.each([undefined, 'not-a-date'])(
+      'keeps a missing or malformed DateCreated invalid',
+      (DateCreated) => {
+        const result = EmbyMapper.toMediaItem({ ...baseItem, DateCreated });
+
+        expect(Number.isNaN(result.addedAt.getTime())).toBe(true);
+      },
+    );
 
     it('converts RunTimeTicks (100-ns) to milliseconds', () => {
       const result = EmbyMapper.toMediaItem(baseItem);
@@ -315,6 +341,11 @@ describe('EmbyMapper', () => {
       expect(result.labels).toEqual(['HD', '4K']);
     });
 
+    it('maps studio names and drops empty entries', () => {
+      const result = EmbyMapper.toMediaItem(baseItem);
+      expect(result.studios).toEqual(['Studio One']);
+    });
+
     it('handles minimal items without crashing', () => {
       const result = EmbyMapper.toMediaItem({
         Id: 'minimal-1',
@@ -325,7 +356,12 @@ describe('EmbyMapper', () => {
       expect(result.id).toBe('minimal-1');
       expect(result.title).toBe('Minimal');
       expect(result.parentId).toBeUndefined();
-      expect(result.providerIds).toEqual({ imdb: [], tmdb: [], tvdb: [] });
+      expect(result.providerIds).toEqual({
+        imdb: [],
+        tmdb: [],
+        tvdb: [],
+        sportarr: [],
+      });
       expect(result.mediaSources).toEqual([]);
       expect(result.genres).toEqual([]);
       expect(result.actors).toEqual([]);

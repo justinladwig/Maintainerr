@@ -93,6 +93,7 @@ describe('ruleGroupFormSchema', () => {
       showHome: true,
       overlayEnabled: false,
       overlayTemplateId: null,
+      overlayLandscapeEnabled: false,
       listExclusions: false,
       cleanupLeftoverFolders: false,
       forceSeerr: false,
@@ -165,6 +166,46 @@ describe('ruleGroupFormSchema', () => {
     }
 
     // Optional - omitting it is still valid.
+    expect(ruleGroupFormSchema.safeParse(base).success).toBe(true)
+  })
+
+  it('accepts the optional keep-in-Maintainerr-only opt-in', () => {
+    const base = {
+      name: 'Rule group',
+      description: '',
+      libraryId: '1',
+      dataType: 'movie',
+      arrAction: ServarrAction.DELETE,
+      deleteAfterDays: 30,
+      keepLogsForMonths: 6,
+      showRecommended: true,
+      showHome: true,
+      overlayEnabled: false,
+      overlayTemplateId: null,
+      overlayLandscapeEnabled: false,
+      listExclusions: true,
+      cleanupLeftoverFolders: false,
+      forceSeerr: false,
+      manualCollection: false,
+      manualCollectionName: '',
+      sortTitle: '',
+      active: true,
+      useRules: true,
+      radarrSettingsId: 1,
+      sonarrSettingsId: undefined,
+      ruleHandlerCronSchedule: null,
+    }
+
+    const enabled = ruleGroupFormSchema.safeParse({
+      ...base,
+      keepInMaintainerrOnly: true,
+    })
+    expect(enabled.success).toBe(true)
+    if (enabled.success) {
+      expect(enabled.data.keepInMaintainerrOnly).toBe(true)
+    }
+
+    // Optional - omitting it is still valid, and the default stays off.
     expect(ruleGroupFormSchema.safeParse(base).success).toBe(true)
   })
 

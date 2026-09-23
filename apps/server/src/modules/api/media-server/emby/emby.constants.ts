@@ -15,6 +15,7 @@ export const EMBY_CACHE_TTL = {
 
 export const EMBY_BATCH_SIZE = {
   USER_WATCH_HISTORY: 5,
+  EPISODE_WATCH_HISTORY: 5,
   COLLECTION_MUTATION: 8,
   DEFAULT_PAGE_SIZE: 100,
   MAX_PAGE_SIZE: 500,
@@ -22,6 +23,10 @@ export const EMBY_BATCH_SIZE = {
 
 export const EMBY_CACHE_KEYS = {
   METADATA: 'emby:metadata',
+  // Batched list-route rows carry a stubbed UserData (PlayCount 0, no
+  // LastPlayedDate - verified on 4.9.5, EnableUserData does not help), so
+  // they are cached apart from the full direct-route rows getMetadata serves.
+  METADATA_BATCH: 'emby:metadata-batch',
   CHILDREN: 'emby:children',
   USERS: 'emby:users',
   LIBRARIES: 'emby:libraries',

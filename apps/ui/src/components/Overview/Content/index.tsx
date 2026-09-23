@@ -1,4 +1,6 @@
+import { Trans, useLingui } from '@lingui/react/macro'
 import {
+  getCollectionDeleteDate,
   type MediaItem,
   type MediaItemWithParent,
   type MediaProviderIds,
@@ -20,11 +22,15 @@ interface IOverviewContent {
   fetchData: () => void
   onRemove?: (id: string) => void
   onItemPostponed?: (id: string, addDate: string) => void
-  libraryId: string
   collectionPage?: boolean
   collectionInfo?: ICollectionMedia[]
   collectionId?: number
   collection?: ICollection
+  selectionMode?: boolean
+  selectedMediaIds?: ReadonlySet<string>
+  onToggleSelection?: (mediaId: string, selected: boolean) => void
+  /** Items a bulk action changed, which carry no marker to key the status off. */
+  statusChangedMediaIds?: ReadonlySet<string>
 }
 
 function extractProviderIds(
@@ -54,6 +60,7 @@ function extractProviderIds(
 }
 
 const OverviewContent = (props: IOverviewContent) => {
+  const { t } = useLingui()
   const { data, dataFinished, extrasLoading, fetchData, loading } = props
 
   const isNearBottom = () =>
@@ -99,10 +106,15 @@ const OverviewContent = (props: IOverviewContent) => {
       return undefined
     }
 
-    const date = new Date(collectionData.addDate)
-    date.setDate(date.getDate() + resolvedCollection.deleteAfterDays)
+    const deleteDate = getCollectionDeleteDate(
+      collectionData.addDate,
+      resolvedCollection.deleteAfterDays,
+    )
+    if (!deleteDate) {
+      return undefined
+    }
 
-    const diffTime = date.getTime() - new Date().getTime()
+    const diffTime = deleteDate.getTime() - new Date().getTime()
     return Math.ceil(diffTime / (1000 * 60 * 60 * 24))
   }
 
@@ -138,8 +150,6 @@ const OverviewContent = (props: IOverviewContent) => {
               <li key={el.id}>
                 <MediaCard
                   id={el.id}
-                  libraryId={props.libraryId}
-                  type={el.type}
                   summary={el.summary}
                   year={
                     el.type === 'episode'
@@ -187,6 +197,13 @@ const OverviewContent = (props: IOverviewContent) => {
                   isManual={
                     el.maintainerrIsManual ? el.maintainerrIsManual : false
                   }
+                  collections={el.maintainerrCollections}
+                  selectionMode={props.selectionMode}
+                  selected={props.selectedMediaIds?.has(el.id) ?? false}
+                  onToggleSelection={props.onToggleSelection}
+                  forceStatusLoad={
+                    props.statusChangedMediaIds?.has(el.id) ?? false
+                  }
                   {...(props.collectionInfo
                     ? {
                         daysLeft: getDaysLeft(el.id),
@@ -203,7 +220,7 @@ const OverviewContent = (props: IOverviewContent) => {
                 className="flex min-h-10 items-center justify-center"
                 style={{ overflowAnchor: 'none' }}
               >
-                <div role="status" aria-label="Loading more items">
+                <div role="status" aria-label={t`Loading more items`}>
                   <SmallLoadingSpinner className="h-10 w-10" />
                 </div>
               </li>
@@ -212,7 +229,7 @@ const OverviewContent = (props: IOverviewContent) => {
         </div>
       ) : (
         <div className="flex min-h-80 items-center justify-center rounded-xl border border-dashed border-zinc-700 bg-zinc-900/30 p-6 text-sm text-zinc-400">
-          No items found.
+          <Trans>No items found.</Trans>
         </div>
       )}
     </>

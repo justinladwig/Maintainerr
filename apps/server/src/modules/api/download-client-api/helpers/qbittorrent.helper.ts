@@ -1,4 +1,4 @@
-import { AxiosError, RawAxiosRequestConfig } from 'axios';
+import { AxiosError, AxiosResponse, RawAxiosRequestConfig } from 'axios';
 import { MaintainerrLogger } from '../../../logging/logs.service';
 import { ExternalApiService } from '../../external-api/external-api.service';
 import {
@@ -6,11 +6,23 @@ import {
   DownloadClientTorrent,
 } from '../download-client.interface';
 
+// A 403 after a successful login is qBittorrent's Web UI security blocking the
+// caller, so the shared 401/403 text ("Invalid API key") would mislead.
+const FORBIDDEN_MESSAGE =
+  'The download client accepted the login but returned 403 Forbidden - a ' +
+  'qBittorrent Web UI security restriction, not a wrong username or password. ' +
+  'In qBittorrent → Options → Web UI → Security, add Maintainerr’s IP or ' +
+  'subnet to “Bypass authentication for clients in whitelisted IP subnets” ' +
+  '(Maintainerr and qBittorrent often run on different Docker IPs). A reverse ' +
+  'proxy or host-header validation can also cause this.';
+
 /**
  * The qBittorrent `torrents/info` fields we read. `max_ratio` /
  * `max_seeding_time` are the EFFECTIVE limits qBittorrent enforces ("…until
  * torrent is stopped from seeding"), already resolving any global default; `-1`
- * means "no limit". `seeding_time` and `max_seeding_time` are in seconds.
+ * means "no limit". `seeding_time` is in seconds; `max_seeding_time` is in
+ * MINUTES, like the preference it mirrors (qBittorrent itself compares
+ * `finishedTime() / 60` against it).
  */
 interface RawQbittorrentTorrent {
   hash: string;
@@ -44,7 +56,7 @@ const toDownloadClientTorrent = (
   } else {
     reachedSeedingGoal =
       (hasRatioLimit && ratio >= raw.max_ratio) ||
-      (hasTimeLimit && raw.seeding_time >= raw.max_seeding_time);
+      (hasTimeLimit && raw.seeding_time >= raw.max_seeding_time * 60);
   }
 
   return {
@@ -52,19 +64,23 @@ const toDownloadClientTorrent = (
     name: raw.name,
     content_path: raw.content_path,
     ratio,
+    seedingTime: raw.seeding_time,
     reachedSeedingGoal,
   };
 };
 
 /**
- * Thin client for the qBittorrent WebUI API (v2, qBittorrent 4.1+) - the
- * qBittorrent implementation of the backend-agnostic `DownloadClient` contract.
+ * Thin client for the qBittorrent WebUI API (v2) - the qBittorrent
+ * implementation of the backend-agnostic `DownloadClient` contract. The v2 API
+ * itself dates from 4.1, but the oldest usable version is 4.3.4: `content_path`
+ * (cross-seed detection) only arrived in 4.3.1 and `seeding_time` in 4.3.4.
  *
- * qBittorrent uses cookie/session auth: `POST /api/v2/auth/login` issues a `SID`
- * cookie that must accompany every subsequent request. `ExternalApiService` has
- * no cookie jar, so this helper manages the `SID` on its own axios instance and
- * re-logs in once on a 401/403. Calls go through `this.axios` directly (not the
- * cached `get`/`post` wrappers) so auth failures surface and reads stay fresh.
+ * qBittorrent uses cookie/session auth: `POST /api/v2/auth/login` issues a
+ * session cookie that must accompany every subsequent request.
+ * `ExternalApiService` has no cookie jar, so this helper keeps that cookie on
+ * its own axios instance and re-logs in once on a 401/403. Calls go through
+ * `this.axios` directly (not the cached `get`/`post` wrappers) so auth failures
+ * surface and reads stay fresh.
  */
 export class QbittorrentApi
   extends ExternalApiService
@@ -131,12 +147,26 @@ export class QbittorrentApi
     hashes: string[],
     deleteFiles: boolean,
   ): Promise<void> {
-    if (hashes.length === 0) {
+    // qBittorrent documents `hashes=all` on this endpoint as "delete all
+    // torrents", so a hash that arrives as the literal string would wipe the
+    // client rather than remove one download. Blanks are dropped for the same
+    // reason: they contribute nothing but widen the list they are joined into.
+    const validHashes = hashes
+      .map((hash) => hash?.trim().toLowerCase())
+      .filter((hash) => !!hash && hash !== 'all');
+
+    if (validHashes.length < hashes.length) {
+      this.logger.warn(
+        `Refused ${hashes.length - validHashes.length} download id(s) that do not name a single torrent`,
+      );
+    }
+
+    if (validHashes.length === 0) {
       return;
     }
 
     const body = new URLSearchParams();
-    body.set('hashes', hashes.map((hash) => hash.toLowerCase()).join('|'));
+    body.set('hashes', validHashes.join('|'));
     body.set('deleteFiles', deleteFiles ? 'true' : 'false');
 
     await this.withAuth(async () => {
@@ -151,27 +181,35 @@ export class QbittorrentApi
     body.set('username', this.username ?? '');
     body.set('password', this.password ?? '');
 
-    const response = await this.axios.post<string>(
-      '/auth/login',
-      body.toString(),
-      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } },
-    );
+    let response: AxiosResponse<string>;
+    try {
+      response = await this.axios.post<string>('/auth/login', body.toString(), {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      });
+    } catch (error) {
+      // qBittorrent 5.2+ rejects invalid credentials with HTTP 401 instead of
+      // the older HTTP 200 body "Fails." handled below.
+      if (error instanceof AxiosError && error.response?.status === 401) {
+        throw new Error('Invalid username or password');
+      }
+      throw error;
+    }
 
-    // qBittorrent answers HTTP 200 with body "Fails." on invalid credentials.
+    // qBittorrent 5.1 and older answer HTTP 200 with body "Fails." instead.
     const responseBody =
       typeof response.data === 'string' ? response.data.trim() : '';
     if (responseBody === 'Fails.') {
       throw new Error('Invalid username or password');
     }
 
-    // On a normal login qBittorrent issues an SID cookie to use on subsequent
-    // requests. When the WebUI bypasses authentication (e.g. "Bypass
-    // authentication for clients on localhost"/whitelisted subnets) it returns
-    // "Ok." with no cookie - that is still a valid, authenticated session, so
+    // On a normal login qBittorrent issues a session cookie to send back on
+    // every subsequent request. When the WebUI bypasses authentication (e.g.
+    // "Bypass authentication for clients on localhost"/whitelisted subnets) it
+    // can answer without one - that is still a valid, authenticated session, so
     // capture the cookie when present but never require it.
-    const sid = this.extractSid(response.headers['set-cookie']);
-    if (sid) {
-      this.axios.defaults.headers.common['Cookie'] = `SID=${sid}`;
+    const cookie = this.extractSessionCookie(response.headers['set-cookie']);
+    if (cookie) {
+      this.axios.defaults.headers.common['Cookie'] = cookie;
     }
     this.authenticated = true;
   }
@@ -195,31 +233,41 @@ export class QbittorrentApi
         this.authenticated = false;
         delete this.axios.defaults.headers.common['Cookie'];
         await this.login();
-        return await fn();
+        try {
+          return await fn();
+        } catch (retryError) {
+          throw retryError instanceof AxiosError &&
+            retryError.response?.status === 403
+            ? new Error(FORBIDDEN_MESSAGE)
+            : retryError;
+        }
       }
       throw error;
     }
   }
 
-  private extractSid(setCookie: string[] | undefined): string | undefined {
-    if (!setCookie) {
-      return undefined;
+  /**
+   * Echo back whatever cookie the login response set, name included. The name
+   * is deliberately not matched: qBittorrent 5.1 and older call it `SID` (and
+   * let the user rename it), while 5.2+ call it `QBT_SID_<WebUI port>` - and
+   * that is qBittorrent's own port, which a Docker port mapping or reverse
+   * proxy hides, so it cannot be derived from the configured URL either.
+   */
+  private extractSessionCookie(
+    setCookie: string[] | undefined,
+  ): string | undefined {
+    const cookies: string[] = [];
+
+    for (const cookie of setCookie ?? []) {
+      const end = cookie.indexOf(';');
+      const pair = (end === -1 ? cookie : cookie.slice(0, end)).trim();
+      // Keep only `name=value`; a cookie without a value is a deletion.
+      const separator = pair.indexOf('=');
+      if (separator > 0 && separator < pair.length - 1) {
+        cookies.push(pair);
+      }
     }
 
-    for (const cookie of setCookie) {
-      const trimmed = cookie.trimStart();
-      if (!trimmed.startsWith('SID=')) {
-        continue;
-      }
-
-      const afterEquals = trimmed.slice('SID='.length);
-      const end = afterEquals.indexOf(';');
-      const value = end === -1 ? afterEquals : afterEquals.slice(0, end);
-      if (value) {
-        return value;
-      }
-    }
-
-    return undefined;
+    return cookies.length > 0 ? cookies.join('; ') : undefined;
   }
 }

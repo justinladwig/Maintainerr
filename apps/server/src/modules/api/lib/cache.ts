@@ -11,10 +11,12 @@ type AvailableCacheIds =
   | 'plexcommunity'
   | 'tautulli'
   | 'streamystats'
+  | 'tracearr'
   | 'github'
   | 'jellyfin'
   | 'jellyfinwatchhistory'
-  | 'emby';
+  | 'emby'
+  | 'sportarrmetadata';
 
 type CacheType = AvailableCacheIds | 'radarr' | 'sonarr' | 'sportarr';
 
@@ -183,6 +185,12 @@ class CacheManager {
     ),
     tautulli: new Cache('tautulli', 'Tautulli API', 'tautulli'),
     streamystats: new Cache('streamystats', 'Streamystats API', 'streamystats'),
+    tracearr: new Cache('tracearr', 'Tracearr API', 'tracearr', {
+      stdTtl: 3600,
+      persistent: true,
+      useClones: false,
+      maxKeys: 0,
+    }),
     github: new Cache('github', 'GitHub API', 'github', {
       stdTtl: 86400, // 24 hours
       checkPeriod: 60 * 60, // Check every hour
@@ -210,6 +218,19 @@ class CacheManager {
       },
     ),
     emby: new Cache('emby', 'Emby API', 'emby'),
+    // Artwork and descriptions for Sportarr leagues. Long-lived like the tmdb
+    // and tvdb caches: a league's poster changes rarely and every card asks
+    // for it. The Sportarr card on the metadata settings page clears it.
+    sportarrmetadata: new Cache(
+      'sportarrmetadata',
+      'Sportarr metadata API',
+      'sportarrmetadata',
+      {
+        stdTtl: 21600, // 6 hours
+        checkPeriod: 60 * 30,
+        persistent: true,
+      },
+    ),
   };
 
   public createCache(

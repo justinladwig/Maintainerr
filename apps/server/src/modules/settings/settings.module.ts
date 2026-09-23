@@ -8,6 +8,8 @@ import { PlexApiModule } from '../api/plex-api/plex-api.module';
 import { ServarrApiModule } from '../api/servarr-api/servarr-api.module';
 import { StreamystatsApiModule } from '../api/streamystats-api/streamystats-api.module';
 import { TautulliApiModule } from '../api/tautulli-api/tautulli-api.module';
+import { TracearrApiModule } from '../api/tracearr-api/tracearr-api.module';
+import { SportarrMetadataApiModule } from '../api/sportarr-metadata-api/sportarr-metadata.module';
 import { TmdbApiModule } from '../api/tmdb-api/tmdb.module';
 import { TvdbApiModule } from '../api/tvdb-api/tvdb.module';
 import { Collection } from '../collections/entities/collection.entities';
@@ -26,6 +28,7 @@ import { MetadataSettingsService } from './metadata-settings.service';
 import { RuleMigrationService } from './rule-migration.service';
 import { SettingsController } from './settings.controller';
 import { SettingsOperationsService } from './settings-operations.service';
+import { TelemetryModule } from '../telemetry/telemetry.module';
 import { SettingsDataService } from './settings-data.service';
 
 @Global()
@@ -37,10 +40,13 @@ import { SettingsDataService } from './settings-data.service';
     SeerrApiModule,
     TautulliApiModule,
     StreamystatsApiModule,
+    TracearrApiModule,
     DownloadClientApiModule,
+    SportarrMetadataApiModule,
     TmdbApiModule,
     TvdbApiModule,
     InternalApiModule,
+    TelemetryModule,
     TypeOrmModule.forFeature([
       Settings,
       RadarrSettings,

@@ -1,36 +1,37 @@
 import { Transition } from '@headlessui/react'
-import { DocumentAddIcon, DocumentRemoveIcon } from '@heroicons/react/solid'
+import { useLingui } from '@lingui/react/macro'
 import { MediaItemType, type MediaProviderIds } from '@maintainerr/contracts'
 import React, { memo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { mediaTypeLabel } from '../../../utils/mediaTypeUtils'
-import AddModal from '../../AddModal'
 import type { ICollection } from '../../Collection'
 import RemoveFromCollectionButton from '../../Collection/CollectionDetail/RemoveFromCollectionButton'
-import Button from '../Button'
 import PosterCard from '../Poster/PosterCard'
 import MediaModalContent from './MediaModal'
-import { invalidateMaintainerrStatusDetails } from './maintainerrStatus'
 
+// Each tone carries its own text colour.
 const mediaBadgeClasses = {
-  movie: 'bg-zinc-900',
-  show: 'bg-maintainerrdark',
-  season: 'bg-yellow-700',
-  episode: 'bg-rose-900',
-  info: 'bg-maintainerrdark',
-  success: 'bg-emerald-700',
+  movie: 'bg-zinc-900 text-zinc-200',
+  show: 'bg-maintainerrdark text-zinc-200',
+  season: 'bg-yellow-700 text-zinc-200',
+  episode: 'bg-rose-900 text-zinc-200',
+  // Matches the palette, where info mirrors zinc, and the other card badges.
+  info: 'bg-zinc-900 text-zinc-200',
+  success: 'bg-emerald-700 text-zinc-200',
+  exclusion: 'bg-maintainerr text-white',
+  danger: 'bg-error-700 text-zinc-200',
 } as const
 
 const renderBadge = (
   label: React.ReactNode,
-  tone: keyof typeof mediaBadgeClasses | 'danger',
+  tone: keyof typeof mediaBadgeClasses,
   className?: string,
 ) => (
   <div className={className}>
     <div
-      className={`pointer-events-none z-40 rounded-full shadow-sm ${tone === 'danger' ? 'bg-error-700' : mediaBadgeClasses[tone]}`}
+      className={`pointer-events-none z-40 min-w-0 rounded-full shadow-sm ${mediaBadgeClasses[tone]}`}
     >
-      <div className="flex h-4 items-center px-2 py-2 text-center text-xs font-medium tracking-wider text-zinc-200 uppercase sm:h-5">
+      <div className="flex h-4 min-w-0 items-center px-2 py-2 text-center text-xs font-medium tracking-wider uppercase sm:h-5">
         {label}
       </div>
     </div>
@@ -47,17 +48,20 @@ interface IMediaCard {
   episodeNumber?: number
   episodeTitle?: string
   providerIds?: MediaProviderIds
-  libraryId?: string
-  type?: MediaItemType
   collectionPage: boolean
   daysLeft?: number
   exclusionId?: number
   exclusionType?: 'global' | 'specific' | undefined
   collectionId?: number
   collection?: ICollection
+  collections?: string[]
   isManual?: boolean
   onRemove?: (id: string) => void
   onItemPostponed?: (id: string, addDate: string) => void
+  selectionMode?: boolean
+  selected?: boolean
+  onToggleSelection?: (mediaId: string, selected: boolean) => void
+  forceStatusLoad?: boolean
 }
 
 const MediaCard: React.FC<IMediaCard> = ({
@@ -69,8 +73,6 @@ const MediaCard: React.FC<IMediaCard> = ({
   seasonNumber,
   episodeNumber,
   episodeTitle,
-  libraryId,
-  type,
   collectionId = 0,
   daysLeft = 9999,
   exclusionId = undefined,
@@ -78,16 +80,19 @@ const MediaCard: React.FC<IMediaCard> = ({
   collectionPage = false,
   exclusionType = undefined,
   collection = undefined,
+  collections,
   isManual = false,
   onRemove = () => {},
   onItemPostponed,
+  selectionMode = false,
+  selected = false,
+  onToggleSelection,
+  forceStatusLoad = false,
 }) => {
+  const { t } = useLingui()
   const navigate = useNavigate()
   const [showDetail, setShowDetail] = useState(false)
-  const [excludeModal, setExcludeModal] = useState(false)
-  const [addModal, setAddModal] = useState(false)
   const [showMediaModal, setShowMediaModal] = useState(false)
-  const [statusShouldRefetch, setStatusShouldRefetch] = useState(false)
   const displayYear = year && mediaType !== 'episode' ? year.slice(0, 4) : year
 
   const handleStatusLink = (targetPath: string) => {
@@ -101,63 +106,66 @@ const MediaCard: React.FC<IMediaCard> = ({
 
   return (
     <div className={'w-full'}>
-      {excludeModal ? (
-        <AddModal
-          mediaServerId={id}
-          {...(libraryId ? { libraryId: libraryId } : {})}
-          {...(type ? { type: type } : {})}
-          onSubmit={() => {
-            invalidateMaintainerrStatusDetails(id)
-            setStatusShouldRefetch(true)
-            setExcludeModal(false)
-          }}
-          onCancel={() => setExcludeModal(false)}
-          modalType="exclude"
-        />
-      ) : undefined}
-
-      {addModal ? (
-        <AddModal
-          mediaServerId={id}
-          {...(libraryId ? { libraryId: libraryId } : {})}
-          {...(type ? { type: type } : {})}
-          onSubmit={() => {
-            invalidateMaintainerrStatusDetails(id)
-            setStatusShouldRefetch(true)
-            setAddModal(false)
-          }}
-          onCancel={() => setAddModal(false)}
-          modalType="add"
-        />
-      ) : undefined}
       <PosterCard
         mediaType={mediaType}
         providerIds={providerIds}
         itemId={id}
-        className={`media-card relative transform-gpu cursor-pointer overflow-hidden rounded-xl bg-zinc-800 bg-cover pb-[150%] ring-1 outline-hidden transition duration-300 ${showDetail ? 'show-detail' : ''}`}
+        className={`media-card relative transform-gpu cursor-pointer overflow-hidden rounded-xl bg-zinc-800 bg-cover pb-[150%] outline-hidden transition duration-300 ${selectionMode && selected ? 'ring-4 ring-maintainerr-600' : 'ring-1'} ${showDetail ? 'show-detail' : ''}`}
         onMouseEnter={() => setShowDetail(true)}
         onMouseLeave={() => setShowDetail(false)}
         onClick={() => {
+          if (selectionMode) {
+            onToggleSelection?.(id.toString(), !selected)
+            return
+          }
+
           if (showDetail) {
             setShowMediaModal(true)
           } else {
             setShowDetail(true)
           }
         }}
-        role="link"
+        onKeyDown={(event) => {
+          if (selectionMode && (event.key === 'Enter' || event.key === ' ')) {
+            event.preventDefault()
+            onToggleSelection?.(id.toString(), !selected)
+          }
+        }}
+        role={selectionMode ? 'button' : 'link'}
+        aria-pressed={selectionMode ? selected : undefined}
+        aria-label={selectionMode ? t`Select ${{ title }}` : undefined}
         tabIndex={0}
       >
         {(image) => (
           <>
-            <div className="absolute right-0 left-0 flex items-center justify-between p-2">
+            {/* The markers head the card: over the poster's foot they sat on
+                the artwork and on the title the detail view reveals. EXCL takes
+                the free bottom corner rather than a third slot up here, which
+                truncated the collection name to an ellipsis on a phone. */}
+            <div className="absolute right-0 left-0 flex items-start justify-between gap-1 p-2">
               {renderBadge(
                 mediaTypeLabel(mediaType, { seasonNumber, episodeNumber }),
                 mediaType,
+                'shrink-0',
               )}
-              {!collectionPage && exclusionType === 'global'
-                ? renderBadge('EXCL', mediaType)
+              {!collectionPage && collections?.length
+                ? renderBadge(
+                    <span className="truncate" title={collections.join(', ')}>
+                      {collections.length > 1
+                        ? `${collections[0]} +${collections.length - 1}`
+                        : collections[0]}
+                    </span>,
+                    'info',
+                    'min-w-0',
+                  )
                 : undefined}
             </div>
+
+            {/* The card's one free corner, so a long collection name up top
+                never has to share a line with this. */}
+            {exclusionType === 'global' && !showDetail
+              ? renderBadge('EXCL', 'exclusion', 'absolute bottom-0 left-0 p-2')
+              : undefined}
 
             {collectionPage && isManual && !showDetail
               ? renderBadge(
@@ -175,18 +183,10 @@ const MediaCard: React.FC<IMediaCard> = ({
                 )
               : undefined}
 
-            {collectionPage && exclusionType === 'global'
-              ? renderBadge(
-                  exclusionType.toUpperCase(),
-                  mediaType,
-                  'absolute right-0 p-2',
-                )
-              : undefined}
-
             <Transition
               as="div"
               show={!image || showDetail}
-              className="absolute inset-0 transform cursor-alias overflow-hidden rounded-xl transition"
+              className={`absolute inset-0 transform overflow-hidden rounded-xl transition ${selectionMode ? 'cursor-pointer' : 'cursor-alias'}`}
               enter="opacity-0"
               enterFrom="opacity-0"
               enterTo="opacity-100"
@@ -236,38 +236,9 @@ const MediaCard: React.FC<IMediaCard> = ({
                       </div>
                     )}
 
-                    {!collectionPage ? (
-                      <div>
-                        <Button
-                          buttonType="twin-primary-l"
-                          buttonSize="md"
-                          className="mt-2 mb-1 h-6 w-1/2 text-zinc-200 shadow-md"
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            setAddModal(true)
-                          }}
-                        >
-                          {<DocumentAddIcon className="m-auto ml-3 h-3" />}{' '}
-                          <p className="rules-button-text m-auto mr-2">
-                            {'Add'}
-                          </p>
-                        </Button>
-                        <Button
-                          buttonSize="md"
-                          buttonType="twin-primary-r"
-                          className="mt-2 h-6 w-1/2"
-                          onClick={(e) => {
-                            e.stopPropagation()
-                            setExcludeModal(true)
-                          }}
-                        >
-                          {<DocumentRemoveIcon className="m-auto ml-3 h-3" />}{' '}
-                          <p className="rules-button-text m-auto mr-2">
-                            {'Excl'}
-                          </p>
-                        </Button>
-                      </div>
-                    ) : (
+                    {/* Selection mode makes the whole card a checkbox, so its
+                        own action would fire on the click that picks it. */}
+                    {collectionPage && !selectionMode ? (
                       <RemoveFromCollectionButton
                         mediaServerId={id}
                         popup={exclusionType && exclusionType === 'global'}
@@ -275,7 +246,7 @@ const MediaCard: React.FC<IMediaCard> = ({
                         collectionId={collectionId}
                         exclusionId={exclusionId}
                       />
-                    )}
+                    ) : null}
                   </div>
                 </div>
               </div>
@@ -283,7 +254,7 @@ const MediaCard: React.FC<IMediaCard> = ({
           </>
         )}
       </PosterCard>
-      {!addModal && !excludeModal && showMediaModal && (
+      {showMediaModal && (
         <MediaModalContent
           id={id}
           onClose={() => setShowMediaModal(false)}
@@ -297,7 +268,7 @@ const MediaCard: React.FC<IMediaCard> = ({
           exclusionType={exclusionType}
           collection={collection}
           isManual={isManual}
-          forceStatusLoad={statusShouldRefetch}
+          forceStatusLoad={forceStatusLoad}
           onStatusLink={handleStatusLink}
           onCollectionItemRemoved={() => {
             onRemove(id.toString())

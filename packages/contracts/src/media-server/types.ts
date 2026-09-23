@@ -2,12 +2,14 @@ import { MediaItemType } from './enums'
 import { MediaLibrarySortField, MediaSortOrder } from './sorting'
 
 /**
- * Provider IDs for external databases (IMDB, TMDB, TVDB)
+ * Provider IDs for external databases (IMDB, TMDB, TVDB) and for Sportarr,
+ * whose media server agents stamp their own `sportarr` namespace (lg-000278).
  */
 export interface MediaProviderIds {
   imdb?: string[]
   tmdb?: string[]
   tvdb?: string[]
+  sportarr?: string[]
 }
 
 /**
@@ -74,6 +76,12 @@ export interface MediaItem {
   updatedAt?: Date
   providerIds: MediaProviderIds
   mediaSources: MediaSource[]
+  /**
+   * Where the item lives on the server's own filesystem: the media file for
+   * movies and episodes, the folder for shows and seasons. Only single-item
+   * reads carry it, and a Plex season has none.
+   */
+  path?: string
   library: {
     id: string
     title: string
@@ -97,9 +105,11 @@ export interface MediaItem {
   parentIndex?: number
   collections?: string[]
   labels?: string[]
+  studios?: string[]
   maintainerrExclusionType?: 'specific' | 'global'
   maintainerrExclusionId?: number
   maintainerrIsManual?: boolean
+  maintainerrCollections?: string[]
 }
 
 export interface MaintainerrMediaStatusEntry {

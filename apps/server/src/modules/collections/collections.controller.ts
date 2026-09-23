@@ -1,10 +1,15 @@
 import {
+  BULK_MEDIA_ACTION_MAX_ITEMS,
+  bulkCollectionMediaRequestSchema,
+  type BulkCollectionMediaRequest,
+  type BulkMediaResponse,
   COLLECTION_POSTER_MAX_BYTES,
   COLLECTION_POSTER_MAX_LABEL,
   CollectionPosterDeleteResponse,
   CollectionPosterUploadResponse,
   CollectionLogMeta,
   CollectionMediaSortField,
+  DELETE_AFTER_MAX_DAYS,
   ECollectionLogType,
   MediaItemType,
   MediaItemTypes,
@@ -46,7 +51,7 @@ import * as fs from 'fs';
 import { ZodValidationPipe } from 'nestjs-zod';
 import { z } from 'zod';
 import { MaintainerrLogger } from '../logging/logs.service';
-import { RuleExecutorJobManagerService } from '../rules/tasks/rule-executor-job-manager.service';
+import { ExclusionAction } from '../rules/dtos/exclusion.dto';
 import {
   ExecutionLockService,
   RULES_COLLECTIONS_EXECUTION_LOCK_KEY,
@@ -153,7 +158,12 @@ const collectionBaseShape = {
   listExclusions: z.boolean().optional(),
   cleanupLeftoverFolders: z.boolean().optional(),
   forceSeerr: z.boolean().optional(),
-  deleteAfterDays: z.coerce.number().int().optional(),
+  deleteAfterDays: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(DELETE_AFTER_MAX_DAYS)
+    .optional(),
   manualCollection: z.boolean().optional(),
   manualCollectionName: z.string().optional().nullable(),
   keepLogsForMonths: z.coerce.number().int().optional(),
@@ -165,6 +175,8 @@ const collectionBaseShape = {
   sonarrQualityProfileId: z.coerce.number().int().optional().nullable(),
   sportarrQualityProfileId: z.coerce.number().int().optional().nullable(),
   tagInArr: z.boolean().optional(),
+  // keepInMaintainerrOnly is deliberately absent: it is a rule-group option, and
+  // a collection created here has no rule group to turn it back off with.
   sortTitle: z.string().optional().nullable(),
   mediaServerSort: collectionMediaSortKeySchema.optional().nullable(),
   overlayEnabled: z.boolean().optional(),
@@ -268,7 +280,6 @@ export class CollectionsController {
   constructor(
     private readonly collectionService: CollectionsService,
     private readonly collectionWorkerService: CollectionWorkerService,
-    private readonly ruleExecutorJobManagerService: RuleExecutorJobManagerService,
     private readonly executionLock: ExecutionLockService,
     private readonly collectionHandler: CollectionHandler,
     private readonly collectionPosterService: CollectionPosterService,
@@ -416,7 +427,7 @@ export class CollectionsController {
         request.collectionId,
         request.context,
         { mediaServerId: request.mediaId },
-        request.action === 0 ? 'add' : 'remove',
+        request.action === ExclusionAction.ADD ? 'add' : 'remove',
       );
 
     // A rejected item and an item the context resolved to nothing both used to
@@ -427,13 +438,64 @@ export class CollectionsController {
       );
     }
 
+    // Nothing was written locally or remotely, so answering 201 would close the
+    // modal on a no-op. Not a media server refusal: it was never asked.
+    if (result.unlinkedIds?.length) {
+      throw new BadRequestException(
+        'This collection has no media server collection to add to. Check that its collection still exists on the media server.',
+      );
+    }
+
     if (result.serverRejectedIds.length > 0) {
       throw new BadGatewayException(
         `The media server refused ${result.serverRejectedIds.length} of ${result.resolvedCount} item(s)`,
       );
     }
 
+    // Not a refusal: the media server never answered, so it may or may not have
+    // applied the change. Answering 201 here is the false success #3383 removed.
+    if (result.serverUnconfirmedIds?.length) {
+      throw new BadGatewayException(
+        `The media server did not answer for ${result.serverUnconfirmedIds.length} of ${result.resolvedCount} item(s), so it is unclear whether they were added`,
+      );
+    }
+
     return result.collection;
+  }
+
+  @Post('/media/bulk')
+  @ApiOperation({
+    summary: 'Add or remove a media selection to or from one collection',
+  })
+  @ApiResponse({
+    status: 201,
+    description: 'Per-item results; failures are reported per media id.',
+  })
+  @ApiResponse({
+    status: 400,
+    description: `Rejected without processing: empty, more than ${BULK_MEDIA_ACTION_MAX_ITEMS} media ids, or an add without a collection.`,
+  })
+  async bulkMediaCollectionAction(
+    @Body(new ZodValidationPipe(bulkCollectionMediaRequestSchema))
+    request: BulkCollectionMediaRequest,
+  ): Promise<BulkMediaResponse> {
+    // Only a removal can mean "every collection"; an add needs a target.
+    if (
+      request.action === ExclusionAction.ADD &&
+      request.collectionId === undefined
+    ) {
+      throw new BadRequestException(
+        'A collection is required to add media to it',
+      );
+    }
+
+    return await this.collectionService.bulkMediaCollectionAction(
+      request.mediaIds,
+      request.collectionId,
+      request.action === ExclusionAction.ADD ? 'add' : 'remove',
+      request.mediaType,
+      request.context,
+    );
   }
 
   @Post('/media/handle')
@@ -443,7 +505,7 @@ export class CollectionsController {
   ) {
     if (
       this.collectionWorkerService.isRunning() ||
-      this.ruleExecutorJobManagerService.isProcessing()
+      this.executionLock.isRuleQueueProcessing()
     ) {
       throw new ConflictException(
         'Collection handling is already running. Try again when the current collection or rule execution finishes.',

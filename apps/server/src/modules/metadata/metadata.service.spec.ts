@@ -149,6 +149,89 @@ describe('MetadataService', () => {
     expect(tmdbProvider.getPosterUrl).not.toHaveBeenCalled();
   });
 
+  it('lets the provider that owns an item answer ahead of the primary one', async () => {
+    // A league carries a TMDB id from the media server's own match as well as
+    // its Sportarr id. The Sportarr provider is the authority for the league,
+    // so it answers first even with TMDB set as the primary provider, and TMDB
+    // only answers for it when Sportarr has nothing.
+    const { service, providerByKey } = createService({
+      preference: MetadataProviderPreference.TMDB_PRIMARY,
+      providerMocks: [
+        {
+          name: 'TMDB',
+          idKey: 'tmdb',
+          detailsId: 101,
+          posterUrl: 'https://tmdb/poster.jpg',
+        },
+        {
+          name: 'TVDB',
+          idKey: 'tvdb',
+          detailsId: 202,
+          posterUrl: 'https://tvdb/poster.jpg',
+        },
+        {
+          name: 'Sportarr',
+          idKey: 'sportarr',
+          detailsId: 278,
+          posterUrl: 'https://sportarr/poster.jpg',
+          isAuthorityFor: (ids) => ids.sportarr !== undefined,
+        },
+      ],
+    });
+
+    await expect(
+      service.getPosterUrl({ tmdb: 101, sportarr: 278 }, 'tv'),
+    ).resolves.toEqual({
+      url: 'https://sportarr/poster.jpg',
+      provider: 'Sportarr',
+      id: 278,
+    });
+    expect(providerByKey.tmdb.getPosterUrl).not.toHaveBeenCalled();
+
+    providerByKey.sportarr.getPosterUrl.mockResolvedValue(undefined);
+    await expect(
+      service.getPosterUrl({ tmdb: 101, sportarr: 278 }, 'tv'),
+    ).resolves.toMatchObject({ provider: 'TMDB' });
+
+    await expect(
+      service.getPosterUrl({ tmdb: 101 }, 'tv'),
+    ).resolves.toMatchObject({ provider: 'TMDB' });
+  });
+
+  it('does not warn when a provider that dates nothing returns no year', async () => {
+    // Sportarr dates events rather than leagues, so a league accepted without
+    // a year check is how the provider works, not a gap worth a warning per
+    // league per resolution.
+    const libraryItem = createMediaItem({
+      id: 'league-1',
+      type: 'show',
+      year: 2019,
+      title: 'Sample League',
+      providerIds: { sportarr: ['278'] },
+    });
+    const { service, logger } = createService({
+      providerMocks: [
+        {
+          name: 'Sportarr',
+          idKey: 'sportarr',
+          hasReleaseYears: false,
+          detailsId: 278,
+          details: { title: 'Sample League', type: 'tv' },
+        },
+      ],
+    });
+
+    await expect(
+      service.resolveIdsFromMediaItem(libraryItem),
+    ).resolves.toMatchObject({ sportarr: 278 });
+    expect(logger.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining('without a year check'),
+    );
+    expect(logger.debug).toHaveBeenCalledWith(
+      expect.stringContaining('without a year check'),
+    );
+  });
+
   // Season 3 of a show, where the season carries provider IDs of its own that
   // must not be used for the lookup (#2649).
   const createSeasonMediaServerMock = () => {
@@ -668,6 +751,30 @@ describe('MetadataService', () => {
       type: 'movie',
     });
     expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  // Plex files a legacy agent guid beside a modern one and both land under
+  // tvdb, so a namespace can hold more than one id.
+  it('reads past a first provider id that is not a number', async () => {
+    const libraryItem = createMediaItem({
+      id: 'show-1',
+      type: 'show',
+      year: 2014,
+      title: 'Fixture Chronicle',
+      providerIds: { tvdb: ['not-an-id', '202'] },
+    });
+    const { service } = createService({
+      tvdbDetails: {
+        title: 'Fixture Chronicle',
+        year: 2014,
+        type: 'tv',
+        externalIds: { tvdb: 202, type: 'tv' },
+      },
+    });
+
+    const result = await service.resolveIdsFromMediaItem(libraryItem);
+
+    expect(result).toMatchObject({ tvdb: 202, type: 'tv' });
   });
 
   it('rejects direct provider ids when no configured provider confirms the release year', async () => {
@@ -1371,5 +1478,82 @@ describe('MetadataService', () => {
 
       expect(merged).toBeUndefined();
     });
+  });
+  // The predicate the arr and Seerr getters use to tell "nothing to look up"
+  // from "the lookup failed". It must never make a request, and it must be
+  // broader than "TMDB or TVDB can extract an id" - an imdb-only item has
+  // neither yet still resolves online by cross-referencing, so calling it
+  // unresolvable would un-protect exactly the items #3125 guards during a
+  // TMDB outage.
+  describe('hasExternalIds', () => {
+    it.each([
+      ['a tmdb id', { tmdb: ['550'] }, true],
+      ['a tvdb id', { tvdb: ['73141'] }, true],
+      ['only an imdb id', { imdb: ['tt0099785'] }, true],
+      ['no ids at all', {}, false],
+      ['empty id lists', { imdb: [], tmdb: [], tvdb: [] }, false],
+    ])('is %s -> %s', (label, providerIds, expected) => {
+      const { service, providers } = createService({});
+
+      expect(
+        service.hasExternalIds(
+          createMediaItem({ type: 'movie', providerIds } as never),
+        ),
+      ).toBe(expected);
+      for (const provider of providers) {
+        expect(provider.getDetails).not.toHaveBeenCalled();
+      }
+    });
+
+    it('is false when the item carries no providerIds field', () => {
+      const { service } = createService({});
+      const item = createMediaItem({ type: 'movie' });
+      delete (item as { providerIds?: unknown }).providerIds;
+
+      expect(service.hasExternalIds(item)).toBe(false);
+    });
+  });
+
+  it('reads a provider id the media server carries as a string through the provider that parses it', async () => {
+    // The Sportarr agents stamp lg-000278, not a number, so the provider that
+    // owns that namespace turns it into its id before the year check runs.
+    const libraryItem = createMediaItem({
+      id: 'show-1',
+      type: 'show',
+      title: 'Sample League',
+      providerIds: {
+        tmdb: [],
+        imdb: [],
+        tvdb: [],
+        sportarr: ['lg-000278'],
+      },
+    });
+    const { service, providerByKey } = createService({
+      providerMocks: [
+        {
+          name: 'TMDB',
+          idKey: 'tmdb',
+        },
+        {
+          name: 'Sportarr',
+          idKey: 'sportarr',
+          parseId: (value) => (value === 'lg-000278' ? 278 : undefined),
+          detailsId: 278,
+          details: {
+            title: 'Sample League',
+            type: 'tv',
+            externalIds: { type: 'tv' },
+          },
+        },
+      ],
+    });
+
+    const result = await service.resolveIdsFromMediaItem(libraryItem);
+
+    expect(providerByKey.sportarr.assignId).toHaveBeenCalledWith(
+      expect.anything(),
+      278,
+    );
+    expect(result).toMatchObject({ sportarr: 278, type: 'tv' });
   });
 });

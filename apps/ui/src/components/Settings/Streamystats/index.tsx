@@ -1,8 +1,11 @@
-import { streamystatsSettingSchema } from '@maintainerr/contracts'
+import { Trans, useLingui } from '@lingui/react/macro'
+import {
+  streamystatsSettingSchema,
+  stripTrailingSlashes,
+} from '@maintainerr/contracts'
 import { Navigate } from 'react-router-dom'
 import { z } from 'zod'
 import { useMediaServerType } from '../../../hooks/useMediaServerType'
-import { stripTrailingSlashes } from '../../../utils/SettingsUtils'
 import ExternalServiceSettingsPage, {
   type ExternalServiceFieldConfig,
 } from '../ExternalServiceSettingsPage'
@@ -16,14 +19,15 @@ const StreamystatsSettingFormSchema = z.union([
   StreamystatsSettingDeleteSchema,
 ])
 
-const fields: ExternalServiceFieldConfig[] = [
+// A function, so every label resolves in the locale active at render.
+const buildFields = (): ExternalServiceFieldConfig[] => [
   {
     name: 'url',
     label: 'URL',
     placeholder: 'http://localhost:3000',
     helpText: (
       <>
-        Example URL formats:
+        <Trans>Example URL formats:</Trans>
         <br />
         <span className="whitespace-nowrap">http://localhost:3000</span>
         <br />
@@ -38,6 +42,7 @@ const fields: ExternalServiceFieldConfig[] = [
 ]
 
 const StreamystatsSettings = () => {
+  const { t } = useLingui()
   const { isJellyfin, isLoading } = useMediaServerType()
 
   if (isLoading) {
@@ -53,17 +58,18 @@ const StreamystatsSettings = () => {
 
   return (
     <ExternalServiceSettingsPage
-      scope="Streamystats settings"
-      pageTitle="Streamystats settings - Maintainerr"
-      heading="Streamystats Settings"
-      description="Streamystats configuration. Authentication reuses the configured Jellyfin API key."
+      updatedMessage={t`Streamystats settings updated`}
+      updateErrorMessage={t`Streamystats settings could not be updated`}
+      pageTitle={t`Streamystats settings - Maintainerr`}
+      heading={t`Streamystats Settings`}
+      description={t`Streamystats configuration. Authentication reuses the configured Jellyfin API key.`}
       docsPage="Configuration/#streamystats"
       settingsPath="/settings/streamystats"
       testPath="/settings/test/streamystats"
       schema={StreamystatsSettingFormSchema}
-      fields={fields}
+      fields={buildFields()}
       testSuccessTitle="Streamystats"
-      testFailureMessage="Failed to connect to Streamystats. Verify URL and that the service is running."
+      testFailureMessage={t`Failed to connect to Streamystats. Verify URL and that the service is running.`}
     />
   )
 }

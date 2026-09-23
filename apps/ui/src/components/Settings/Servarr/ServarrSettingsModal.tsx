@@ -1,3 +1,6 @@
+import { RefreshIcon } from '@heroicons/react/solid'
+import { Trans, useLingui } from '@lingui/react/macro'
+import { BasicResponseDto, stripTrailingSlashes } from '@maintainerr/contracts'
 import { useMemo, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import {
@@ -12,6 +15,7 @@ import {
   getPortFromUrl,
 } from '../../../utils/SettingsUtils'
 import Alert from '../../Common/Alert'
+import Button from '../../Common/Button'
 import DocsButton from '../../Common/DocsButton'
 import Modal from '../../Common/Modal'
 import SaveButton from '../../Common/SaveButton'
@@ -73,6 +77,9 @@ interface ServarrSettingsModalProps<TSetting extends ServarrSettingShape> {
   settingsPath: string
   testPath: string
   serviceName: string
+  // Set by a service whose metadata Maintainerr caches, so the cache can be
+  // dropped from the same place the connection is configured.
+  metadataRefreshPath?: string
   settings?: TSetting
   onUpdate: (setting: TSetting) => void
   onDelete: (id: number) => Promise<boolean>
@@ -140,14 +147,16 @@ const buildServarrPayload = <TSetting extends ServarrSettingShape>(
       ? `https://${state.hostname}`
       : `http://${state.hostname}`
 
-  const normalizedUrl = addPortToUrl(hostnameValue, Number(port))
-  const url = normalizedUrl.endsWith('/')
-    ? normalizedUrl.slice(0, -1)
-    : normalizedUrl
+  const url = stripTrailingSlashes(addPortToUrl(hostnameValue, Number(port)))
 
   return {
     payload: {
-      url: `${url}${state.baseUrl ? `/${state.baseUrl}` : ''}`,
+      // The base URL slot can contribute its own trailing slash (#3416), so
+      // the composed URL is stripped as well - the host strip above still
+      // keeps a slash-ended hostname from doubling at the join.
+      url: stripTrailingSlashes(
+        `${url}${state.baseUrl ? `/${state.baseUrl}` : ''}`,
+      ),
       apiKey: state.apiKey,
       serverName: state.serverName,
       ...(settings?.id ? { id: settings.id } : {}),
@@ -162,11 +171,13 @@ const ServarrSettingsModal = <TSetting extends ServarrSettingShape>({
   settingsPath,
   testPath,
   serviceName,
+  metadataRefreshPath,
   settings,
   onUpdate,
   onDelete,
   onCancel,
 }: ServarrSettingsModalProps<TSetting>) => {
+  const { t } = useLingui()
   const initialState = useMemo(() => buildInitialState(settings), [settings])
   const savedConnectionState = settings
     ? toConnectionState(initialState)
@@ -181,6 +192,11 @@ const ServarrSettingsModal = <TSetting extends ServarrSettingShape>({
   const [testedConnectionStateKey, setTestedConnectionStateKey] =
     useState<string>()
   const [saving, setSaving] = useState(false)
+  const [refreshing, setRefreshing] = useState(false)
+  const [refreshMessage, setRefreshMessage] = useState<{
+    status: boolean
+    message: string
+  }>()
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<TestStatus>()
 
@@ -232,9 +248,49 @@ const ServarrSettingsModal = <TSetting extends ServarrSettingShape>({
     ? testResult?.status
     : undefined
 
+  // Nothing to refresh until the server it belongs to exists.
+  const canRefresh = Boolean(metadataRefreshPath) && settings?.id != null
+
   const clearFeedback = () => {
     setErrorMessage(undefined)
     setTestResult(undefined)
+    setRefreshMessage(undefined)
+  }
+
+  const refreshMetadata = async () => {
+    // metadataRefreshPath is tested again rather than left to canRefresh: it
+    // is what narrows the path for the post below.
+    if (!metadataRefreshPath || !canRefresh || refreshing) return
+
+    clearFeedback()
+    setRefreshing(true)
+
+    try {
+      const response = await PostApiHandler<BasicResponseDto>(
+        metadataRefreshPath,
+        {},
+      )
+
+      const started = response?.code === 1
+
+      // The server answers with the provider name upper-cased, which suits
+      // TMDB and TVDB and shouts for a product name, so the known outcome
+      // reads from the catalogue and anything else keeps its own reason.
+      setRefreshMessage({
+        status: started,
+        message: started
+          ? t`${{ serviceName }} metadata refresh started`
+          : (response?.message ??
+            t`Failed to refresh ${{ serviceName }} metadata`),
+      })
+    } catch {
+      setRefreshMessage({
+        status: false,
+        message: t`Failed to refresh ${{ serviceName }} metadata`,
+      })
+    } finally {
+      setRefreshing(false)
+    }
   }
 
   const saveSettings = async (values: ServarrFormState) => {
@@ -247,10 +303,10 @@ const ServarrSettingsModal = <TSetting extends ServarrSettingShape>({
         const wasDeleted = await onDelete(settings.id)
 
         if (!wasDeleted) {
-          setErrorMessage(`Failed to remove ${serviceName} settings.`)
+          setErrorMessage(t`Failed to remove ${{ serviceName }} settings.`)
         }
       } catch {
-        setErrorMessage(`Failed to remove ${serviceName} settings.`)
+        setErrorMessage(t`Failed to remove ${{ serviceName }} settings.`)
       } finally {
         setSaving(false)
       }
@@ -258,19 +314,11 @@ const ServarrSettingsModal = <TSetting extends ServarrSettingShape>({
       return
     }
 
-    const { payload, port } = buildServarrPayload(values, settings)
-
-    if (
-      values.hostname === '' ||
-      port === '' ||
-      values.apiKey === '' ||
-      values.serverName === ''
-    ) {
-      setErrorMessage(
-        `Please fill in all required ${serviceName} fields or clear all fields to remove this server.`,
-      )
-      return
-    }
+    // No completeness check here on purpose: canSave already requires hostname,
+    // apiKey and serverName, and resolveServarrPort only yields an empty port
+    // when hostname is empty - which canSave rejects. The all-empty case is
+    // taken by the removal branch above before reaching this point.
+    const { payload } = buildServarrPayload(values, settings)
 
     const endpoint = settings?.id
       ? `${settingsPath}/${settings.id}`
@@ -288,10 +336,10 @@ const ServarrSettingsModal = <TSetting extends ServarrSettingShape>({
       if (response.code === 1) {
         onUpdate(response.data)
       } else {
-        setErrorMessage(`Failed to update ${serviceName} settings.`)
+        setErrorMessage(t`Failed to update ${{ serviceName }} settings.`)
       }
     } catch {
-      setErrorMessage(`Failed to update ${serviceName} settings.`)
+      setErrorMessage(t`Failed to update ${{ serviceName }} settings.`)
     } finally {
       setSaving(false)
     }
@@ -314,7 +362,7 @@ const ServarrSettingsModal = <TSetting extends ServarrSettingShape>({
           status: response.code === 1,
           version: normalizeConnectionErrorMessage(
             response.message,
-            `Failed to connect to ${serviceName}. Verify URL and API key.`,
+            t`Failed to connect to ${{ serviceName }}. Verify URL and API key.`,
           ),
         })
 
@@ -328,7 +376,7 @@ const ServarrSettingsModal = <TSetting extends ServarrSettingShape>({
           status: false,
           version: getApiErrorMessage(
             error,
-            `Failed to connect to ${serviceName}. Verify URL and API key.`,
+            t`Failed to connect to ${{ serviceName }}. Verify URL and API key.`,
           ),
         })
       })
@@ -363,27 +411,47 @@ const ServarrSettingsModal = <TSetting extends ServarrSettingShape>({
             type="button"
             onClick={() => void performTest()}
             disabled={testing || isClearingExistingSetting}
-            label="Test Connection"
+            label={t`Test Connection`}
             isPending={testing}
             feedbackStatus={testFeedbackStatus}
           />
+          {metadataRefreshPath ? (
+            <Button
+              buttonType="default"
+              className="ml-3"
+              type="button"
+              onClick={() => void refreshMetadata()}
+              disabled={!canRefresh || refreshing}
+            >
+              <RefreshIcon />
+              <Trans>Refresh metadata</Trans>
+            </Button>
+          ) : null}
         </>
       }
     >
       <SettingsAlertSlot>
-        {errorMessage || testResult ? (
+        {errorMessage || testResult || refreshMessage ? (
           <div className="space-y-4">
             {errorMessage ? (
               <Alert type="warning" title={errorMessage} />
+            ) : null}
+            {refreshMessage ? (
+              <Alert
+                type={refreshMessage.status ? 'success' : 'error'}
+                title={refreshMessage.message}
+              />
             ) : null}
             {testResult ? (
               <Alert
                 type={testResult.status ? 'success' : 'error'}
                 title={
                   testResult.status
-                    ? `Successfully connected to ${serviceName} (${testResult.version})`
-                    : testResult.version ||
-                      `Failed to connect to ${serviceName}`
+                    ? t`Successfully connected to ${{ serviceName }} (${{ version: testResult.version }})`
+                    : // Always set on failure: both test paths run the message
+                      // through normalizeConnectionErrorMessage, which falls
+                      // back to its own sentence rather than returning empty.
+                      testResult.version
                 }
               />
             ) : null}
@@ -393,7 +461,7 @@ const ServarrSettingsModal = <TSetting extends ServarrSettingShape>({
 
       <div className="form-row">
         <label htmlFor="serverName" className="text-label">
-          Server Name
+          <Trans>Server Name</Trans>
         </label>
         <div className="form-input">
           <div className="form-input-field">
@@ -408,7 +476,7 @@ const ServarrSettingsModal = <TSetting extends ServarrSettingShape>({
 
       <div className="form-row">
         <label htmlFor="hostname" className="text-label">
-          Hostname or IP
+          <Trans>Hostname or IP</Trans>
         </label>
         <div className="form-input">
           <div className="form-input-field">
@@ -423,7 +491,7 @@ const ServarrSettingsModal = <TSetting extends ServarrSettingShape>({
 
       <div className="form-row">
         <label htmlFor="port" className="text-label">
-          Port
+          <Trans>Port</Trans>
         </label>
         <div className="form-input">
           <div className="form-input-field">
@@ -438,8 +506,10 @@ const ServarrSettingsModal = <TSetting extends ServarrSettingShape>({
 
       <div className="form-row">
         <label htmlFor="baseUrl" className="text-label">
-          Base URL
-          <span className="label-tip">No Leading Slash</span>
+          <Trans>Base URL</Trans>
+          <span className="label-tip">
+            <Trans>No Leading Slash</Trans>
+          </span>
         </label>
         <div className="form-input">
           <div className="form-input-field">
@@ -454,7 +524,7 @@ const ServarrSettingsModal = <TSetting extends ServarrSettingShape>({
 
       <div className="form-row">
         <label htmlFor="apikey" className="text-label">
-          API key
+          <Trans>API key</Trans>
         </label>
         <div className="form-input">
           <div className="form-input-field">

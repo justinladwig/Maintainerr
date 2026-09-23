@@ -58,6 +58,8 @@ export enum MediaServerFeature {
   COLLECTION_POSTER = 'collection_poster',
   /** Ability to sort collections */
   COLLECTION_SORT = 'collection_sort',
+  /** Ability to natively sort media-library listings by studio */
+  LIBRARY_STUDIO_SORT = 'library_studio_sort',
   /**
    * A single collection can span multiple libraries. Jellyfin/Emby BoxSets are
    * server-global and may hold items from any library; Plex collections are
@@ -72,4 +74,13 @@ export enum MediaServerFeature {
    * image).
    */
   OVERLAY_LANDSCAPE_IMAGE = 'overlay_landscape_image',
+  /**
+   * An empty collection-children read is a trustworthy "this collection is
+   * empty" answer rather than a possible sync-delay artefact. Plex answers
+   * definitively; the .NET BoxSet API can return no children for a brief window
+   * after a collection is modified, so treating that as empty would flag every
+   * member as removed by hand. Gates the membership reconciliation that runs
+   * off an empty child list.
+   */
+  TRUSTWORTHY_EMPTY_COLLECTION = 'trustworthy_empty_collection',
 }

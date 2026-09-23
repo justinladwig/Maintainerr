@@ -8,7 +8,7 @@ import { Injectable } from '@nestjs/common';
 import { MediaServerFactory } from '../../api/media-server/media-server.factory';
 import { Application } from '../constants/rules.constants';
 import { RuleDto } from '../dtos/rule.dto';
-import { RulesDto } from '../dtos/rules.dto';
+import { RuleGroupDto } from '../dtos/ruleGroup.dto';
 import { ArrLookupCache } from '../helpers/arr-lookup-cache';
 import { EmbyGetterService } from './emby-getter.service';
 import { JellyfinGetterService } from './jellyfin-getter.service';
@@ -19,6 +19,7 @@ import { SonarrGetterService } from './sonarr-getter.service';
 import { SportarrGetterService } from './sportarr-getter.service';
 import { StreamystatsGetterService } from './streamystats-getter.service';
 import { TautulliGetterService } from './tautulli-getter.service';
+import { TracearrGetterService } from './tracearr-getter.service';
 
 @Injectable()
 export class ValueGetterService {
@@ -30,6 +31,7 @@ export class ValueGetterService {
     private readonly seerrGetter: SeerrGetterService,
     private readonly tautulliGetter: TautulliGetterService,
     private readonly streamystatsGetter: StreamystatsGetterService,
+    private readonly tracearrGetter: TracearrGetterService,
     private readonly jellyfinGetter: JellyfinGetterService,
     private readonly embyGetter: EmbyGetterService,
     private readonly mediaServerFactory: MediaServerFactory,
@@ -47,7 +49,7 @@ export class ValueGetterService {
   async get(
     [val1, val2]: [number, number],
     libItem: MediaItem,
-    ruleGroup?: RulesDto,
+    ruleGroup?: RuleGroupDto,
     dataType?: MediaItemType,
     currentRule?: RuleDto,
     arrLookupCache?: ArrLookupCache,
@@ -72,7 +74,10 @@ export class ValueGetterService {
                 ? this.embyGetter
                 : null;
 
-        return getter?.get(val2, libItem, dataType, ruleGroup) ?? null;
+        return (
+          getter?.get(val2, libItem, dataType, ruleGroup, arrLookupCache) ??
+          null
+        );
       }
       case Application.RADARR: {
         return await this.radarrGetter.get(
@@ -117,10 +122,19 @@ export class ValueGetterService {
           libItem,
           dataType,
           ruleGroup,
+          currentRule,
         );
       }
       case Application.STREAMYSTATS: {
-        return await this.streamystatsGetter.get(val2, libItem);
+        return await this.streamystatsGetter.get(val2, libItem, currentRule);
+      }
+      case Application.TRACEARR: {
+        return await this.tracearrGetter.get(
+          val2,
+          libItem,
+          ruleGroup,
+          currentRule,
+        );
       }
       default: {
         return null;

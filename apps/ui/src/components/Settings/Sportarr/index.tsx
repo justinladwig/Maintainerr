@@ -1,3 +1,4 @@
+import { Trans, useLingui } from '@lingui/react/macro'
 import {
   DocumentAddIcon,
   PlusCircleIcon,
@@ -8,12 +9,12 @@ import GetApiHandler, { DeleteApiHandler } from '../../../utils/ApiHandler'
 import { logClientError } from '../../../utils/ClientLogger'
 import { ICollection } from '../../Collection'
 import Button from '../../Common/Button'
-import Modal from '../../Common/Modal'
 import {
   SettingsFeedbackAlert,
   useSettingsFeedback,
 } from '../useSettingsFeedback'
 import ServarrSettingsModal from '../Servarr/ServarrSettingsModal'
+import ServerInUseModal from '../Servarr/ServerInUseModal'
 
 type DeleteSportarrSettingResponseDto =
   | {
@@ -39,6 +40,7 @@ export interface ISportarrSetting {
 }
 
 const SportarrSettings = () => {
+  const { t } = useLingui()
   const [loaded, setLoaded] = useState(false)
   const [settings, setSettings] = useState<ISportarrSetting[]>([])
   const [settingsModalActive, setSettingsModalActive] = useState<
@@ -47,8 +49,7 @@ const SportarrSettings = () => {
   const [collectionsInUseWarning, setCollectionsInUseWarning] = useState<
     ICollection[] | undefined
   >()
-  const { feedback, clear, showError, showInfo } =
-    useSettingsFeedback('Sportarr settings')
+  const { feedback, clear, showError, showInfo } = useSettingsFeedback()
 
   const handleSettingsSaved = (setting: ISportarrSetting) => {
     const newSettings = [...settings]
@@ -74,14 +75,14 @@ const SportarrSettings = () => {
           currentSettings.filter((setting) => setting.id !== id),
         )
         setSettingsModalActive(undefined)
-        showInfo('Sportarr server removed')
+        showInfo(t`Sportarr server removed`)
         return true
       }
 
       if (resp.data?.collectionsInUse) {
         setCollectionsInUseWarning(resp.data.collectionsInUse)
       } else {
-        showError('Failed to delete Sportarr setting.')
+        showError(t`Failed to delete Sportarr setting.`)
       }
     } catch (error: unknown) {
       void logClientError(
@@ -89,7 +90,7 @@ const SportarrSettings = () => {
         error,
         'Settings.Sportarr.confirmedDelete',
       )
-      showError('Failed to delete Sportarr setting. Check logs for details.')
+      showError(t`Failed to delete Sportarr setting. Check logs for details.`)
     }
 
     return false
@@ -109,11 +110,15 @@ const SportarrSettings = () => {
 
   return (
     <>
-      <title>Sportarr settings - Maintainerr</title>
+      <title>{t`Sportarr settings - Maintainerr`}</title>
       <div className="h-full w-full">
         <div className="section h-full w-full">
-          <h3 className="heading">Sportarr Settings</h3>
-          <p className="description">Sportarr configuration</p>
+          <h3 className="heading">
+            <Trans>Sportarr Settings</Trans>
+          </h3>
+          <p className="description">
+            <Trans>Sportarr configuration</Trans>
+          </p>
         </div>
 
         <SettingsFeedbackAlert feedback={feedback} />
@@ -131,7 +136,9 @@ const SportarrSettings = () => {
                     {setting.serverName}
                   </div>
                   <p className="mb-4 space-x-2 truncate text-gray-300">
-                    <span className="font-semibold">Address</span>
+                    <span className="font-semibold">
+                      <Trans>Address</Trans>
+                    </span>
                     <a href={setting.url} className="hover:underline">
                       {setting.url}
                     </a>
@@ -147,7 +154,9 @@ const SportarrSettings = () => {
                       }}
                     >
                       {<DocumentAddIcon className="m-auto" />}{' '}
-                      <p className="m-auto font-semibold">Edit</p>
+                      <p className="m-auto font-semibold">
+                        <Trans>Edit</Trans>
+                      </p>
                     </Button>
                     <DeleteButton
                       onDeleteRequested={() => {
@@ -167,7 +176,9 @@ const SportarrSettings = () => {
                 onClick={showAddModal}
               >
                 {<PlusCircleIcon className="m-auto h-5" />}
-                <p className="m-auto ml-1 font-semibold">Add server</p>
+                <p className="m-auto ml-1 font-semibold">
+                  <Trans>Add server</Trans>
+                </p>
               </button>
             </li>
           ) : null}
@@ -175,11 +186,12 @@ const SportarrSettings = () => {
       </div>
       {settingsModalActive && (
         <ServarrSettingsModal
-          title="Sportarr Settings"
+          title={t`Sportarr Settings`}
           docsPage="Configuration/#sportarr"
           settingsPath="/settings/sportarr"
           testPath="/settings/test/sportarr"
           serviceName="Sportarr"
+          metadataRefreshPath="/settings/metadata/refresh/sportarr"
           settings={
             typeof settingsModalActive === 'boolean'
               ? undefined
@@ -193,30 +205,10 @@ const SportarrSettings = () => {
         />
       )}
       {collectionsInUseWarning ? (
-        <Modal
-          title="Server in-use"
-          size="sm"
-          footerActions={
-            <Button
-              buttonType="primary"
-              className="ml-3"
-              onClick={() => setCollectionsInUseWarning(undefined)}
-            >
-              Ok
-            </Button>
-          }
-        >
-          <p>This server is currently being used by the following rules:</p>
-          <ul className="mb-4 list-inside list-disc">
-            {collectionsInUseWarning.map((x) => (
-              <li key={x.id}>{x.title}</li>
-            ))}
-          </ul>
-          <p>
-            You must re-assign these rules to a different server before
-            deleting.
-          </p>
-        </Modal>
+        <ServerInUseModal
+          collections={collectionsInUseWarning}
+          onClose={() => setCollectionsInUseWarning(undefined)}
+        />
       ) : undefined}
     </>
   )
@@ -245,7 +237,7 @@ const DeleteButton = ({
     >
       {<TrashIcon className="m-auto" />}{' '}
       <p className="m-auto font-semibold">
-        {showSureDelete ? <>Are you sure?</> : <>Delete</>}
+        {showSureDelete ? <Trans>Are you sure?</Trans> : <Trans>Delete</Trans>}
       </p>
     </Button>
   )

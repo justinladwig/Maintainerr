@@ -12,6 +12,7 @@ import { MaintainerrLogger } from '../../../logging/logs.service';
 import type { PlexStatusResponse } from '../../plex-api/interfaces/server.interface';
 import { PlexApiService } from '../../plex-api/plex-api.service';
 import { PlexAdapterService } from './plex-adapter.service';
+import { batchIdsByRequestCost } from '../metadata-batch.util';
 
 describe('PlexAdapterService', () => {
   let service: PlexAdapterService;
@@ -59,8 +60,24 @@ describe('PlexAdapterService', () => {
       [MediaServerFeature.COLLECTION_VISIBILITY, true],
       [MediaServerFeature.WATCHLIST, true],
       [MediaServerFeature.CENTRAL_WATCH_HISTORY, true],
+      [MediaServerFeature.LIBRARY_STUDIO_SORT, true],
     ])('supportsFeature(%s) is %s', (feature, expected) => {
       expect(service.supportsFeature(feature)).toBe(expected);
+    });
+
+    it('asks Plex to sort a library by studio natively', async () => {
+      plexApi.getLibraryContents.mockResolvedValue({ items: [], totalSize: 0 });
+
+      await service.getLibraryContents('1', {
+        sort: 'studio',
+        sortOrder: 'desc',
+      });
+
+      expect(plexApi.getLibraryContents).toHaveBeenCalledWith(
+        '1',
+        expect.objectContaining({ sort: 'studio:desc' }),
+        undefined,
+      );
     });
   });
 
@@ -638,44 +655,240 @@ describe('PlexAdapterService', () => {
     });
   });
 
+  describe('getMetadataBatch', () => {
+    it('reads a whole id list in one request', async () => {
+      plexApi.getMetadataBatch.mockResolvedValue([
+        createPlexMetadata({ ratingKey: 'movie-1', type: 'movie' }),
+        createPlexMetadata({ ratingKey: 'movie-2', type: 'movie' }),
+      ]);
+
+      const items = await service.getMetadataBatch(['movie-1', 'movie-2']);
+
+      expect(plexApi.getMetadataBatch).toHaveBeenCalledTimes(1);
+      expect(plexApi.getMetadataBatch).toHaveBeenCalledWith([
+        'movie-1',
+        'movie-2',
+      ]);
+      expect(items.map((item) => item.id)).toEqual(['movie-1', 'movie-2']);
+    });
+
+    it('splits a long id list so the request line stays bounded', async () => {
+      plexApi.getMetadataBatch.mockResolvedValue([]);
+      const itemIds = Array.from(
+        { length: 1500 },
+        (unused, index) => `movie-${index}`,
+      );
+
+      await service.getMetadataBatch(itemIds);
+
+      // The shared helper decides the split from the ids themselves.
+      expect(plexApi.getMetadataBatch).toHaveBeenCalledTimes(
+        batchIdsByRequestCost(itemIds, 1).length,
+      );
+      expect(plexApi.getMetadataBatch.mock.calls.length).toBeGreaterThan(1);
+    });
+
+    it('leaves out the ids Plex did not answer for', async () => {
+      plexApi.getMetadataBatch.mockResolvedValue([
+        createPlexMetadata({ ratingKey: 'movie-1', type: 'movie' }),
+      ]);
+
+      await expect(
+        service.getMetadataBatch(['movie-1', 'gone']),
+      ).resolves.toEqual([expect.objectContaining({ id: 'movie-1' })]);
+    });
+  });
+
   describe('getCollectionChildren', () => {
-    it('refreshes incomplete Plex collection children via full metadata lookups', async () => {
+    it('reads no metadata at all when the listing carries provider ids', async () => {
       plexApi.getCollectionChildren.mockResolvedValue([
         createPlexLibraryItem('movie', {
           ratingKey: 'movie-1',
-          Guid: undefined,
-        }),
-      ]);
-      plexApi.getMetadata.mockResolvedValue(
-        createPlexMetadata({
-          ratingKey: 'movie-1',
-          type: 'movie',
           Guid: [{ id: 'tmdb://321' }],
         }),
-      );
+      ]);
 
       const children = await service.getCollectionChildren('col123');
 
       expect(plexApi.getCollectionChildren).toHaveBeenCalledWith('col123');
-      expect(plexApi.getMetadata).toHaveBeenCalledWith('movie-1');
+      expect(plexApi.getMetadataBatch).not.toHaveBeenCalled();
       expect(children[0].providerIds.tmdb).toEqual(['321']);
     });
 
-    it('keeps the original collection child when the metadata refresh is unavailable', async () => {
+    it('looks up the ids Plex withheld from the listing in one batch', async () => {
+      plexApi.getCollectionChildren.mockResolvedValue([
+        createPlexLibraryItem('episode', {
+          ratingKey: 'episode-1',
+          Guid: undefined,
+        }),
+        createPlexLibraryItem('episode', {
+          ratingKey: 'episode-2',
+          Guid: undefined,
+        }),
+      ]);
+      plexApi.getMetadataBatch.mockResolvedValue([
+        createPlexMetadata({
+          ratingKey: 'episode-1',
+          type: 'episode',
+          Guid: [{ id: 'tmdb://321' }],
+        }),
+        createPlexMetadata({
+          ratingKey: 'episode-2',
+          type: 'episode',
+          Guid: [{ id: 'tmdb://654' }],
+        }),
+      ]);
+
+      const children = await service.getCollectionChildren('col123');
+
+      expect(plexApi.getMetadataBatch).toHaveBeenCalledTimes(1);
+      expect(plexApi.getMetadataBatch).toHaveBeenCalledWith([
+        'episode-1',
+        'episode-2',
+      ]);
+      expect(children[0].providerIds.tmdb).toEqual(['321']);
+      expect(children[1].providerIds.tmdb).toEqual(['654']);
+    });
+
+    it('splits the lookup so the request line cannot grow without bound', async () => {
+      const childCount = 1500;
+      plexApi.getCollectionChildren.mockResolvedValue(
+        Array.from({ length: childCount }, (_, index) =>
+          createPlexLibraryItem('movie', {
+            ratingKey: `movie-${index}`,
+            Guid: undefined,
+          }),
+        ),
+      );
+      plexApi.getMetadataBatch.mockImplementation(async (keys: string[]) =>
+        keys.map((ratingKey) =>
+          createPlexMetadata({
+            ratingKey,
+            type: 'movie',
+            Guid: [{ id: 'tmdb://321' }],
+          }),
+        ),
+      );
+
+      const children = await service.getCollectionChildren('col123');
+
+      expect(plexApi.getMetadataBatch.mock.calls.length).toBeGreaterThan(1);
+      expect(children.every((child) => child.providerIds.tmdb.length > 0)).toBe(
+        true,
+      );
+    });
+
+    // Plex sends no rating at all on an episode or season listing row and puts
+    // the audience score in Rating[], which only the per-item read returns. The
+    // rating sort compares it, so it has to survive the merge.
+    it('takes the ratings the listing row does not carry', async () => {
+      plexApi.getCollectionChildren.mockResolvedValue([
+        createPlexLibraryItem('episode', {
+          ratingKey: 'episode-1',
+          Guid: undefined,
+          rating: undefined,
+          audienceRating: undefined,
+        }),
+      ]);
+      plexApi.getMetadataBatch.mockResolvedValue([
+        createPlexMetadata({
+          ratingKey: 'episode-1',
+          type: 'episode',
+          Guid: [{ id: 'tmdb://321' }],
+          Rating: [
+            { image: 'imdb://image.rating', value: 6.5, type: 'audience' },
+          ],
+        }),
+      ]);
+
+      const children = await service.getCollectionChildren('col123');
+
+      expect(children[0].ratings).toEqual([
+        { source: 'imdb://image.rating', value: 6.5, type: 'audience' },
+      ]);
+    });
+
+    // A movie listing row carries audienceRating, and the metadata read dedupes
+    // Rating[] by type behind it, so the listing value must not be replaced.
+    it('keeps the rating the listing row already carried', async () => {
       plexApi.getCollectionChildren.mockResolvedValue([
         createPlexLibraryItem('movie', {
           ratingKey: 'movie-1',
           Guid: undefined,
+          audienceRating: 5.4,
         }),
       ]);
-      plexApi.getMetadata.mockResolvedValue(undefined);
+      plexApi.getMetadataBatch.mockResolvedValue([
+        createPlexMetadata({
+          ratingKey: 'movie-1',
+          type: 'movie',
+          Guid: [{ id: 'tmdb://321' }],
+          audienceRating: 5.4,
+        }),
+      ]);
 
       const children = await service.getCollectionChildren('col123');
 
-      expect(children[0].id).toBe('movie-1');
+      expect(children[0].ratings).toEqual([
+        { source: 'audience', value: 5.4, type: 'audience' },
+      ]);
+    });
+
+    it('keeps the listing entry, and only its ids change, when a lookup resolves', async () => {
+      plexApi.getCollectionChildren.mockResolvedValue([
+        createPlexLibraryItem('episode', {
+          ratingKey: 'episode-1',
+          Guid: undefined,
+          librarySectionID: 7,
+          librarySectionTitle: 'Shows',
+          grandparentTitle: 'Sample Series',
+        }),
+      ]);
+      plexApi.getMetadataBatch.mockResolvedValue([
+        createPlexMetadata({
+          ratingKey: 'episode-1',
+          type: 'episode',
+          Guid: [{ id: 'tmdb://321' }],
+        }),
+      ]);
+
+      const children = await service.getCollectionChildren('col123');
+
+      expect(children[0].providerIds.tmdb).toEqual(['321']);
+      expect(children[0].grandparentTitle).toBe('Sample Series');
+      expect(children[0].library).toEqual({ id: '7', title: 'Shows' });
+    });
+
+    it('counts the children Plex holds no ids for instead of logging each one', async () => {
+      plexApi.getCollectionChildren.mockResolvedValue([
+        createPlexLibraryItem('episode', {
+          ratingKey: 'episode-1',
+          Guid: undefined,
+        }),
+        createPlexLibraryItem('episode', {
+          ratingKey: 'episode-2',
+          Guid: undefined,
+        }),
+      ]);
+      // An item answered with no ids counts the same as one never answered for.
+      plexApi.getMetadataBatch.mockResolvedValue([
+        createPlexMetadata({
+          ratingKey: 'episode-1',
+          type: 'episode',
+          Guid: undefined,
+        }),
+      ]);
+
+      const children = await service.getCollectionChildren('col123');
+
+      expect(children[0].id).toBe('episode-1');
       expect(children[0].providerIds.tmdb).toEqual([]);
       expect(children[0].providerIds.tvdb).toEqual([]);
       expect(children[0].providerIds.imdb).toEqual([]);
+      expect(logger.debug).toHaveBeenCalledWith(
+        'No external ids resolved for 2 of 2 children of Plex collection col123',
+      );
+      expect(logger.debug).toHaveBeenCalledTimes(1);
     });
 
     it('propagates enumeration failures so callers never mistake a failed read for an empty collection', async () => {
@@ -884,7 +1097,7 @@ describe('PlexAdapterService', () => {
 
       await expect(
         service.addBatchToCollection('col123', ['good', 'good-2']),
-      ).resolves.toEqual([]);
+      ).resolves.toEqual({ refused: [], unknown: [] });
 
       expect(plexApi.addChildrenToCollection).toHaveBeenCalledWith('col123', [
         'good',
@@ -896,13 +1109,13 @@ describe('PlexAdapterService', () => {
     it('should fall back to per-item adds when a Plex batch add fails', async () => {
       plexApi.addChildrenToCollection.mockResolvedValue({
         status: 'NOK',
-        code: 0,
+        code: 400,
         message: 'batch failed',
       } as any);
       plexApi.addChildToCollection.mockImplementation(
         async (collectionId, itemId) => {
           if (itemId === 'bad') {
-            throw new Error('boom');
+            return { status: 'NOK', code: 400, message: 'nope' } as any;
           }
 
           return { status: 'OK' } as any;
@@ -911,7 +1124,7 @@ describe('PlexAdapterService', () => {
 
       await expect(
         service.addBatchToCollection('col123', ['good', 'bad', 'good-2']),
-      ).resolves.toEqual(['bad']);
+      ).resolves.toEqual({ refused: ['bad'], unknown: [] });
 
       expect(plexApi.addChildrenToCollection).toHaveBeenCalledWith('col123', [
         'good',
@@ -920,7 +1133,7 @@ describe('PlexAdapterService', () => {
       ]);
       expect(plexApi.addChildToCollection).toHaveBeenCalledTimes(3);
       expect(logger.warn).toHaveBeenCalledWith(
-        'Plex batch add fallback left 1 failed item(s) for collection col123',
+        'Plex add to collection col123: 1 refused, 0 unconfirmed',
       );
       expect(logger.error).not.toHaveBeenCalled();
       expect(logger.debug).not.toHaveBeenCalled();
@@ -936,32 +1149,73 @@ describe('PlexAdapterService', () => {
 
       await expect(
         service.addBatchToCollection('col123', ['good', 'good-2']),
-      ).resolves.toEqual([]);
+      ).resolves.toEqual({ refused: [], unknown: [] });
 
       expect(logger.warn).not.toHaveBeenCalled();
       expect(logger.error).not.toHaveBeenCalled();
       expect(logger.debug).not.toHaveBeenCalled();
     });
 
+    it('reports an unanswered batch add as unconfirmed, without retrying per item', async () => {
+      // code 0 is plexApi's "nothing came back". Plex commits a collection write
+      // it has begun processing and can answer late, so this is not a refusal -
+      // and re-issuing the ids one at a time only spends another timeout each.
+      plexApi.addChildrenToCollection.mockResolvedValue({
+        status: 'NOK',
+        code: 0,
+        message: 'timeout of 30000ms exceeded',
+      } as any);
+
+      await expect(
+        service.addBatchToCollection('col123', ['good', 'good-2']),
+      ).resolves.toEqual({ refused: [], unknown: ['good', 'good-2'] });
+
+      expect(plexApi.addChildToCollection).not.toHaveBeenCalled();
+    });
+
+    it('treats a 5xx batch add as unconfirmed rather than refused', async () => {
+      // The server broke while handling the write, which says nothing about
+      // whether it applied.
+      plexApi.addChildrenToCollection.mockResolvedValue({
+        status: 'NOK',
+        code: 500,
+        message: 'server error',
+      } as any);
+
+      await expect(
+        service.addBatchToCollection('col123', ['good']),
+      ).resolves.toEqual({ refused: [], unknown: ['good'] });
+
+      expect(plexApi.addChildToCollection).not.toHaveBeenCalled();
+    });
+
+    it('reports an unanswered removal as unconfirmed', async () => {
+      plexApi.deleteChildFromCollection.mockResolvedValue({
+        status: 'NOK',
+        code: 0,
+        message: 'timeout of 30000ms exceeded',
+      } as any);
+
+      await expect(
+        service.removeBatchFromCollection('col123', ['good']),
+      ).resolves.toEqual({ refused: [], unknown: ['good'] });
+    });
+
     it('should treat 404 removes as successful in batch remove', async () => {
       plexApi.deleteChildFromCollection.mockImplementation(
         async (collectionId, itemId) => {
           if (itemId === 'missing') {
-            throw new Error(
-              'DELETE /library/collections/col123/items/missing failed with exception: response code: 404',
-            );
+            return { status: 'NOK', code: 404, message: 'not found' } as any;
           }
 
           if (itemId === 'bad') {
-            throw new Error('boom');
+            return { status: 'NOK', code: 0, message: 'no answer' } as any;
           }
 
-          // A ratingKey can contain 404 without the request having 404'd, and
-          // the failure message carries the request URL.
+          // Read from the status Plex answered with, so a ratingKey that merely
+          // contains 404 can never be mistaken for a 404 response.
           if (itemId === '1404') {
-            throw new Error(
-              'DELETE /library/collections/col123/items/1404 failed with exception: response code: 500',
-            );
+            return { status: 'NOK', code: 500, message: 'server error' } as any;
           }
 
           return { status: 'OK' } as any;
@@ -975,7 +1229,7 @@ describe('PlexAdapterService', () => {
           'bad',
           '1404',
         ]),
-      ).resolves.toEqual(['bad', '1404']);
+      ).resolves.toEqual({ refused: [], unknown: ['bad', '1404'] });
     });
 
     it('should default optional visibility flags to false', async () => {

@@ -1,5 +1,8 @@
 import { Mocked, TestBed } from '@suites/unit';
-import { createMediaItem, createRulesDto } from '../../../../test/utils/data';
+import {
+  createMediaItem,
+  createRuleGroupDto,
+} from '../../../../test/utils/data';
 import { MediaServerFactory } from '../../api/media-server/media-server.factory';
 import { IMediaServerService } from '../../api/media-server/media-server.interface';
 import { ServarrService } from '../../api/servarr-api/servarr.service';
@@ -60,7 +63,7 @@ describe('SportarrGetterService', () => {
     });
 
   const ruleGroup = () =>
-    createRulesDto({
+    createRuleGroupDto({
       dataType: 'show',
       collection: { title: 'F1', sportarrSettingsId: 1 } as any,
     });
@@ -70,26 +73,59 @@ describe('SportarrGetterService', () => {
       0,
       showItem(),
       'show',
-      createRulesDto({ collection: {} as any }),
+      createRuleGroupDto({ collection: {} as any }),
     );
     expect(result).toBeNull();
   });
 
-  it('fails closed (undefined) when no Sportarr id can be resolved', async () => {
-    // An empty resolution can't distinguish "no alias on the item" from a
-    // transient media-server failure, so it must not read as definitive
-    // absence (same reasoning as the Sonarr getter, #3307).
+  it('fails closed (undefined) when the show metadata read fails', async () => {
+    // The alias is unknown rather than absent, so it must not read as
+    // definitive absence (same reasoning as the Sonarr getter, #3307).
+    mockMediaServer.getMetadata.mockResolvedValue(undefined);
+
     const result = await service.get(
       0,
       createMediaItem({ type: 'show', providerIds: { tvdb: ['342040'] } }),
       'show',
       ruleGroup(),
     );
+
     expect(result).toBeUndefined();
     expect(mockClient.getLeagueByExternalId).not.toHaveBeenCalled();
   });
 
-  it('finds the alias when it is not the first tvdb provider id', async () => {
+  // An ordinary show in a sports library carries no alias, but a definitive
+  // answer would let it match NOT_EXISTS rules - so it stays transient and only
+  // the log level changes.
+  it('stays transient when the show reads fine but carries no league alias', async () => {
+    mockMediaServer.getMetadata.mockResolvedValue(
+      createMediaItem({ type: 'show', providerIds: { tvdb: ['342040'] } }),
+    );
+
+    const result = await service.get(
+      0,
+      createMediaItem({ type: 'show', providerIds: { tvdb: ['342040'] } }),
+      'show',
+      ruleGroup(),
+    );
+
+    expect(result).toBeUndefined();
+    expect(mockClient.getLeagueByExternalId).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    // A show refreshed since the agents stamp their own namespace carries the
+    // native id, and it wins over a conflicting alias.
+    {
+      name: 'the native sportarr id',
+      providerIds: { sportarr: [F1_EXTERNAL_ID], tvdb: ['900000999'] },
+    },
+    // An agent-matched item can carry a real TVDB id ahead of the alias.
+    {
+      name: 'the alias behind a real tvdb id',
+      providerIds: { tvdb: ['342040', F1_ALIAS] },
+    },
+  ])('resolves the league from $name', async ({ providerIds }) => {
     mockClient.getLeagueByExternalId.mockResolvedValue({
       id: 3,
       externalId: F1_EXTERNAL_ID,
@@ -98,19 +134,18 @@ describe('SportarrGetterService', () => {
       added: '2025-12-04T02:29:15.000Z',
     });
 
-    // An agent-matched item can carry a real TVDB id ahead of the alias.
     const result = await service.get(
       1,
-      showItem({ providerIds: { tvdb: ['342040', F1_ALIAS] } }),
+      showItem({ providerIds }),
       'show',
       ruleGroup(),
     );
 
+    expect(result).toBe(true);
     expect(mockClient.getLeagueByExternalId).toHaveBeenCalledWith(
       F1_EXTERNAL_ID,
       expect.any(Array),
     );
-    expect(result).toBe(true);
   });
 
   it('resolves the league by the reversed alias and returns addDate', async () => {

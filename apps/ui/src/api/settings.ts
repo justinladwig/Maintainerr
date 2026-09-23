@@ -1,6 +1,9 @@
+import { t } from '@lingui/core/macro'
 import {
   BasicResponseDto,
   DownloadClientSetting,
+  DownloadClientSettingResponse,
+  DownloadClientType,
   EmbySetting,
   JellyfinSetting,
   MediaServerSwitchPreview,
@@ -9,6 +12,9 @@ import {
   MetadataProviderSetting,
   SwitchMediaServerRequest,
   SwitchMediaServerResponse,
+  TelemetryPing,
+  TelemetrySetting,
+  TelemetryStatus,
 } from '@maintainerr/contracts'
 import {
   useMutation,
@@ -61,7 +67,11 @@ export interface ISettings {
   tautulli_url: string
   tautulli_api_key: string
   streamystats_url?: string
-  // Download client integration (currently qBittorrent)
+  tracearr_url?: string
+  tracearr_api_key?: string
+  tracearr_server_id?: string
+  // Download client integration
+  download_client_type?: DownloadClientType | null
   download_client_url?: string
   download_client_username?: string
   download_client_password?: string
@@ -77,6 +87,7 @@ export interface ISettings {
   sonarr_tag_exclusions?: boolean
   sonarr_exclusion_tag?: string
   sonarr_untag_on_unexclude?: boolean
+  telemetryEnabled?: boolean | null
 }
 
 // Jellyfin test result (not in contracts as it's UI-specific)
@@ -301,9 +312,15 @@ export const usePlexAuthValidation = (
       return {
         valid: false,
         unreachable: result.unreachable === true,
+        // No invented message when plex.tv simply could not be reached: the
+        // saved token may be perfectly good, and claiming the credentials are
+        // invalid sends people off to re-authenticate for nothing. Leaving it
+        // unset lets the caller show its softer "still retrying" wording.
         errorMessage:
           result.message ||
-          'Stored Plex credentials are invalid. Re-authenticate with Plex.',
+          (result.unreachable
+            ? undefined
+            : t`Stored Plex credentials are invalid. Re-authenticate with Plex.`),
       }
     },
     staleTime: 0,
@@ -443,7 +460,7 @@ export const useSaveJellyfinSettings = (
 
       return assertSettingsMutationSucceeded(
         response,
-        'Jellyfin settings could not be updated',
+        t`Jellyfin settings could not be updated`,
       )
     },
     onSuccess: () => {
@@ -477,7 +494,7 @@ export const useDeleteJellyfinSettings = (
 
       return assertSettingsMutationSucceeded(
         response,
-        'Jellyfin settings could not be updated',
+        t`Jellyfin settings could not be updated`,
       )
     },
     onSuccess: () => {
@@ -494,16 +511,16 @@ export type UseDeleteJellyfinSettingsResult = ReturnType<
 >
 
 // --------------------------------------------------------------------------
-// Download client (currently qBittorrent)
+// Download client
 // --------------------------------------------------------------------------
 
 type UseDownloadClientSettingsQueryKey = ['settings', 'download-client']
 
 type UseDownloadClientSettingsOptions = Omit<
   UseQueryOptions<
-    DownloadClientSetting,
+    DownloadClientSettingResponse,
     Error,
-    DownloadClientSetting,
+    DownloadClientSettingResponse,
     UseDownloadClientSettingsQueryKey
   >,
   'queryKey' | 'queryFn'
@@ -513,14 +530,14 @@ export const useDownloadClientSettings = (
   options?: UseDownloadClientSettingsOptions,
 ) => {
   return useQuery<
-    DownloadClientSetting,
+    DownloadClientSettingResponse,
     Error,
-    DownloadClientSetting,
+    DownloadClientSettingResponse,
     UseDownloadClientSettingsQueryKey
   >({
     queryKey: ['settings', 'download-client'],
     queryFn: async () => {
-      return await GetApiHandler<DownloadClientSetting>(
+      return await GetApiHandler<DownloadClientSettingResponse>(
         `/settings/download-client`,
       )
     },
@@ -577,7 +594,7 @@ export const useSaveDownloadClientSettings = (
 
       return assertSettingsMutationSucceeded(
         response,
-        'Download client settings could not be updated',
+        t`Download client settings could not be updated`,
       )
     },
     onSuccess: () => {
@@ -618,7 +635,7 @@ export const useDeleteDownloadClientSettings = (
 
       return assertSettingsMutationSucceeded(
         response,
-        'Download client settings could not be updated',
+        t`Download client settings could not be updated`,
       )
     },
     onSuccess: () => {
@@ -702,7 +719,7 @@ export const useSaveEmbySettings = (options?: UseSaveEmbySettingsOptions) => {
 
       return assertSettingsMutationSucceeded(
         response,
-        'Emby settings could not be updated',
+        t`Emby settings could not be updated`,
       )
     },
     onSuccess: () => {
@@ -734,7 +751,7 @@ export const useDeleteEmbySettings = (
 
       return assertSettingsMutationSucceeded(
         response,
-        'Emby settings could not be updated',
+        t`Emby settings could not be updated`,
       )
     },
     onSuccess: () => {
@@ -904,6 +921,92 @@ export const useUpdateMetadataProviderPreference = (
 
 export type UseUpdateMetadataProviderPreferenceResult = ReturnType<
   typeof useUpdateMetadataProviderPreference
+>
+
+type UseTelemetryPreviewQueryKey = ['settings', 'telemetry', 'preview']
+
+type UseTelemetryPreviewOptions = Omit<
+  UseQueryOptions<
+    TelemetryPing,
+    Error,
+    TelemetryPing,
+    UseTelemetryPreviewQueryKey
+  >,
+  'queryKey' | 'queryFn'
+>
+
+/**
+ * The exact ping this server would send, sample block included. There is no
+ * send-now endpoint on purpose: every real post increments the census, so a
+ * test button would let an instance inflate the instance count. This preview
+ * is the verification mechanism.
+ */
+export const useTelemetryPreview = (options?: UseTelemetryPreviewOptions) => {
+  return useQuery<
+    TelemetryPing,
+    Error,
+    TelemetryPing,
+    UseTelemetryPreviewQueryKey
+  >({
+    queryKey: ['settings', 'telemetry', 'preview'],
+    queryFn: async () => {
+      return await GetApiHandler<TelemetryPing>('/settings/telemetry/preview')
+    },
+    staleTime: 0,
+    ...options,
+  })
+}
+
+export const useTelemetryStatus = (options?: { enabled?: boolean }) => {
+  return useQuery<TelemetryStatus, Error, TelemetryStatus, string[]>({
+    queryKey: ['settings', 'telemetry', 'status'],
+    queryFn: async () => {
+      return await GetApiHandler<TelemetryStatus>('/settings/telemetry/status')
+    },
+    staleTime: 0,
+    ...options,
+  })
+}
+
+export type UseTelemetryPreviewResult = ReturnType<typeof useTelemetryPreview>
+
+type UseUpdateTelemetrySettingOptions = Omit<
+  UseMutationOptions<BasicResponseDto, Error, boolean>,
+  'mutationFn' | 'mutationKey' | 'onSuccess'
+>
+
+export const useUpdateTelemetrySetting = (
+  options?: UseUpdateTelemetrySettingOptions,
+) => {
+  const queryClient = useQueryClient()
+
+  return useMutation<BasicResponseDto, Error, boolean>({
+    mutationKey: ['settings', 'updateTelemetrySetting'],
+    mutationFn: async (enabled) => {
+      const response = await PostApiHandler<BasicResponseDto>(
+        '/settings/telemetry',
+        { enabled } satisfies TelemetrySetting,
+      )
+
+      // A failed write answers 2xx with code 0, so without this the page would
+      // report a save that did not happen.
+      if (response?.code !== 1) {
+        throw new Error(response?.message ?? 'Failed to update telemetry')
+      }
+
+      return response
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: ['settings'] satisfies UseSettingsQueryKey,
+      })
+    },
+    ...options,
+  })
+}
+
+export type UseUpdateTelemetrySettingResult = ReturnType<
+  typeof useUpdateTelemetrySetting
 >
 
 export const downloadDatabase = async (

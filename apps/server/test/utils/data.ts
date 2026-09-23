@@ -40,10 +40,11 @@ import { IMetadataProvider } from '../../src/modules/metadata/interfaces/metadat
 import {
   ExternalIdSearchResult,
   MetadataDetails,
+  ProviderIds,
   ResolvedMediaIds,
 } from '../../src/modules/metadata/interfaces/metadata.types';
 import { RuleDto } from '../../src/modules/rules/dtos/rule.dto';
-import { RulesDto } from '../../src/modules/rules/dtos/rules.dto';
+import { RuleGroupDto } from '../../src/modules/rules/dtos/ruleGroup.dto';
 
 export const createCollection = (
   properties: Partial<Collection> = {},
@@ -84,6 +85,7 @@ export const createCollection = (
     sportarrQualityProfileId: undefined,
     tagInArr: false,
     listExclusions: false,
+    keepInMaintainerrOnly: false,
     cleanupLeftoverFolders: false,
     ruleGroup: undefined,
     visibleOnHome: false,
@@ -600,9 +602,9 @@ export const createSonarrEpisodeFile = (
   ...properties,
 });
 
-export const createRulesDto = (
-  properties: Partial<RulesDto> = {},
-): RulesDto => ({
+export const createRuleGroupDto = (
+  properties: Partial<RuleGroupDto> = {},
+): RuleGroupDto => ({
   id: faker.number.int(),
   libraryId: faker.number.int().toString(),
   dataType: faker.helpers.arrayElement([
@@ -670,11 +672,14 @@ export interface MetadataProviderMockConfig {
   name: string;
   idKey: string;
   isAvailable?: boolean;
+  hasReleaseYears?: boolean;
   details?: MetadataDetailsFixture;
   detailsId?: number;
   posterUrl?: string;
   backdropUrl?: string;
   hierarchyOverview?: string;
+  parseId?: (value: string) => number | undefined;
+  isAuthorityFor?: (ids: ProviderIds) => boolean;
   findByExternalId?: (
     externalId: string | number,
     type: string,
@@ -711,11 +716,14 @@ export const createMetadataProviderMock = ({
   name,
   idKey,
   isAvailable = true,
+  hasReleaseYears = true,
   details,
   detailsId,
   posterUrl,
   backdropUrl,
   hierarchyOverview,
+  parseId,
+  isAuthorityFor,
   findByExternalId,
 }: MetadataProviderMockConfig): jest.Mocked<IMetadataProvider> => {
   const resolvedDetails = details
@@ -728,6 +736,7 @@ export const createMetadataProviderMock = ({
   return {
     name,
     idKey,
+    hasReleaseYears,
     isAvailable: jest.fn(() => isAvailable),
     extractId: jest.fn((ids) =>
       typeof ids[idKey] === 'number' ? (ids[idKey] as number) : undefined,
@@ -744,6 +753,8 @@ export const createMetadataProviderMock = ({
       .mockResolvedValue(backdropUrl ?? `https://${idKey}/backdrop.jpg`),
     getHierarchyOverview: jest.fn().mockResolvedValue(hierarchyOverview),
     getPersonDetails: jest.fn(),
+    parseId: jest.fn(parseId ?? ((value: string) => Number(value))),
+    isAuthorityFor: jest.fn(isAuthorityFor ?? (() => false)),
     findByExternalId: jest
       .fn()
       .mockImplementation(findByExternalId ?? (async () => undefined)),

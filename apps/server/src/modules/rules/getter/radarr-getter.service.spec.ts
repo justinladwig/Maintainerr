@@ -8,7 +8,7 @@ import {
   createRadarrMovieFile,
   createRadarrQuality,
   createRuleDto,
-  createRulesDto,
+  createRuleGroupDto,
 } from '../../../../test/utils/data';
 import { RadarrApi } from '../../api/servarr-api/helpers/radarr.helper';
 import { RadarrMovie } from '../../api/servarr-api/interfaces/radarr.interface';
@@ -67,7 +67,7 @@ describe('RadarrGetterService', () => {
       const response = await radarrGetterService.get(
         20,
         mediaItem,
-        createRulesDto({
+        createRuleGroupDto({
           collection: collectionMedia.collection,
           dataType: 'movie',
         }),
@@ -87,7 +87,7 @@ describe('RadarrGetterService', () => {
       const response = await radarrGetterService.get(
         20,
         mediaItem,
-        createRulesDto({
+        createRuleGroupDto({
           collection: collectionMedia.collection,
           dataType: 'movie',
         }),
@@ -105,7 +105,7 @@ describe('RadarrGetterService', () => {
       const response = await radarrGetterService.get(
         20,
         mediaItem,
-        createRulesDto({
+        createRuleGroupDto({
           collection: collectionMedia.collection,
           dataType: 'movie',
         }),
@@ -129,7 +129,7 @@ describe('RadarrGetterService', () => {
       const response = await radarrGetterService.get(
         21,
         mediaItem,
-        createRulesDto({
+        createRuleGroupDto({
           collection: collectionMedia.collection,
           dataType: 'movie',
         }),
@@ -147,7 +147,7 @@ describe('RadarrGetterService', () => {
       const response = await radarrGetterService.get(
         21,
         mediaItem,
-        createRulesDto({
+        createRuleGroupDto({
           collection: collectionMedia.collection,
           dataType: 'movie',
         }),
@@ -167,7 +167,7 @@ describe('RadarrGetterService', () => {
       const response = await radarrGetterService.get(
         22,
         mediaItem,
-        createRulesDto({
+        createRuleGroupDto({
           collection: collectionMedia.collection,
           dataType: 'movie',
         }),
@@ -185,7 +185,7 @@ describe('RadarrGetterService', () => {
       const response = await radarrGetterService.get(
         22,
         mediaItem,
-        createRulesDto({
+        createRuleGroupDto({
           collection: collectionMedia.collection,
           dataType: 'movie',
         }),
@@ -205,7 +205,7 @@ describe('RadarrGetterService', () => {
       const response = await radarrGetterService.get(
         22,
         mediaItem,
-        createRulesDto({
+        createRuleGroupDto({
           collection: collectionMedia.collection,
           dataType: 'movie',
         }),
@@ -245,7 +245,7 @@ describe('RadarrGetterService', () => {
       const response = await radarrGetterService.get(
         23,
         mediaItem,
-        createRulesDto({
+        createRuleGroupDto({
           collection: collectionMedia.collection,
           dataType: 'movie',
         }),
@@ -274,7 +274,7 @@ describe('RadarrGetterService', () => {
       const response = await radarrGetterService.get(
         24,
         mediaItem,
-        createRulesDto({
+        createRuleGroupDto({
           collection: collectionMedia.collection,
           dataType: 'movie',
         }),
@@ -306,7 +306,7 @@ describe('RadarrGetterService', () => {
       radarrGetterService.get(
         0,
         mediaItem,
-        createRulesDto({
+        createRuleGroupDto({
           collection: collectionMedia.collection,
           dataType: 'movie',
         }),
@@ -328,15 +328,30 @@ describe('RadarrGetterService', () => {
       await expect(callAddDate()).resolves.toBeNull();
     });
 
-    it('returns undefined (fail closed) when no external ids resolve', async () => {
-      // Empty resolution also covers a transient TMDB/TVDB validation
-      // failure, so it must stay transient (#3307).
+    it('returns undefined (fail closed) when the lookup fails for an item that has ids', async () => {
+      // The item has something to look up, so an empty resolution may be a
+      // transient TMDB/TVDB validation failure and must stay transient (#3307).
       mockRadarrApi();
+      metadataService.hasExternalIds.mockReturnValue(true);
       metadataService.resolveLookupCandidatesFromMediaItemForService.mockResolvedValue(
         [],
       );
 
       await expect(callAddDate()).resolves.toBeUndefined();
+    });
+
+    // "We could not look it up" is not "it is not there": a definitive answer
+    // would let unmatched items and personal media match NOT_EXISTS rules. Only
+    // the log level changes.
+    it('stays transient, and logs quietly, when the item carries no external ids', async () => {
+      mockRadarrApi();
+      metadataService.hasExternalIds.mockReturnValue(false);
+      metadataService.resolveLookupCandidatesFromMediaItemForService.mockResolvedValue(
+        [],
+      );
+
+      await expect(callAddDate()).resolves.toBeUndefined();
+      expect(logger.warn).not.toHaveBeenCalled();
     });
   });
 
@@ -355,7 +370,7 @@ describe('RadarrGetterService', () => {
       radarrGetterService.get(
         propertyId,
         mediaItem,
-        createRulesDto({
+        createRuleGroupDto({
           collection: collectionMedia.collection,
           dataType: 'movie',
         }),
@@ -409,7 +424,7 @@ describe('RadarrGetterService', () => {
       radarrGetterService.get(
         25,
         mediaItem,
-        createRulesDto({
+        createRuleGroupDto({
           collection: collectionMedia.collection,
           dataType: 'movie',
         }),

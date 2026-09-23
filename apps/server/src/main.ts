@@ -2,10 +2,12 @@ import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { setupGracefulShutdown } from '@tygra/nestjs-graceful-shutdown';
+import compression from 'compression';
 import * as fs from 'fs';
 import { cleanupOpenApiDoc } from 'nestjs-zod';
 import path from 'path';
 import { AppModule } from './app/app.module';
+import { resolveCorsOptions } from './app/config/cors';
 import { dataDir } from './app/config/dataDir';
 import { MaintainerrLogger } from './modules/logging/logs.service';
 import { installStdioPipeGuards } from './modules/logging/winston/stdioPipeGuard';
@@ -23,6 +25,12 @@ async function bootstrap() {
   });
 
   setupGracefulShutdown({ app });
+
+  // The UI bundle is served by this process and monaco alone is several MB, so
+  // without this every asset goes out uncompressed. Registered before the
+  // modules initialise so it also wraps ServeStaticModule. The SSE endpoints
+  // are unaffected: they send Cache-Control: no-transform, which this skips.
+  app.use(compression());
 
   const basePathEnv = process.env.BASE_PATH?.trim();
   if (basePathEnv && basePathEnv !== '/') {
@@ -48,7 +56,11 @@ async function bootstrap() {
   SwaggerModule.setup('api/swagger', app, document);
 
   app.useLogger(await app.resolve(MaintainerrLogger));
-  app.enableCors({ origin: true });
+
+  const corsOptions = resolveCorsOptions();
+  if (corsOptions) {
+    app.enableCors(corsOptions);
+  }
 
   if (!isSharpAvailable) {
     const sharpLogger = await app.resolve(MaintainerrLogger);
@@ -71,7 +83,7 @@ function createDataDirectoryStructure() {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, {
         recursive: true,
-        mode: 0o777,
+        mode: 0o755,
       });
     }
 
@@ -80,7 +92,7 @@ function createDataDirectoryStructure() {
     for (const name of ['overlays/fonts', 'overlays/images']) {
       const overlayDir = path.join(dataDir, name);
       if (!fs.existsSync(overlayDir)) {
-        fs.mkdirSync(overlayDir, { recursive: true, mode: 0o777 });
+        fs.mkdirSync(overlayDir, { recursive: true, mode: 0o755 });
       }
     }
 

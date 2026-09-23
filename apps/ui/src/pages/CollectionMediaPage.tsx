@@ -1,15 +1,26 @@
-import { type MediaItem } from '@maintainerr/contracts'
+import { useLingui } from '@lingui/react/macro'
+import {
+  MediaServerFeature,
+  supportsFeature,
+  type MediaItem,
+} from '@maintainerr/contracts'
 import { useCallback, useRef, useState } from 'react'
 import { useOutletContext, useParams } from 'react-router-dom'
 import type { ICollectionMedia } from '../components/Collection'
-import CollectionDetailControlRow from '../components/Collection/CollectionDetail/CollectionDetailControlRow'
+import { invalidateMaintainerrStatusDetails } from '../components/Common/MediaCard/maintainerrStatus'
+import MediaSelectionActions from '../components/Common/MediaSelectionActions'
+import type { MediaActionOutcome } from '../components/Common/MediaActionModal'
 import {
   getCollectionMediaSortConfig,
   MediaLibrarySortControl,
   useMediaLibrarySort,
 } from '../components/Common/MediaLibrarySortControl'
+import PageControlRow from '../components/Common/PageControlRow'
 import OverviewContent from '../components/Overview/Content'
 import useInfinitePaginatedList from '../hooks/useInfinitePaginatedList'
+import useMediaSelection from '../hooks/useMediaSelection'
+import { useMediaServerType } from '../hooks/useMediaServerType'
+import { reportBulkOutcome } from '../utils/bulkOutcome'
 import type { CollectionDetailOutletContext } from './CollectionDetailPage'
 import GetApiHandler from '../utils/ApiHandler'
 
@@ -29,16 +40,27 @@ export const mapCollectionMediaItemsToMediaData = (
 }
 
 const CollectionMediaPage = () => {
-  const { collection, canTestMedia, openMediaTestModal } =
-    useOutletContext<CollectionDetailOutletContext>()
+  const { t } = useLingui()
+  const { collection } = useOutletContext<CollectionDetailOutletContext>()
   const { id } = useParams<{ id: string }>()
   const [media, setMedia] = useState<ICollectionMedia[]>([])
+  const { mediaServerType } = useMediaServerType()
+  const {
+    selectionMode,
+    selectedIds,
+    toggleSelection,
+    toggleSelectionMode,
+    applyBulkOutcome,
+    resetSelection,
+  } = useMediaSelection()
   const fetchAmount = 30
   const mediaRef = useRef<ICollectionMedia[]>([])
   const libraryType = collection.type === 'movie' ? 'movie' : 'show'
   const sortConfig = getCollectionMediaSortConfig(
     libraryType,
     collection.deleteAfterDays != null,
+    supportsFeature(mediaServerType, MediaServerFeature.LIBRARY_STUDIO_SORT),
+    true,
   )
   const { sortValue, sortParams, onSortChange } =
     useMediaLibrarySort(sortConfig)
@@ -111,46 +133,89 @@ const CollectionMediaPage = () => {
       return
     }
 
+    // A selection made against the previous item set must never survive into
+    // the next one - same contract as the Overview sync.
+    resetSelection()
     resetAndLoad({
       fetchPage: (page) =>
         fetchCollectionMediaPage(page, nextSortState.sortParams),
     })
   }
 
+  const removeMediaItem = (mediaServerId: string) => {
+    updateData((currentData) =>
+      currentData.filter((item) => item.id !== mediaServerId),
+    )
+    updateMedia((currentMedia) =>
+      currentMedia.filter((item) => item.mediaServerId !== mediaServerId),
+    )
+  }
+
+  const handleBulkOutcome = (outcome: MediaActionOutcome) => {
+    const { action, collectionId, succeededIds, failedIds } = outcome
+    applyBulkOutcome(new Set(failedIds))
+
+    for (const mediaServerId of succeededIds) {
+      invalidateMaintainerrStatusDetails(mediaServerId)
+    }
+
+    // Removing and excluding both drop membership, but only from the collection
+    // they were aimed at: an undefined id means every collection, so it reaches
+    // this one too. Aimed elsewhere, this grid is unchanged.
+    const leavesThisCollection =
+      (action === 'exclusion-add' || action === 'collection-remove') &&
+      (collectionId === undefined || collectionId === collection.id)
+
+    if (leavesThisCollection) {
+      for (const mediaServerId of succeededIds) {
+        removeMediaItem(mediaServerId)
+      }
+    }
+
+    reportBulkOutcome(outcome)
+  }
+
   const showRefreshing = isLoading && data.length > 0
 
   return (
     <div className="w-full">
-      <CollectionDetailControlRow
-        canTestMedia={canTestMedia}
-        onOpenTestMedia={openMediaTestModal}
-      >
-        <MediaLibrarySortControl
-          ariaLabel="Sort collection items"
-          options={sortConfig.options}
-          value={sortValue}
-          onSortChange={handleSortChange}
-          isLoading={showRefreshing}
-        />
-      </CollectionDetailControlRow>
+      <PageControlRow
+        sticky
+        actionsClassName="justify-center sm:justify-start"
+        actions={
+          <MediaSelectionActions
+            selectionMode={selectionMode}
+            onToggleSelectionMode={toggleSelectionMode}
+            selectedIds={selectedIds}
+            items={data}
+            libraryId={collection.libraryId}
+            defaultCollectionId={collection.id}
+            onSubmitted={handleBulkOutcome}
+          />
+        }
+        controls={
+          <MediaLibrarySortControl
+            ariaLabel={t`Sort collection items`}
+            options={sortConfig.options}
+            value={sortValue}
+            onSortChange={handleSortChange}
+            isLoading={showRefreshing}
+          />
+        }
+      />
 
       <OverviewContent
         dataFinished={true}
         fetchData={() => {}}
         loading={isLoading}
         data={data}
-        libraryId={collection.libraryId}
         collection={collection}
         collectionPage={true}
         extrasLoading={isLoadingExtra && !isLoading && hasMoreData}
-        onRemove={(id: string) => {
-          updateData((currentData) =>
-            currentData.filter((item) => item.id !== id),
-          )
-          updateMedia((currentMedia) =>
-            currentMedia.filter((item) => item.mediaServerId !== id),
-          )
-        }}
+        selectionMode={selectionMode}
+        selectedMediaIds={selectedIds}
+        onToggleSelection={toggleSelection}
+        onRemove={removeMediaItem}
         onItemPostponed={(id: string, addDate: string) => {
           // Patch the local addDate so the "days left" badge reflects the new
           // deletion date immediately, without refetching the page.

@@ -10,7 +10,6 @@ import {
   createCollectionMedia,
 } from '../../../test/utils/data';
 import { MaintainerrLogger } from '../logging/logs.service';
-import { RuleExecutorJobManagerService } from '../rules/tasks/rule-executor-job-manager.service';
 import {
   ExecutionLockService,
   RULES_COLLECTIONS_EXECUTION_LOCK_KEY,
@@ -40,6 +39,7 @@ describe('CollectionsController', () => {
     getCollectionRecord: jest.fn(),
     getCollectionMediaRecord: jest.fn(),
     MediaCollectionActionWithContext: jest.fn(),
+    bulkMediaCollectionAction: jest.fn(),
     postponeCollectionMedia: jest.fn(),
     logPostponedCollectionMedia: jest.fn(),
   } as unknown as jest.Mocked<CollectionsService>;
@@ -49,13 +49,10 @@ describe('CollectionsController', () => {
     execute: jest.fn(),
   } as unknown as jest.Mocked<CollectionWorkerService>;
 
-  const ruleExecutorJobManagerService = {
-    isProcessing: jest.fn(),
-  } as unknown as jest.Mocked<RuleExecutorJobManagerService>;
-
   const executionLock = {
     tryAcquire: jest.fn(),
     acquireWithin: jest.fn(),
+    isRuleQueueProcessing: jest.fn(),
   } as unknown as jest.Mocked<ExecutionLockService>;
 
   const collectionHandler = {
@@ -79,7 +76,6 @@ describe('CollectionsController', () => {
     controller = new CollectionsController(
       collectionsService,
       collectionWorkerService,
-      ruleExecutorJobManagerService,
       executionLock,
       collectionHandler,
       collectionPosterService,
@@ -87,7 +83,7 @@ describe('CollectionsController', () => {
     );
 
     collectionWorkerService.isRunning.mockReturnValue(false);
-    ruleExecutorJobManagerService.isProcessing.mockReturnValue(false);
+    executionLock.isRuleQueueProcessing.mockReturnValue(false);
     executionLock.tryAcquire.mockReturnValue(jest.fn());
     collectionPosterService.pushToMediaServer.mockResolvedValue({
       attempted: true,
@@ -271,6 +267,21 @@ describe('CollectionsController', () => {
       ).rejects.toThrow('refused 1 of 1');
     });
 
+    it('reports an add the media server never answered for', async () => {
+      // Not a refusal: the write may or may not have landed. Answering 201 is
+      // the false success #3383 removed.
+      collectionsService.MediaCollectionActionWithContext.mockResolvedValue({
+        collection: createCollection(),
+        serverRejectedIds: [],
+        serverUnconfirmedIds: ['10'],
+        resolvedCount: 1,
+      });
+
+      await expect(
+        controller.ManualActionOnCollection(addRequest),
+      ).rejects.toThrow('did not answer for 1 of 1');
+    });
+
     it('reports a context that resolves to nothing', async () => {
       collectionsService.MediaCollectionActionWithContext.mockResolvedValue({
         collection: createCollection(),
@@ -294,6 +305,67 @@ describe('CollectionsController', () => {
       await expect(
         controller.ManualActionOnCollection(addRequest),
       ).resolves.toBe(collection);
+    });
+  });
+
+  describe('bulkMediaCollectionAction', () => {
+    it('delegates the selection and returns per-item results', async () => {
+      const response = {
+        results: [
+          { mediaId: '10', code: 1 as const },
+          { mediaId: '11', code: 0 as const, message: 'Failed' },
+        ],
+      };
+      collectionsService.bulkMediaCollectionAction.mockResolvedValue(response);
+
+      await expect(
+        controller.bulkMediaCollectionAction({
+          mediaIds: ['10', '11'],
+          collectionId: 7,
+          action: 0,
+          mediaType: 'movie',
+        }),
+      ).resolves.toEqual(response);
+      expect(collectionsService.bulkMediaCollectionAction).toHaveBeenCalledWith(
+        ['10', '11'],
+        7,
+        'add',
+        'movie',
+        undefined,
+      );
+    });
+
+    it('removes from every collection when none is named', async () => {
+      collectionsService.bulkMediaCollectionAction.mockResolvedValue({
+        results: [],
+      });
+
+      await controller.bulkMediaCollectionAction({
+        mediaIds: ['10'],
+        action: 1,
+        mediaType: 'movie',
+      });
+
+      expect(collectionsService.bulkMediaCollectionAction).toHaveBeenCalledWith(
+        ['10'],
+        undefined,
+        'remove',
+        'movie',
+        undefined,
+      );
+    });
+
+    it('rejects an add with no collection to add to', async () => {
+      await expect(
+        controller.bulkMediaCollectionAction({
+          mediaIds: ['10'],
+          action: 0,
+          mediaType: 'movie',
+        }),
+      ).rejects.toThrow('A collection is required');
+      expect(
+        collectionsService.bulkMediaCollectionAction,
+      ).not.toHaveBeenCalled();
     });
   });
 
@@ -389,7 +461,7 @@ describe('CollectionsController', () => {
   });
 
   it('rejects item handling while the rule executor is running', async () => {
-    ruleExecutorJobManagerService.isProcessing.mockReturnValue(true);
+    executionLock.isRuleQueueProcessing.mockReturnValue(true);
 
     await expect(
       controller.handleCollectionMedia({

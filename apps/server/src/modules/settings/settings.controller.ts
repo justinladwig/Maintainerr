@@ -1,5 +1,10 @@
 import {
   BasicResponseDto,
+  CronSchedule,
+  cronScheduleSchema,
+  DownloadClientSetting,
+  DownloadClientSettingResponse,
+  downloadClientSettingSchema,
   EmbyLoginRequest,
   embyLoginRequestSchema,
   EmbySetting,
@@ -9,25 +14,36 @@ import {
   MediaServerSwitchPreview,
   MediaServerType,
   MetadataProviderPreference,
-  DownloadClientSetting,
-  downloadClientSettingSchema,
   MetadataProviderSetting,
   metadataProviderSettingSchema,
+  PlexAuthToken,
+  plexAuthTokenSchema,
   RadarrSetting,
   radarrSettingSchema,
   SeerrSetting,
   seerrSettingSchema,
+  SettingsUpdate,
+  settingsUpdateSchema,
   SonarrSetting,
   sonarrSettingSchema,
   SportarrSetting,
   sportarrSettingSchema,
   StreamystatsSetting,
   streamystatsSettingSchema,
+  TracearrConnection,
+  TracearrSetting,
+  TracearrSettingForm,
+  tracearrConnectionSchema,
+  tracearrSettingSchema,
   SwitchMediaServerRequest,
   SwitchMediaServerResponse,
   switchMediaServerSchema,
   TautulliSetting,
   tautulliSettingSchema,
+  TelemetryPing,
+  TelemetrySetting,
+  telemetrySettingSchema,
+  TelemetryStatus,
   TmdbSetting,
   TmdbSettingForm,
   tmdbSettingSchema,
@@ -39,6 +55,7 @@ import {
   Body,
   Controller,
   Delete,
+  BadGatewayException,
   ForbiddenException,
   Get,
   Header,
@@ -55,14 +72,12 @@ import { ApiOperation, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { Response } from 'express';
 import { ZodValidationPipe } from 'nestjs-zod';
 import { DatabaseDownloadService } from './database-download.service';
-import { CronScheduleDto } from "./dto's/cron.schedule.dto";
-import { SettingDto } from "./dto's/setting.dto";
-import { UpdateSettingDto } from "./dto's/update-setting.dto";
 import { Settings } from './entities/settings.entities';
 import { MediaServerSwitchService } from './media-server-switch.service';
 import { MetadataProvider } from './metadata-provider';
 import { MetadataSettingsService } from './metadata-settings.service';
 import { SettingsDataService } from './settings-data.service';
+import { TelemetryService } from '../telemetry/telemetry.service';
 import { SettingsOperationsService } from './settings-operations.service';
 
 @ApiTags('settings')
@@ -74,6 +89,7 @@ export class SettingsController {
     private readonly metadataSettingsService: MetadataSettingsService,
     private readonly mediaServerSwitchService: MediaServerSwitchService,
     private readonly databaseDownloadService: DatabaseDownloadService,
+    private readonly telemetryService: TelemetryService,
   ) {}
 
   @Get()
@@ -124,15 +140,24 @@ export class SettingsController {
     return this.settingsOperationsService.deletePlexApiAuth();
   }
   @Post()
-  updateSettings(@Body() payload: SettingDto) {
+  updateSettings(
+    @Body(new ZodValidationPipe(settingsUpdateSchema))
+    payload: SettingsUpdate,
+  ) {
     return this.settingsOperationsService.updateSettings(payload);
   }
   @Patch()
-  patchSettings(@Body() payload: UpdateSettingDto) {
+  patchSettings(
+    @Body(new ZodValidationPipe(settingsUpdateSchema))
+    payload: SettingsUpdate,
+  ) {
     return this.settingsOperationsService.patchSettings(payload);
   }
   @Post('/plex/token')
-  updateAuthToken(@Body() payload: { plex_auth_token: string }) {
+  updateAuthToken(
+    @Body(new ZodValidationPipe(plexAuthTokenSchema))
+    payload: PlexAuthToken,
+  ) {
     return this.settingsOperationsService.savePlexApiAuthToken(
       payload.plex_auth_token,
     );
@@ -308,9 +333,62 @@ export class SettingsController {
     return this.settingsOperationsService.testStreamystats(payload);
   }
 
+  @Get('/tracearr')
+  async getTracearrSetting(): Promise<TracearrSettingForm | BasicResponseDto> {
+    const settings = await this.settingsOperationsService.getSettings();
+
+    if (!(settings instanceof Settings)) {
+      return settings;
+    }
+
+    return {
+      url: settings.tracearr_url,
+      api_key: settings.tracearr_api_key,
+      server_id: settings.tracearr_server_id,
+    };
+  }
+
+  @Post('/tracearr')
+  async updateTracearrSetting(
+    @Body(new ZodValidationPipe(tracearrSettingSchema))
+    payload: TracearrSetting,
+  ) {
+    return await this.settingsOperationsService.updateTracearrSetting(payload);
+  }
+
+  @Delete('/tracearr')
+  async removeTracearrSetting() {
+    return await this.settingsOperationsService.removeTracearrSetting();
+  }
+
+  @Post('/tracearr/servers')
+  async getTracearrServers(
+    @Body(new ZodValidationPipe(tracearrConnectionSchema))
+    payload: TracearrConnection,
+  ) {
+    const servers =
+      await this.settingsOperationsService.getTracearrServers(payload);
+
+    if (!servers) {
+      throw new BadGatewayException(
+        'Could not load Tracearr servers. Verify URL and API key.',
+      );
+    }
+
+    return servers;
+  }
+
+  @Post('/test/tracearr')
+  testTracearr(
+    @Body(new ZodValidationPipe(tracearrSettingSchema))
+    payload: TracearrSetting,
+  ): Promise<BasicResponseDto> {
+    return this.settingsOperationsService.testTracearr(payload);
+  }
+
   @Get('/download-client')
   async getDownloadClientSetting(): Promise<
-    DownloadClientSetting | BasicResponseDto
+    DownloadClientSettingResponse | BasicResponseDto
   > {
     const settings = await this.settingsOperationsService.getSettings();
 
@@ -319,6 +397,7 @@ export class SettingsController {
     }
 
     return {
+      download_client_type: settings.download_client_type,
       download_client_url: settings.download_client_url ?? '',
       download_client_username: settings.download_client_username ?? '',
       download_client_password: settings.download_client_password ?? '',
@@ -453,6 +532,43 @@ export class SettingsController {
   ): Promise<BasicResponseDto> {
     return this.metadataSettingsService.updateMetadataProviderPreference(
       payload.preference,
+    );
+  }
+
+  /**
+   * The full ping, sample block included, so the user reviews everything that
+   * could ever be sent rather than whatever this week happens to carry.
+   */
+  @Get('/telemetry/preview')
+  async previewTelemetry(): Promise<TelemetryPing> {
+    return this.telemetryService.buildPayload(true);
+  }
+
+  @Get('/telemetry/status')
+  telemetryStatus(): TelemetryStatus {
+    return this.telemetryService.status();
+  }
+
+  // There is deliberately no send-now endpoint: every real POST increments the
+  // exact census, so a test button would let an instance inflate the count.
+  // The preview above is the verification mechanism.
+  @Post('/telemetry')
+  async updateTelemetrySetting(
+    @Body(new ZodValidationPipe(telemetrySettingSchema))
+    payload: TelemetrySetting,
+  ): Promise<BasicResponseDto> {
+    // Refused rather than stored: TELEMETRY=off already decides the outcome, so
+    // accepting a value here would confirm a save that changes nothing.
+    if (this.telemetryService.forcedOff()) {
+      return {
+        status: 'NOK',
+        code: 0,
+        message: 'TELEMETRY=off is set in the environment',
+      };
+    }
+
+    return this.settingsOperationsService.updateTelemetrySetting(
+      payload.enabled,
     );
   }
 
@@ -625,7 +741,9 @@ export class SettingsController {
   }
 
   @Post('/cron/validate')
-  validateSingleCron(@Body() payload: CronScheduleDto) {
+  validateSingleCron(
+    @Body(new ZodValidationPipe(cronScheduleSchema)) payload: CronSchedule,
+  ) {
     return this.settingsOperationsService.cronIsValid(payload.schedule)
       ? { status: 'OK', code: 1, message: 'Success' }
       : { status: 'NOK', code: 0, message: 'Failure' };

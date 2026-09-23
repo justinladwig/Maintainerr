@@ -1,6 +1,8 @@
+import { Trans, useLingui } from '@lingui/react/macro'
 import { useEffect, useState } from 'react'
 import GetApiHandler from '../../../../../utils/ApiHandler'
 import Button from '../../../../Common/Button'
+import { SmallLoadingSpinner } from '../../../../Common/LoadingSpinner'
 import Modal from '../../../../Common/Modal'
 import ToggleItem from '../../../../Common/ToggleButton'
 import type { AgentConfiguration } from '../../../../Settings/Notifications/CreateNotificationModal'
@@ -11,6 +13,7 @@ interface ConfigureNotificationModal {
   selectedAgents?: AgentConfiguration[]
 }
 const ConfigureNotificationModal = (props: ConfigureNotificationModal) => {
+  const { t } = useLingui()
   const [notifications, setNotifications] = useState<AgentConfiguration[]>()
   const [activatedNotifications, setActivatedNotifications] = useState<
     AgentConfiguration[]
@@ -31,18 +34,18 @@ const ConfigureNotificationModal = (props: ConfigureNotificationModal) => {
 
   return (
     <Modal
-      loading={isLoading}
       backgroundClickable={false}
       onCancel={() => props.onCancel()}
-      title={'Notification Agents'}
+      title={t`Notification Agents`}
       iconSvg={''}
       footerActions={
         <Button
           buttonType="primary"
           className="ml-3"
+          disabled={isLoading}
           onClick={() => props.onSuccess(activatedNotifications)}
         >
-          OK
+          <Trans>OK</Trans>
         </Button>
       }
     >
@@ -51,15 +54,22 @@ const ConfigureNotificationModal = (props: ConfigureNotificationModal) => {
           {/* Config Name */}
           <div className="form-row">
             <label htmlFor="name" className="text-label">
-              Agents
+              <Trans>Agents</Trans>
             </label>
             <div className="form-input">
               <div className="form-input-field flex flex-col gap-2">
+                {/* Immediate: the delayed spinner may just have shown for
+                    the chunk, and a fresh one would restart its timer. */}
+                {isLoading && <SmallLoadingSpinner className="h-6 w-6" />}
                 {!isLoading &&
                   notifications!.map((n) => (
                     <ToggleItem
                       key={n.id}
-                      label={`${n.name} - ${n.agent} ${!n.enabled ? ' (disabled)' : ''}`}
+                      label={
+                        n.enabled
+                          ? `${n.name} - ${n.agent}`
+                          : t`${{ agentName: n.name }} - ${{ agentType: n.agent }} (disabled)`
+                      }
                       toggled={
                         activatedNotifications.find((an) => an.id === n.id)
                           ? true
@@ -83,7 +93,7 @@ const ConfigureNotificationModal = (props: ConfigureNotificationModal) => {
                   ))}
                 {!isLoading && notifications!.length === 0 && (
                   <p className="text-zinc-400">
-                    No notification agents configured.
+                    <Trans>No notification agents configured.</Trans>
                   </p>
                 )}
               </div>

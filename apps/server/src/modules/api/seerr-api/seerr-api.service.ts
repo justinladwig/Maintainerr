@@ -1,12 +1,12 @@
-import { BasicResponseDto } from '@maintainerr/contracts';
+import { BasicResponseDto, stripTrailingSlashes } from '@maintainerr/contracts';
 import { Injectable } from '@nestjs/common';
 import { cloneDeep } from 'lodash';
 import { SettingsDataService } from '../../../modules/settings/settings-data.service';
 import {
-  CONNECTION_TEST_TIMEOUT_MS,
   formatConnectionFailureMessage,
   logConnectionTestError,
 } from '../../../utils/connection-error';
+import { CONNECTION_TEST_TIMEOUT_MS } from '../lib/httpTimeouts';
 import {
   MaintainerrLogger,
   MaintainerrLoggerFactory,
@@ -218,13 +218,19 @@ export class SeerrApiService {
   }
 
   public init() {
+    // Drop the previous client first, so removing Seerr from settings stops
+    // the app querying it rather than leaving the old one live until restart.
+    this.api = undefined;
+
     if (!this.settings.seerr_url) {
       return;
     }
 
     this.api = new SeerrApi(
       {
-        url: `${this.settings.seerr_url.endsWith('/') ? this.settings.seerr_url.slice(0, -1) : this.settings.seerr_url}/api/v1`,
+        // Settings saved before the URL schema normalised them can still hold
+        // a trailing slash.
+        url: `${stripTrailingSlashes(this.settings.seerr_url)}/api/v1`,
         apiKey: `${this.settings.seerr_api_key}`,
       },
       this.loggerFactory.createLogger(),
@@ -235,9 +241,18 @@ export class SeerrApiService {
     return this.settings.seerrConfigured();
   }
 
-  public async getMovie(id: string | number): Promise<SeerrMovieResponse> {
+  /**
+   * `fresh` bypasses the read cache. The delete paths never invalidate it, so
+   * a read that precedes a write or a decision must not come from it.
+   */
+  public async getMovie(
+    id: string | number,
+    options?: { fresh?: boolean },
+  ): Promise<SeerrMovieResponse> {
     try {
-      const response: SeerrMovieResponse = await this.api.get(`/movie/${id}`);
+      const response: SeerrMovieResponse = options?.fresh
+        ? await this.api.getWithoutCache(`/movie/${id}`)
+        : await this.api.get(`/movie/${id}`);
       return response;
     } catch (error) {
       this.logger.warn(
@@ -251,10 +266,15 @@ export class SeerrApiService {
     }
   }
 
-  public async getShow(showId: string | number): Promise<SeerrTVResponse> {
+  public async getShow(
+    showId: string | number,
+    options?: { fresh?: boolean },
+  ): Promise<SeerrTVResponse> {
     try {
       if (showId) {
-        const response: SeerrTVResponse = await this.api.get(`/tv/${showId}`);
+        const response: SeerrTVResponse = options?.fresh
+          ? await this.api.getWithoutCache(`/tv/${showId}`)
+          : await this.api.get(`/tv/${showId}`);
         return response;
       }
       return undefined;
@@ -540,23 +560,55 @@ export class SeerrApiService {
     }
   }
 
-  public async removeSeasonRequest(tmdbid: string | number, season: number) {
+  /**
+   * Whether the season's requests were removed. `undefined` when that could not
+   * be established, the same contract as {@link hasRemainingSeasonRequests}, so
+   * a caller never reports a removal that did not happen. The writes rethrow
+   * rather than answering their body: a 204 carries an empty one, so success
+   * and failure are both falsy.
+   */
+  public async removeSeasonRequest(
+    tmdbid: string | number,
+    season: number,
+  ): Promise<boolean | undefined> {
     try {
-      const media = await this.getShow(tmdbid);
+      const media = await this.getShow(tmdbid, { fresh: true });
 
-      if (media?.mediaInfo) {
-        const requests = (media.mediaInfo.requests ?? []).filter((el) =>
-          el.seasons.find((s) => s.seasonNumber === season),
-        );
-        if (requests.length > 0) {
-          for (const el of requests) {
-            await this.deleteRequest(el.id.toString());
-          }
-        } else {
-          // no requests? clear data and let Seerr refetch.
-          await this.api.delete(`/media/${media.id}`);
-        }
+      // getShow returns undefined only on communication failure or falsy id;
+      // the show being untracked still yields a response with mediaInfo == null.
+      if (!media) {
+        return undefined;
       }
+
+      if (!media.mediaInfo) {
+        return false;
+      }
+
+      const allRequests = media.mediaInfo.requests ?? [];
+      const requests = allRequests.filter((el) =>
+        el.seasons.find((s) => s.seasonNumber === season),
+      );
+      if (requests.length > 0) {
+        for (const el of requests) {
+          await this.api.delete(`/request/${el.id}`, undefined, {
+            rethrow: true,
+          });
+        }
+      } else if (allRequests.length > 0) {
+        // Other seasons are still requested. Deleting the media record cascades
+        // into their requests, so leave it alone and report nothing removed.
+        return false;
+      } else {
+        // Nothing requested at all? Clear the stale media record and let Seerr
+        // refetch. Keyed on Seerr's own media id, not `media.id`, which is the
+        // TMDB id: Seerr answers 204 for an id it does not hold, so the wrong
+        // one was a no-op that reported success.
+        await this.api.delete(`/media/${media.mediaInfo.id}`, undefined, {
+          rethrow: true,
+        });
+      }
+
+      return true;
     } catch (error) {
       this.logger.warn(
         'Seerr communication failed. Is the application running?',
@@ -578,7 +630,7 @@ export class SeerrApiService {
     }
 
     try {
-      const media = await this.getShow(tmdbid);
+      const media = await this.getShow(tmdbid, { fresh: true });
 
       // getShow returns undefined only on communication failure or falsy id;
       // the show being untracked still yields a response with mediaInfo == null.
@@ -632,30 +684,33 @@ export class SeerrApiService {
     }
   }
 
-  public async removeMediaByTmdbId(id: string | number, type: 'movie' | 'tv') {
+  /** Whether the media record was cleared, with the same contract as
+   * {@link removeSeasonRequest}. */
+  public async removeMediaByTmdbId(
+    id: string | number,
+    type: 'movie' | 'tv',
+  ): Promise<boolean | undefined> {
     try {
-      let media: SeerrMovieResponse | SeerrTVResponse;
-      if (type === 'movie') {
-        media = await this.getMovie(id);
-      } else {
-        media = await this.getShow(id);
-      }
+      const media: SeerrMovieResponse | SeerrTVResponse =
+        type === 'movie'
+          ? await this.getMovie(id, { fresh: true })
+          : await this.getShow(id, { fresh: true });
 
-      if (!media.mediaInfo?.id) {
+      // Reading through an undefined media used to throw, which the catch
+      // below then reported as a communication failure. Answer it directly.
+      if (!media) {
         return undefined;
       }
 
-      try {
-        await this.deleteMediaItem(media.mediaInfo.id.toString());
-      } catch (error) {
-        this.logger.log(
-          `Couldn't delete media by TMDB ID ${id}. Does it exist in Seerr?`,
-        );
-        this.logger.debug(
-          `Couldn't delete media by TMDB ID ${id}. Does it exist in Seerr?`,
-          error,
-        );
+      if (!media.mediaInfo?.id) {
+        return false;
       }
+
+      await this.api.delete(`/media/${media.mediaInfo.id}`, undefined, {
+        rethrow: true,
+      });
+
+      return true;
     } catch (error) {
       this.logger.warn(
         'Seerr communication failed. Is the application running?',
@@ -688,7 +743,7 @@ export class SeerrApiService {
       ? new SeerrApi(
           {
             apiKey: params.apiKey,
-            url: `${params.url?.endsWith('/') ? params.url.slice(0, -1) : params.url}/api/v1`,
+            url: `${stripTrailingSlashes(params.url)}/api/v1`,
           },
           this.loggerFactory.createLogger(),
         )

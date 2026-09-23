@@ -94,6 +94,11 @@
   --color-maintainerrdark-900: #78350f;
   --color-maintainerrdark-950: #451a03;
   --color-maintainerrdark: #78350f;
+
+  /* Monaco's vs-dark canvas. Named so a container can be painted the same
+     colour before the editor mounts, instead of flashing from a lighter panel
+     to this one. */
+  --color-editor: #1e1e1e;
 }
 
 /* v4 has no transition-property theme namespace; expose the two we rely on. */
@@ -174,12 +179,52 @@
     height: calc(4rem + env(safe-area-inset-top));
   }
 
+  /* Pins a page bar right below the fixed .searchbar - keep the offset equal
+     to that bar's height. */
+  .sticky-under-searchbar {
+    position: sticky;
+    top: calc(4rem + env(safe-area-inset-top));
+  }
+
+  /* The bar wears the .searchbar's glass, carried past the page padding (1rem
+     from the shell, 1rem from the page) so it lines up with that full-width
+     bar. Its own layer, so scrolling content repaints without it. */
+  .sticky-under-searchbar::before {
+    content: '';
+    position: absolute;
+    inset: 0 -2rem;
+    z-index: -1;
+    background-color: rgb(24 24 27 / 0.22);
+    /* -webkit- first: Lightning CSS (production only) keeps a hand written
+       prefix that follows the standard property and drops the standard one,
+       leaving Firefox with no blur at all. */
+    -webkit-backdrop-filter: blur(5.8px);
+    backdrop-filter: blur(5.8px);
+  }
+
+  /* Once pinned, that one panel reaches up behind the search bar and the bar
+     drops its own glass. A backdrop filter samples only what is inside its own
+     box, so two of them meeting edge to edge each blur a truncated kernel and
+     the join shows as a line however well their colours match. One panel over
+     both has no join to show. */
+  .sticky-under-searchbar[data-pinned]::before {
+    top: calc(-4rem - env(safe-area-inset-top));
+  }
+
+  body:has(.sticky-under-searchbar[data-pinned])
+    .searchbar
+    > .transparent-glass-bg {
+    background-color: transparent;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+
   .transparent-glass-bg {
     --tw-bg-opacity: 0.22;
     background-color: rgb(24 24 27 / var(--tw-bg-opacity));
     box-shadow: 0 4px 30px rgba(0, 0, 0, 0.1);
-    backdrop-filter: blur(5.8px);
     -webkit-backdrop-filter: blur(5.8px);
+    backdrop-filter: blur(5.8px);
   }
 
   .max-width-form {
@@ -596,6 +641,10 @@
 
   .button-sm svg {
     @apply mr-1.5 ml-1.5 h-4 w-4 first:ml-0 last:mr-0;
+  }
+
+  .modal-backdrop {
+    @apply fixed top-0 right-0 bottom-0 left-0 z-50 flex h-full w-full items-center justify-center bg-zinc-800/70;
   }
 
   .modal-icon {

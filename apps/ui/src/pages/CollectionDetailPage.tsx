@@ -1,10 +1,12 @@
+import { t as globalT } from '@lingui/core/macro'
+import { useLingui } from '@lingui/react/macro'
 import { lazy, useEffect, useState } from 'react'
 import { Outlet, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { toast } from 'react-toastify'
 import { useCollection } from '../api/collections'
 import { useRuleGroupForCollection } from '../api/rules'
 import { ICollection } from '../components/Collection'
-import CollectionDetailControlRow from '../components/Collection/CollectionDetail/CollectionDetailControlRow'
+import ExecuteButton from '../components/Common/ExecuteButton'
 import LazyModalBoundary from '../components/Common/LazyModalBoundary'
 import LoadingSpinner from '../components/Common/LoadingSpinner'
 import TabbedLinks, { TabbedRoute } from '../components/Common/TabbedLinks'
@@ -17,11 +19,10 @@ const TestMediaItem = lazy(
 
 export interface CollectionDetailOutletContext {
   collection: ICollection
-  canTestMedia: boolean
-  openMediaTestModal: () => void
 }
 
 const CollectionDetailPage = () => {
+  const { t } = useLingui()
   const navigate = useNavigate()
   const location = useLocation()
   const { id } = useParams<{ id: string }>()
@@ -56,20 +57,20 @@ const CollectionDetailPage = () => {
       collectionError,
       'CollectionDetailPage.fetchData',
     )
-    toast.error('Failed to load collection. Check logs for details.')
+    toast.error(globalT`Failed to load collection. Check logs for details.`)
   }, [collectionError])
 
   const tabbedRoutes: TabbedRoute[] = [
     {
-      text: 'Media',
+      text: t`Media`,
       route: 'media',
     },
     {
-      text: 'Exclusions',
+      text: t`Exclusions`,
       route: 'exclusions',
     },
     {
-      text: 'Info',
+      text: t`Info`,
       route: 'info',
     },
   ]
@@ -102,7 +103,7 @@ const CollectionDetailPage = () => {
   if (isLoading || !collection || ruleGroupLoading) {
     return (
       <>
-        <title>Collection - Maintainerr</title>
+        <title>{t`Collection - Maintainerr`}</title>
         <LoadingSpinner />
       </>
     )
@@ -110,12 +111,22 @@ const CollectionDetailPage = () => {
 
   return (
     <>
-      <title>{collection.title} - Maintainerr</title>
+      <title>{t`${{ collectionTitle: collection.title }} - Maintainerr`}</title>
       <div className="w-full px-4">
-        <div className="m-auto mb-3 flex w-full">
+        {/* Test Media belongs to this collection's rules, so it sits with its
+            title: the same place on every tab, and out of the pinned row that
+            carries the media actions. */}
+        <div className="m-auto mb-3 flex w-full items-center gap-3">
           <h1 className="flex w-full justify-center overflow-hidden text-lg font-bold text-ellipsis whitespace-nowrap text-zinc-200 sm:m-0 sm:justify-start xl:m-0">
             {collection.title}
           </h1>
+          {ruleGroup?.useRules ? (
+            <ExecuteButton
+              className="mx-0 shrink-0"
+              onClick={() => setMediaTestModalOpen(true)}
+              text={t`Test Media`}
+            />
+          ) : null}
         </div>
 
         <div>
@@ -130,29 +141,14 @@ const CollectionDetailPage = () => {
               />
             </div>
           </div>
-          {currentTab === 'info' && ruleGroup?.useRules ? (
-            <CollectionDetailControlRow
-              canTestMedia={true}
-              onOpenTestMedia={() => setMediaTestModalOpen(true)}
-            />
-          ) : null}
-
-          <Outlet
-            context={{
-              collection,
-              canTestMedia: Boolean(ruleGroup?.useRules),
-              openMediaTestModal: () => setMediaTestModalOpen(true),
-            }}
-          />
+          <Outlet context={{ collection }} />
         </div>
 
         {mediaTestModalOpen && collection?.id ? (
           <LazyModalBoundary
-            title="Test Media"
             onCancel={() => {
               setMediaTestModalOpen(false)
             }}
-            size="5xl"
           >
             <TestMediaItem
               collectionId={+collection.id}

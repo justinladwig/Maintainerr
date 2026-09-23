@@ -1,13 +1,7 @@
 import type { MediaLibrary } from '@maintainerr/contracts'
-import {
-  cleanup,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '../../../test-utils/render'
 import type { ReactNode } from 'react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useMediaServerLibraries } from '../../../api/media-server'
 import {
   buildQueryErrorResult,
@@ -51,10 +45,6 @@ describe('CollectionItem', () => {
     librariesHookMock.mockReturnValue(buildQuerySuccessResult(libraries))
   })
 
-  afterEach(() => {
-    cleanup()
-  })
-
   it('renders collection preview images inside the wide backdrop layout', async () => {
     render(
       <CollectionItem
@@ -83,7 +73,7 @@ describe('CollectionItem', () => {
     )
 
     await waitFor(() => {
-      expect(screen.getAllByAltText('img')).toHaveLength(2)
+      expect(screen.getAllByAltText('Collection preview')).toHaveLength(2)
     })
 
     expect(getApiHandlerMock).not.toHaveBeenCalled()
@@ -114,7 +104,7 @@ describe('CollectionItem', () => {
     )
 
     await waitFor(() => {
-      expect(screen.getAllByAltText('img')).toHaveLength(1)
+      expect(screen.getAllByAltText('Collection preview')).toHaveLength(1)
     })
 
     expect(getApiHandlerMock).not.toHaveBeenCalled()

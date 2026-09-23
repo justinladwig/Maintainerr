@@ -1,4 +1,5 @@
 import {
+  DownloadClientType,
   MediaServerType,
   MetadataProviderPreference,
 } from '@maintainerr/contracts';
@@ -60,6 +61,14 @@ export class SettingDto {
 
   streamystats_url: string;
 
+  tracearr_url: string;
+
+  tracearr_api_key: string;
+
+  tracearr_server_id: string;
+
+  download_client_type: DownloadClientType | null;
+
   download_client_url: string;
 
   download_client_username: string;
@@ -86,4 +95,6 @@ export class SettingDto {
   sonarr_exclusion_tag: string;
 
   sonarr_untag_on_unexclude: boolean;
+
+  telemetryEnabled: boolean | null;
 }

@@ -3,6 +3,7 @@ import { ExternalApiService } from '../../../../modules/api/external-api/externa
 import { DVRSettings } from '../../../../modules/settings/interfaces/dvr-settings.interface';
 import { MaintainerrLogger } from '../../../logging/logs.service';
 import cacheManager from '../../lib/cache';
+import { NO_TIMEOUT, SLOW_INSTANCE_TIMEOUT_MS } from '../../lib/httpTimeouts';
 import {
   DiskSpaceResource,
   HistoryRecord,
@@ -12,12 +13,6 @@ import {
   SystemStatus,
   Tag,
 } from '../interfaces/servarr.interface';
-
-// Slow/underpowered *arr instances can take >10s to answer even simple reads;
-// allow more headroom than the shared 10s axios default before aborting
-// (#3181). Used for uncached reads whose failure would change action or rule
-// behavior.
-export const SLOW_INSTANCE_TIMEOUT_MS = 20000;
 
 export abstract class ServarrApi<QueueItemAppendT> extends ExternalApiService {
   static buildUrl(settings: DVRSettings, path?: string): string {
@@ -138,7 +133,19 @@ export abstract class ServarrApi<QueueItemAppendT> extends ExternalApiService {
       this.getRootFolders(),
     ]);
 
-    const mounts: DiskSpaceResource[] = [...(diskspace ?? [])];
+    // Either read answering undefined means it failed, and merging that in
+    // fabricates a mount list rather than losing one: measured against a real
+    // Radarr, dropping `/diskspace` and keeping the root folder reported 3.9 GB
+    // free where the instance had 15.4, which is enough to fire a "delete when
+    // space runs low" rule on a server with plenty of room. A partial merge is
+    // no safer than an empty one - the missing side only ever understates free
+    // space - so throw and let callers decide, as the media-server reads do
+    // (#3248).
+    if (diskspace === undefined || rootFolders === undefined) {
+      throw new Error('Failed to read disk space');
+    }
+
+    const mounts: DiskSpaceResource[] = [...diskspace];
     const existingPaths = new Set(
       mounts.filter((d) => d.path).map((d) => normalizeDiskPath(d.path!)),
     );
@@ -319,7 +326,9 @@ export abstract class ServarrApi<QueueItemAppendT> extends ExternalApiService {
 
   protected async runDelete(command: string): Promise<boolean> {
     try {
-      const result = await this.delete(`/${command}`);
+      const result = await this.delete(`/${command}`, {
+        timeout: NO_TIMEOUT,
+      });
 
       if (result === undefined) {
         this.logger.warn(`Failed to run DELETE: /${command}`);

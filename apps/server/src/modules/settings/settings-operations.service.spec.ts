@@ -1,4 +1,4 @@
-import { MediaServerType } from '@maintainerr/contracts';
+import { MediaServerType, TracearrSetting } from '@maintainerr/contracts';
 import { TestBed, type Mocked } from '@suites/unit';
 import { Repository } from 'typeorm';
 import { InternalApiService } from '../api/internal-api/internal-api.service';
@@ -8,6 +8,7 @@ import { SeerrApiService } from '../api/seerr-api/seerr-api.service';
 import { ServarrService } from '../api/servarr-api/servarr.service';
 import { StreamystatsApiService } from '../api/streamystats-api/streamystats-api.service';
 import { TautulliApiService } from '../api/tautulli-api/tautulli-api.service';
+import { TracearrApiService } from '../api/tracearr-api/tracearr-api.service';
 import { MaintainerrLogger } from '../logging/logs.service';
 import { Settings } from './entities/settings.entities';
 import { RadarrSettings } from './entities/radarr_settings.entities';
@@ -24,6 +25,7 @@ describe('SettingsOperationsService', () => {
   let seerr: Mocked<SeerrApiService>;
   let tautulli: Mocked<TautulliApiService>;
   let streamystats: Mocked<StreamystatsApiService>;
+  let tracearr: Mocked<TracearrApiService>;
   let internalApi: Mocked<InternalApiService>;
 
   const createSettings = (overrides: Partial<Settings> = {}): Settings =>
@@ -65,6 +67,7 @@ describe('SettingsOperationsService', () => {
     seerr = unitRef.get(SeerrApiService);
     tautulli = unitRef.get(TautulliApiService);
     streamystats = unitRef.get(StreamystatsApiService);
+    tracearr = unitRef.get(TracearrApiService);
     internalApi = unitRef.get(InternalApiService);
     unitRef.get(MaintainerrLogger);
 
@@ -88,7 +91,145 @@ describe('SettingsOperationsService', () => {
     seerr.init.mockImplementation();
     tautulli.init.mockImplementation();
     streamystats.init.mockImplementation();
+    tracearr.init.mockImplementation();
     internalApi.init.mockImplementation();
+  });
+
+  it('saves Tracearr settings and reinitializes the client', async () => {
+    const setting: TracearrSetting = {
+      url: 'http://tracearr.local',
+      api_key: 'trr_pub_token',
+    };
+    tracearr.resolveServerId.mockResolvedValue(
+      '11111111-1111-4111-8111-111111111111',
+    );
+
+    await expect(service.updateTracearrSetting(setting)).resolves.toEqual({
+      status: 'OK',
+      code: 1,
+      message: 'Success',
+    });
+
+    expect(settingsDataService.saveSettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        tracearr_url: setting.url,
+        tracearr_api_key: setting.api_key,
+        tracearr_server_id: '11111111-1111-4111-8111-111111111111',
+      }),
+    );
+    expect(tracearr.init).toHaveBeenCalledTimes(1);
+  });
+
+  it('tests Tracearr with connection fields only', async () => {
+    tracearr.testConnection.mockResolvedValue({
+      status: 'OK',
+      code: 1,
+      message: '2.0.0-beta.1',
+    });
+
+    await expect(
+      service.testTracearr({
+        url: 'http://tracearr.local',
+        api_key: 'trr_pub_token',
+      }),
+    ).resolves.toEqual({ status: 'OK', code: 1, message: '2.0.0-beta.1' });
+  });
+
+  it('clears the Tracearr server selection when the reconfigured media server no longer matches', async () => {
+    tracearr.savedServerTracksMediaServer.mockResolvedValue(false);
+
+    await service.updateSettings({ plex_hostname: 'other-plex.local' });
+
+    expect(settingsDataService.saveSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ tracearr_server_id: null }),
+    );
+    expect(tracearr.invalidateHistory).toHaveBeenCalledTimes(1);
+  });
+
+  // The selection survives an inconclusive check, but the snapshot it was
+  // verified against does not: keeping it would let the next run read the
+  // previous media server's history without probing again.
+  it('keeps the Tracearr server selection but drops its snapshot when the match cannot be determined', async () => {
+    tracearr.savedServerTracksMediaServer.mockResolvedValue(undefined);
+
+    await service.updateSettings({ plex_hostname: 'other-plex.local' });
+
+    expect(settingsDataService.saveSettings).not.toHaveBeenCalledWith(
+      expect.objectContaining({ tracearr_server_id: null }),
+    );
+    expect(tracearr.invalidateHistory).toHaveBeenCalledTimes(1);
+  });
+
+  // Re-pointing is what invalidates the binding, so an unchanged save must not
+  // drop the history snapshot and re-probe the media server for nothing.
+  it('leaves the Tracearr snapshot alone when a Jellyfin save changes nothing', async () => {
+    settingsRepo.findOne.mockResolvedValue(
+      createSettings({
+        media_server_type: MediaServerType.JELLYFIN,
+        jellyfin_url: 'http://jellyfin.local',
+        jellyfin_api_key: 'jellyfin-key',
+      }),
+    );
+    jest.spyOn(service, 'testJellyfin').mockResolvedValue({
+      status: 'OK',
+      code: 1,
+      message: 'Success',
+      users: [{ id: 'user-1', name: 'admin' }],
+    });
+
+    await service.saveJellyfinSettings({
+      jellyfin_url: 'http://jellyfin.local',
+      jellyfin_api_key: 'jellyfin-key',
+      jellyfin_user_id: 'user-1',
+    });
+
+    expect(tracearr.invalidateHistory).not.toHaveBeenCalled();
+  });
+
+  it('revalidates the Tracearr binding when a Jellyfin save changes the server', async () => {
+    settingsRepo.findOne.mockResolvedValue(
+      createSettings({
+        media_server_type: MediaServerType.JELLYFIN,
+        jellyfin_url: 'http://jellyfin.local',
+        jellyfin_api_key: 'jellyfin-key',
+      }),
+    );
+    jest.spyOn(service, 'testJellyfin').mockResolvedValue({
+      status: 'OK',
+      code: 1,
+      message: 'Success',
+      users: [{ id: 'user-1', name: 'admin' }],
+    });
+
+    await service.saveJellyfinSettings({
+      jellyfin_url: 'http://other-jellyfin.local',
+      jellyfin_api_key: 'jellyfin-key',
+      jellyfin_user_id: 'user-1',
+    });
+
+    expect(tracearr.invalidateHistory).toHaveBeenCalledTimes(1);
+  });
+
+  it('defaults the Jellyfin admin user to the first admin the connection test lists', async () => {
+    settingsRepo.findOne.mockResolvedValue(createSettings({}));
+    jest.spyOn(service, 'testJellyfin').mockResolvedValue({
+      status: 'OK',
+      code: 1,
+      message: 'Success',
+      users: [
+        { id: 'admin-1', name: 'admin' },
+        { id: 'admin-2', name: 'other' },
+      ],
+    });
+
+    await service.saveJellyfinSettings({
+      jellyfin_url: 'http://jellyfin.local',
+      jellyfin_api_key: 'jellyfin-key',
+    });
+
+    expect(settingsDataService.saveSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ jellyfin_user_id: 'admin-1' }),
+    );
   });
 
   it('rejects Plex server setting changes when no Plex credentials are stored', async () => {
@@ -107,6 +248,32 @@ describe('SettingsOperationsService', () => {
       status: 'NOK',
       code: 0,
       message: 'Authenticate with Plex before saving Plex server settings.',
+    });
+    expect(settingsDataService.saveSettings).not.toHaveBeenCalled();
+  });
+
+  it('accepts an update that omits the cron schedules', async () => {
+    // Both routes merge over the stored row, so an absent schedule means "leave
+    // as-is". Validating it anyway reached `undefined.trim()` and threw a 500.
+    const response = await service.updateSettings({
+      applicationTitle: 'Maintainerr Dev',
+    });
+
+    expect(response).toEqual({ status: 'OK', code: 1, message: 'Success' });
+    expect(settingsDataService.saveSettings).toHaveBeenCalledTimes(1);
+  });
+
+  it('still rejects a schedule that is present but invalid', async () => {
+    settingsDataService.cronIsValid.mockReturnValue(false);
+
+    const response = await service.updateSettings({
+      collection_handler_job_cron: 'not a cron',
+    });
+
+    expect(response).toEqual({
+      status: 'NOK',
+      code: 0,
+      message: 'Update failed, invalid CRON value was found',
     });
     expect(settingsDataService.saveSettings).not.toHaveBeenCalled();
   });
@@ -197,6 +364,46 @@ describe('SettingsOperationsService', () => {
         plex_port: 32400,
         plex_ssl: 1,
       }),
+    );
+  });
+
+  it('keeps plex_ssl when a partial update omits the Plex connection fields', async () => {
+    settingsRepo.findOne.mockResolvedValue(
+      createSettings({
+        plex_hostname: 'abc.plex.direct',
+        plex_port: 32400,
+        plex_ssl: 1,
+      }),
+    );
+
+    const response = await service.patchSettings({
+      applicationTitle: 'Maintainerr Dev',
+    });
+
+    expect(response).toEqual({ status: 'OK', code: 1, message: 'Success' });
+    expect(settingsDataService.saveSettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        plex_hostname: 'abc.plex.direct',
+        plex_port: 32400,
+        plex_ssl: 1,
+      }),
+    );
+  });
+
+  it('lets an explicit plex_ssl update turn ssl off for a bare hostname', async () => {
+    settingsRepo.findOne.mockResolvedValue(
+      createSettings({
+        plex_hostname: 'abc.plex.direct',
+        plex_port: 32400,
+        plex_ssl: 1,
+      }),
+    );
+
+    const response = await service.patchSettings({ plex_ssl: 0 });
+
+    expect(response).toEqual({ status: 'OK', code: 1, message: 'Success' });
+    expect(settingsDataService.saveSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ plex_ssl: 0 }),
     );
   });
 

@@ -1,6 +1,6 @@
 import { MediaItem, MediaItemType } from '@maintainerr/contracts';
 import { Injectable } from '@nestjs/common';
-import _ from 'lodash';
+import { cloneDeep } from 'lodash';
 import {
   SonarrEpisode,
   SonarrEpisodeFile,
@@ -24,7 +24,7 @@ import {
   RuleConstants,
 } from '../constants/rules.constants';
 import { RuleDto } from '../dtos/rule.dto';
-import { RulesDto } from '../dtos/rules.dto';
+import { RuleGroupDto } from '../dtos/ruleGroup.dto';
 import { ArrLookupCache } from '../helpers/arr-lookup-cache';
 import { evaluateArrDiskspaceGiB } from '../helpers/diskspace.utils';
 
@@ -53,7 +53,7 @@ export class SonarrGetterService {
     id: number,
     libItem: MediaItem,
     dataType?: MediaItemType,
-    ruleGroup?: RulesDto,
+    ruleGroup?: RuleGroupDto,
     rule?: RuleDto,
     arrLookupCache?: ArrLookupCache,
   ) {
@@ -88,10 +88,25 @@ export class SonarrGetterService {
       let seasonRatingKey: number | undefined = undefined;
 
       if (dataType === 'season' || dataType === 'episode') {
-        origLibItem = _.cloneDeep(libItem);
+        origLibItem = cloneDeep(libItem);
         seasonRatingKey = libItem.grandparentId
           ? libItem.parentIndex
           : libItem.index;
+
+        // Every season-scoped read below has to be limited to this number.
+        // Jellyfin and Emby file episodes they can't place under a permanent
+        // "Season Unknown" that carries no index, which leaves it undefined -
+        // and the episode reads drop their season filter when it is, so the
+        // rule would be answered with another season's data. Report the
+        // transport-failure signal instead (same as the outer catch): the
+        // comparator skips the item rather than matching it, and the executor
+        // keeps it in any collection it already belongs to.
+        if (seasonRatingKey == null) {
+          this.logger.debug(
+            `Sonarr-Getter - No season number for '${libItem.title}' with id '${libItem.id}'; skipping this item.`,
+          );
+          return undefined;
+        }
 
         // get (grand)parent
         const mediaServer = await this.getMediaServer();
@@ -106,13 +121,18 @@ export class SonarrGetterService {
       );
 
       if (lookupCandidates.length === 0) {
-        this.logger.warn(
-          `Failed to resolve external IDs for '${libItem.title}' (media server ID '${libItem.id}'). As a result, no Sonarr query could be made.`,
-        );
-        // An empty resolution cannot distinguish "item has no provider ids"
-        // from a transient TMDB/TVDB failure (validation runs online), so it
-        // must stay `undefined` - `null` would defeat the transient-removal
-        // guard and wipe collections during an internet outage (#3307).
+        // An item the media server gave no external IDs for can never resolve,
+        // so log it quietly rather than warning about it every run. The answer
+        // stays transient either way: "we could not look it up" is not the same
+        // claim as "it is not there", and a definitive one would let unmatched
+        // and personal media match NOT_EXISTS rules.
+        const message = `Failed to resolve external IDs for '${libItem.title}' (media server ID '${libItem.id}'). As a result, no Sonarr query could be made.`;
+        if (this.metadataService.hasExternalIds(libItem)) {
+          this.logger.warn(message);
+        } else {
+          this.logger.debug(message);
+        }
+
         return undefined;
       }
 
@@ -178,9 +198,14 @@ export class SonarrGetterService {
         return null;
       }
 
-      const season = seasonRatingKey
-        ? showResponse.seasons.find((el) => el.seasonNumber === seasonRatingKey)
-        : undefined;
+      // Season 0 is the specials season, so test for a number rather than
+      // truthiness - `0` would otherwise read as "no season".
+      const season =
+        seasonRatingKey != null
+          ? showResponse.seasons.find(
+              (el) => el.seasonNumber === seasonRatingKey,
+            )
+          : undefined;
 
       // Lazy-load episode / episodeFile only if a property actually needs them.
       let episodePromise: Promise<SonarrEpisode | undefined> | undefined;
@@ -198,17 +223,13 @@ export class SonarrGetterService {
         }
 
         episodePromise ??= (async () => {
-          const seasonNumber = origLibItem.grandparentId
-            ? origLibItem.parentIndex
-            : origLibItem.index;
-
           const episodeNumbers = [
             origLibItem.grandparentId ? origLibItem.index : 1,
           ];
 
           const episodes = await sonarrApiClient.getEpisodes(
             showResponse.id,
-            seasonNumber,
+            seasonRatingKey,
             episodeNumbers,
           );
 
@@ -258,9 +279,7 @@ export class SonarrGetterService {
 
         seasonEpisodesPromise ??= sonarrApiClient.getEpisodes(
           showResponse.id,
-          origLibItem.grandparentId
-            ? origLibItem.parentIndex
-            : origLibItem.index,
+          seasonRatingKey,
         );
 
         return seasonEpisodesPromise;
@@ -496,6 +515,9 @@ export class SonarrGetterService {
           // returns true if a season with unaired episodes is found in monitored seasons
           const data: SonarrSeason[] = [];
           if (dataType === 'season') {
+            if (!season) {
+              return undefined;
+            }
             data.push(season);
           } else {
             data.push(...showResponse.seasons.filter((el) => el.monitored));
@@ -527,17 +549,24 @@ export class SonarrGetterService {
         case 'part_of_latest_season': {
           // returns the true when this is the latest season or the episode is part of the latest season
           if (dataType === 'season' || dataType === 'episode') {
-            return season.seasonNumber && showResponse.seasons
-              ? +season.seasonNumber ===
-                  (
-                    await this.getLastAiredOrCurrentlyAiringSeason(
-                      showResponse.seasons,
-                      showResponse.id,
-                      sonarrApiClient,
-                    )
-                  )?.seasonNumber
-              : false;
+            // A season Sonarr does not list cannot be judged - skip the item
+            // rather than answer. Season 0 is a real season: specials compare
+            // like any other, and are the latest when only specials aired.
+            if (!season) {
+              return undefined;
+            }
+            return (
+              +season.seasonNumber ===
+              (
+                await this.getLastAiredOrCurrentlyAiringSeason(
+                  showResponse.seasons,
+                  showResponse.id,
+                  sonarrApiClient,
+                )
+              )?.seasonNumber
+            );
           }
+          return null;
         }
         case 'originalLanguage': {
           return showResponse.originalLanguage?.name
@@ -560,7 +589,7 @@ export class SonarrGetterService {
           );
         }
         case 'seasonNumber': {
-          return season.seasonNumber;
+          return season?.seasonNumber ?? null;
         }
         case 'rating': {
           return showResponse.ratings?.value ?? null;
@@ -642,9 +671,7 @@ export class SonarrGetterService {
             return null;
           }
 
-          const targetSeasonNumber = origLibItem.grandparentId
-            ? origLibItem.parentIndex
-            : origLibItem.index;
+          const targetSeasonNumber = seasonRatingKey;
           const targetEpisodeNumber = origLibItem.grandparentId
             ? origLibItem.index
             : 1;

@@ -100,6 +100,9 @@ const settingsTautulliRoute = createLazyRoute(
 const settingsStreamystatsRoute = createLazyRoute(
   () => import('./components/Settings/Streamystats'),
 )
+const settingsTracearrRoute = createLazyRoute(
+  () => import('./components/Settings/Tracearr'),
+)
 const settingsDownloadClientRoute = createLazyRoute(
   () => import('./components/Settings/DownloadClient'),
 )
@@ -114,6 +117,9 @@ const settingsJobsRoute = createLazyRoute(
 )
 const settingsLogsRoute = createLazyRoute(
   () => import('./components/Settings/Logs'),
+)
+const settingsTelemetryRoute = createLazyRoute(
+  () => import('./components/Settings/Telemetry'),
 )
 const settingsAboutRoute = createLazyRoute(
   () => import('./components/Settings/About'),
@@ -308,6 +314,11 @@ const appRoutes: AppRoute[] = [
         preload: settingsStreamystatsRoute.preload,
       },
       {
+        path: 'tracearr',
+        lazy: settingsTracearrRoute.lazy,
+        preload: settingsTracearrRoute.preload,
+      },
+      {
         path: 'download-client',
         lazy: settingsDownloadClientRoute.lazy,
         preload: settingsDownloadClientRoute.preload,
@@ -326,6 +337,11 @@ const appRoutes: AppRoute[] = [
         path: 'logs',
         lazy: settingsLogsRoute.lazy,
         preload: settingsLogsRoute.preload,
+      },
+      {
+        path: 'telemetry',
+        lazy: settingsTelemetryRoute.lazy,
+        preload: settingsTelemetryRoute.preload,
       },
       {
         path: 'about',

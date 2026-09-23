@@ -1,4 +1,5 @@
 import {
+  DownloadClientType,
   BasicResponseDto,
   MaintainerrEvent,
   MediaServerType,
@@ -102,6 +103,14 @@ export class SettingsDataService implements SettingDto {
 
   streamystats_url: string;
 
+  tracearr_url: string;
+
+  tracearr_api_key: string;
+
+  tracearr_server_id: string;
+
+  download_client_type: DownloadClientType | null;
+
   download_client_url: string;
 
   download_client_username: string;
@@ -127,6 +136,8 @@ export class SettingsDataService implements SettingDto {
   sonarr_exclusion_tag: string;
 
   sonarr_untag_on_unexclude: boolean;
+
+  telemetryEnabled: boolean | null;
 
   constructor(
     @InjectRepository(Settings)
@@ -180,6 +191,10 @@ export class SettingsDataService implements SettingDto {
       this.tautulli_url = settingsDb?.tautulli_url;
       this.tautulli_api_key = settingsDb?.tautulli_api_key;
       this.streamystats_url = settingsDb?.streamystats_url;
+      this.tracearr_url = settingsDb?.tracearr_url;
+      this.tracearr_api_key = settingsDb?.tracearr_api_key;
+      this.tracearr_server_id = settingsDb?.tracearr_server_id;
+      this.download_client_type = settingsDb?.download_client_type;
       this.download_client_url = settingsDb?.download_client_url;
       this.download_client_username = settingsDb?.download_client_username;
       this.download_client_password = settingsDb?.download_client_password;
@@ -198,6 +213,7 @@ export class SettingsDataService implements SettingDto {
       this.sonarr_exclusion_tag = settingsDb?.sonarr_exclusion_tag ?? 'dnd';
       this.sonarr_untag_on_unexclude =
         settingsDb?.sonarr_untag_on_unexclude ?? false;
+      this.telemetryEnabled = settingsDb?.telemetryEnabled ?? null;
 
       // Auto-detect media server type when not set but credentials exist.
       // This handles upgrades from pre-Jellyfin versions (Plex) and any future
@@ -237,6 +253,10 @@ export class SettingsDataService implements SettingDto {
       await this.settingsRepo.insert({
         apikey: this.generateApiKey(),
         clientId: randomUUID(),
+        // Seeded here rather than as a column default, which would rebuild
+        // the table on every existing install to hold a value only a new row
+        // can take. Null stays "predates the setting, still to be asked".
+        telemetryEnabled: true,
       });
       await this.init();
     }
@@ -267,7 +287,7 @@ export class SettingsDataService implements SettingDto {
 
   public async getSettings() {
     try {
-      return this.settingsRepo.findOne({ where: {} });
+      return await this.settingsRepo.findOne({ where: {} });
     } catch (error) {
       this.logger.error(
         'Something went wrong while getting settings. Is the database file locked?',
@@ -301,13 +321,14 @@ export class SettingsDataService implements SettingDto {
       tmdb_api_key: maskSecret(settings.tmdb_api_key),
       tvdb_api_key: maskSecret(settings.tvdb_api_key),
       tautulli_api_key: maskSecret(settings.tautulli_api_key),
+      tracearr_api_key: maskSecret(settings.tracearr_api_key),
       download_client_password: maskSecret(settings.download_client_password),
     };
   }
 
   public async getRadarrSettings() {
     try {
-      return this.radarrSettingsRepo.find();
+      return await this.radarrSettingsRepo.find();
     } catch (error) {
       this.logger.error(
         'Something went wrong while getting radarr settings. Is the database file locked?',
@@ -323,7 +344,7 @@ export class SettingsDataService implements SettingDto {
 
   public async getRadarrSetting(id: number) {
     try {
-      return this.radarrSettingsRepo.findOne({ where: { id: id } });
+      return await this.radarrSettingsRepo.findOne({ where: { id: id } });
     } catch (error) {
       this.logger.error(
         `Something went wrong while getting radarr setting ${id}. Is the database file locked?`,
@@ -339,7 +360,7 @@ export class SettingsDataService implements SettingDto {
 
   public async getSonarrSettings() {
     try {
-      return this.sonarrSettingsRepo.find();
+      return await this.sonarrSettingsRepo.find();
     } catch (error) {
       this.logger.error(
         'Something went wrong while getting sonarr settings. Is the database file locked?',
@@ -355,7 +376,7 @@ export class SettingsDataService implements SettingDto {
 
   public async getSonarrSetting(id: number) {
     try {
-      return this.sonarrSettingsRepo.findOne({ where: { id: id } });
+      return await this.sonarrSettingsRepo.findOne({ where: { id: id } });
     } catch (error) {
       this.logger.error(
         `Something went wrong while getting sonarr setting ${id}. Is the database file locked?`,
@@ -444,7 +465,7 @@ export class SettingsDataService implements SettingDto {
 
   public async getSportarrSettings() {
     try {
-      return this.sportarrSettingsRepo.find();
+      return await this.sportarrSettingsRepo.find();
     } catch (error) {
       this.logger.error(
         'Something went wrong while getting sportarr settings. Is the database file locked?',
@@ -460,7 +481,7 @@ export class SettingsDataService implements SettingDto {
 
   public async getSportarrSetting(id: number) {
     try {
-      return this.sportarrSettingsRepo.findOne({ where: { id: id } });
+      return await this.sportarrSettingsRepo.findOne({ where: { id: id } });
     } catch (error) {
       this.logger.error(
         `Something went wrong while getting sportarr setting ${id}. Is the database file locked?`,

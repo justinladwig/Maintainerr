@@ -1,3 +1,4 @@
+import { t } from '@lingui/core/macro'
 import type {
   ArrDiskspaceResource,
   MediaServerCollectionSort,
@@ -102,6 +103,7 @@ export interface RuleGroupCreatePayload {
   sonarrQualityProfileId?: number
   sportarrQualityProfileId?: number
   tagInArr?: boolean
+  keepInMaintainerrOnly?: boolean
   collection: RuleGroupCollectionPayload
   rules: IRule[]
   dataType: MediaItemType
@@ -192,6 +194,27 @@ export const useRuleConstants = (options?: UseRuleConstantsOptions) => {
 
 export type UseRuleConstants = ReturnType<typeof useRuleConstants>
 
+type UseRuleUsernamesQueryKey = ['rules', 'users']
+
+type UseRuleUsernamesOptions = Omit<
+  UseQueryOptions<string[], Error, string[], UseRuleUsernamesQueryKey>,
+  'queryKey' | 'queryFn'
+>
+
+/**
+ * Users a rule can be scoped to, named as the rule getters resolve them.
+ */
+export const useRuleUsernames = (options?: UseRuleUsernamesOptions) => {
+  return useQuery<string[], Error, string[], UseRuleUsernamesQueryKey>({
+    queryKey: ['rules', 'users'],
+    queryFn: async () => {
+      return await GetApiHandler<string[]>('/rules/users')
+    },
+    staleTime: 60000,
+    ...options,
+  })
+}
+
 export type { ArrDiskspaceResource } from '@maintainerr/contracts'
 
 type UseArrDiskspaceQueryKey = [
@@ -266,7 +289,7 @@ export const useCreateRuleGroup = (options?: UseCreateRuleGroupOptions) => {
       const response = await PostApiHandler<BasicResponseDto>('/rules', payload)
 
       if (response.code !== 1) {
-        throw new Error(response.message ?? 'Failed to create rule group')
+        throw new Error(response.message ?? t`Failed to create rule group`)
       }
 
       return response
@@ -299,7 +322,7 @@ export const useUpdateRuleGroup = (options?: UseUpdateRuleGroupOptions) => {
       const response = await PutApiHandler<BasicResponseDto>('/rules', payload)
 
       if (response.code !== 1) {
-        throw new Error(response.message ?? 'Failed to update rule group')
+        throw new Error(response.message ?? t`Failed to update rule group`)
       }
 
       return response

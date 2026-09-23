@@ -2,6 +2,7 @@ import axios, { AxiosError, AxiosInstance, RawAxiosRequestConfig } from 'axios';
 import NodeCache from 'node-cache';
 import { MaintainerrLogger } from '../../logging/logs.service';
 import { applyHttpRetry } from '../lib/httpRetry';
+import { DEFAULT_REQUEST_TIMEOUT_MS } from '../lib/httpTimeouts';
 import { describeRequestTarget } from '../lib/requestLogging';
 
 // 20 minute default TTL (in seconds)
@@ -29,7 +30,7 @@ export class ExternalApiService {
     this.axios = axios.create({
       baseURL: baseUrl,
       params,
-      timeout: 10000, // timeout after 10s
+      timeout: DEFAULT_REQUEST_TIMEOUT_MS,
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/json',
@@ -87,11 +88,17 @@ export class ExternalApiService {
   public async delete<T>(
     endpoint: string,
     config?: RawAxiosRequestConfig,
+    options?: { rethrow?: boolean },
   ): Promise<T> {
     try {
       const response = await this.axios.delete<T>(endpoint, config);
       return response.data;
     } catch (error) {
+      // Same escape hatch as post(): a 204 answers an empty body, so a caller
+      // cannot tell success from failure by the return value.
+      if (options?.rethrow) {
+        throw error;
+      }
       this.logRequestFailure('DELETE', endpoint, config, error);
       return undefined;
     }
@@ -198,15 +205,7 @@ export class ExternalApiService {
               }
             })
             .catch((error: AxiosError) => {
-              if (error.response?.status === 429) {
-                const retryAfter =
-                  error.response.headers['retry-after'] || 'unknown';
-                this.logger.warn(
-                  `${url} Rate limit hit. Retry after: ${retryAfter} seconds.`,
-                );
-              } else {
-                this.logger.warn(this.formatRequestFailure('POST', url, error));
-              }
+              this.logger.warn(this.formatRequestFailure('POST', url, error));
             });
         }
         return cachedItem;
@@ -215,15 +214,7 @@ export class ExternalApiService {
       const response = await this.axios
         .post<T>(endpoint, data, config)
         .catch((error: AxiosError) => {
-          if (error.response?.status === 429) {
-            const retryAfter =
-              error.response.headers['retry-after'] || 'unknown';
-            this.logger.warn(
-              `${url} Rate limit hit. Retry after: ${retryAfter} seconds.`,
-            );
-          } else {
-            this.logger.warn(this.formatRequestFailure('POST', url, error));
-          }
+          this.logger.warn(this.formatRequestFailure('POST', url, error));
           return undefined;
         });
 

@@ -26,21 +26,20 @@ When implementing against any external API or SDK (Plex, Jellyfin, TypeORM, etc.
 
 ### API documentation references
 
-#### Media management services
+Machine-readable OpenAPI specs are deliberately not listed here. They live in
+`SPECS` in [tools/api-spec-drift.mjs](../../tools/api-spec-drift.mjs), which
+fetches every one of them weekly, so that list is verified rather than trusted.
+Duplicating it in prose only creates a second copy that goes stale.
 
-- Sonarr: https://raw.githubusercontent.com/Sonarr/Sonarr/develop/src/Sonarr.Api.V3/openapi.json
-- Radarr: https://raw.githubusercontent.com/Radarr/Radarr/develop/src/Radarr.Api.V3/openapi.json
-- Tautulli: https://docs.tautulli.com/extending-tautulli/api-reference
+The references below are the ones with no fetchable spec, or that say something
+the spec does not:
 
-#### Request management services
-
+- Tautulli: https://docs.tautulli.com/extending-tautulli/api-reference - no machine-readable spec, a single `/api/v2?cmd=` endpoint
 - Seerr: https://docs.seerr.dev/
-
-#### Media server services
-
-- Plex (python-plexapi): https://python-plexapi.readthedocs.io/en/latest/index.html
-- Plex (OpenAPI): https://raw.githubusercontent.com/LukeHagar/plex-api-spec/refs/heads/main/src/pms-spec.yaml
 - Jellyfin: https://api.jellyfin.org/
+- Plex (python-plexapi): https://python-plexapi.readthedocs.io/en/latest/index.html
+- Plex (additional): https://www.plexopedia.com/plex-media-server/api/
+- Plex (official PMS reference): https://developer.plex.tv/pms/ - authoritative for what Plex guarantees; rendered page only, no spec file to fetch. The community OpenAPI spec's `required` lists are looser (e.g. it requires `addedAt`, the official schema does not), so confirm guarantees against this page.
 
 ## Rules
 
@@ -54,3 +53,4 @@ When implementing against any external API or SDK (Plex, Jellyfin, TypeORM, etc.
 8. Database/migrations: if persistence changes are needed, keep migrations safe, reversible, and edge-case aware. All migrations MUST be generated and run via TypeORM - never manually crafted SQL. You MUST always follow [typeorm_instructions.txt](../../typeorm_instructions.txt) for migration commands and workflow. A migration is NEVER considered working until it has been tested - run it end-to-end and verify the result before treating it as done.
 9. Rules/metadata systems: make sure any cache invalidation approach stays consistent with existing getter/provider patterns.
 10. Rule naming standards: preserve established rule `name` and `humanName` conventions for equivalent concepts across media servers. Do not rename user-facing rule labels to encode backend caveats; keep naming stable and document server-specific semantics in code comments and focused tests instead.
+11. Outbound HTTP: every client goes through `ExternalApiService` or `applyHttpRetry` (`modules/api/lib/httpRetry.ts`) - never the bare global `axios`, which carries no retry policy at all, and never a per-client `axios-retry` config. The shared policy already answers a 429 with the wait the server declared, capped at `MAX_RATE_LIMIT_WAIT_MS`; anything hand-rolled beside it only drifts.

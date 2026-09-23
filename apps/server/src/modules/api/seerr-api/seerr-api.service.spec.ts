@@ -1,4 +1,5 @@
 import { Mocked, TestBed } from '@suites/unit';
+import { MaintainerrLoggerFactory } from '../../logging/logs.service';
 import { SettingsDataService } from '../../settings/settings-data.service';
 import cacheManager from '../lib/cache';
 import { SEERR_REQUESTS_CACHE_ID } from './seerr-api.constants';
@@ -244,6 +245,97 @@ describe('SeerrApiService', () => {
   const page = (results: SeerrRequest[], pageNum: number, pages: number) => ({
     pageInfo: { page: pageNum, pages, pageSize: 100, results: pages * 100 },
     results,
+  });
+
+  it('reads the show uncached when fresh', async () => {
+    const getWithoutCache = jest.fn().mockResolvedValue({ id: 1 });
+    const get = jest.fn();
+    service.api = { get, getWithoutCache } as never;
+
+    await expect(service.getShow(1, { fresh: true })).resolves.toEqual({
+      id: 1,
+    });
+
+    expect(getWithoutCache).toHaveBeenCalledWith('/tv/1');
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  describe('removeSeasonRequest', () => {
+    const tvRequest = (id: number, seasonNumbers: number[]) =>
+      ({
+        id,
+        type: 'tv',
+        status: SeerrRequestStatus.APPROVED,
+        createdAt: '2026-03-14T00:00:00.000Z',
+        updatedAt: '2026-03-14T00:00:00.000Z',
+        requestedBy: {} as never,
+        modifiedBy: {} as never,
+        is4k: false,
+        serverId: 1,
+        profileId: 1,
+        rootFolder: '/',
+        media: {} as never,
+        seasons: seasonNumbers.map((seasonNumber) => ({
+          id: seasonNumber,
+          name: `Season ${seasonNumber}`,
+          seasonNumber,
+          status: SeerrRequestStatus.APPROVED,
+        })),
+      }) as never;
+
+    const arrange = (requests: unknown[]) => {
+      jest.spyOn(service, 'getShow').mockResolvedValue({
+        id: 100,
+        mediaInfo: {
+          id: 7,
+          tmdbId: 100,
+          tvdbId: 200,
+          status: 1,
+          updatedAt: '2026-03-14T00:00:00.000Z',
+          mediaAddedAt: '2026-03-14T00:00:00.000Z',
+          externalServiceId: 1,
+          externalServiceId4k: 1,
+          mediaType: 'tv',
+          requests,
+        },
+      } as never);
+
+      const del = jest.fn().mockResolvedValue('');
+      service.api = { delete: del } as never;
+      return del;
+    };
+
+    it('deletes only the requests covering the season', async () => {
+      const del = arrange([tvRequest(10, [1]), tvRequest(11, [2])]);
+
+      await expect(service.removeSeasonRequest(100, 1)).resolves.toBe(true);
+
+      expect(service.getShow).toHaveBeenCalledWith(100, { fresh: true });
+      expect(del).toHaveBeenCalledTimes(1);
+      expect(del).toHaveBeenCalledWith('/request/10', undefined, {
+        rethrow: true,
+      });
+    });
+
+    // Deleting the media record cascades into every request it holds, so a
+    // season with none of its own must not take the other seasons with it.
+    it('keeps the media record when another season is still requested', async () => {
+      const del = arrange([tvRequest(11, [2])]);
+
+      await expect(service.removeSeasonRequest(100, 1)).resolves.toBe(false);
+
+      expect(del).not.toHaveBeenCalled();
+    });
+
+    it('clears the stale media record when nothing is requested at all', async () => {
+      const del = arrange([]);
+
+      await expect(service.removeSeasonRequest(100, 1)).resolves.toBe(true);
+
+      expect(del).toHaveBeenCalledWith('/media/7', undefined, {
+        rethrow: true,
+      });
+    });
   });
 
   describe('getRequests', () => {
@@ -507,5 +599,40 @@ describe('SeerrApiService', () => {
         'alice',
       ]);
     });
+  });
+});
+
+describe('SeerrApiService.init lifecycle', () => {
+  let service: SeerrApiService;
+  let settings: Mocked<SettingsDataService>;
+
+  beforeEach(async () => {
+    const { unit, unitRef } = await TestBed.solitary(SeerrApiService).compile();
+    service = unit;
+    settings = unitRef.get(
+      SettingsDataService,
+    ) as unknown as Mocked<SettingsDataService>;
+    unitRef.get(MaintainerrLoggerFactory).createLogger.mockReturnValue({
+      setContext: jest.fn(),
+      log: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+      debug: jest.fn(),
+    } as never);
+  });
+
+  // Removing Seerr from settings left the previous client in place, so the app
+  // kept querying an integration the user had deleted until the next restart.
+  it('drops the client when the settings are removed', () => {
+    settings.seerr_url = 'http://seerr.local';
+    settings.seerr_api_key = 'key';
+    service.init();
+    expect(service.api).toBeDefined();
+
+    settings.seerr_url = null;
+    settings.seerr_api_key = null;
+    service.init();
+
+    expect(service.api).toBeUndefined();
   });
 });

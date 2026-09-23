@@ -39,7 +39,7 @@ If you prefer to set up your development environment manually (specific to a Win
 
 - HTML/TypeScript/JavaScript editor
 - [VSCode](https://code.visualstudio.com/) is recommended. Upon opening the project, a few extensions will be automatically recommended for install.
-- [NodeJS](https://nodejs.org/en/download/) (Node 22.x or higher)
+- [NodeJS](https://nodejs.org/en/download/) (Node 26+)
 - [Git](https://git-scm.com/downloads)
 
 #### Getting Started
@@ -102,6 +102,12 @@ If you prefer to set up your development environment manually (specific to a Win
    ```
 
    - If the build fails with PowerShell, try to use cmd instead.
+   - `yarn dev` skips the media server setup guard so you land straight in the
+     app. To work on the first-run experience, use `yarn dev:fresh-setup`
+     instead: it sets `VITE_BYPASS_MEDIA_SERVER_SETUP_GUARD=false`, which turns
+     the guard back on. You also need a database with no media server
+     configured, otherwise setup is already complete and nothing is gated. The
+     guard is always active in production builds.
 
 8. Make your code changes/improvements and test that they work as intended.
    - Be sure to follow both the [code](#contributing-code) and [UI text](#ui-text-style) guidelines.
@@ -142,6 +148,56 @@ By submitting a pull request, you confirm that:
 - You take full responsibility for the contribution, regardless of how it was produced
 
 Pull requests that appear to be largely unreviewed, low-effort, or misaligned with Maintainerr’s design and coding standards may be closed without detailed feedback.
+
+### Browser Testing with Playwright
+
+Playwright is not a repo dependency and there is no browser test suite. UI
+verification runs through the `playwright` MCP server, wired up per client in
+[.mcp.json](.mcp.json) (Claude Code), [.vscode/mcp.json](.vscode/mcp.json)
+(VS Code), and [.codex/config.toml](.codex/config.toml) (Codex). Keep the three
+in sync.
+
+```json
+{
+  "mcpServers": {
+    "playwright": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "@playwright/mcp@latest",
+        "--headless",
+        "--isolated",
+        "--no-sandbox",
+        "--executable-path",
+        "/usr/bin/chromium",
+        "--output-dir",
+        ".playwright-mcp"
+      ]
+    }
+  }
+}
+```
+
+`--executable-path` assumes a system Chromium; drop it and `--no-sandbox` if you
+do not have one. Start your editor from the repo root, or the project config
+never loads. For flows that need Plex, Jellyfin, or Radarr data, run the mocks
+and seed in [tools/dev/](tools/dev/) first, as described in
+[AGENTS.md](AGENTS.md).
+
+#### What to Attach to a Pull Request
+
+`.playwright-mcp/` is gitignored deliberately. Screenshots are evidence for
+reviewers, not repo content, so attach them to the pull request and do not
+commit them.
+
+Match the evidence to the change. One screenshot per flow you touched is plenty;
+a wall of them buries the review. When the visible change is small, for example
+a new dropdown entry, tests and captured logs or API responses are the real
+evidence and a single screenshot is a formality. The screenshot-every-flow rule
+in
+[release-review.instructions.md](.github/instructions/release-review.instructions.md)
+applies to maintainers auditing a release candidate, not to contributor pull
+requests.
 
 ### UI Text Style
 

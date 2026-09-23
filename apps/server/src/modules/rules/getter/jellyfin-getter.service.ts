@@ -14,11 +14,15 @@ import {
   Property,
   RuleConstants,
 } from '../constants/rules.constants';
-import { RulesDto } from '../dtos/rules.dto';
+import { RuleGroupDto } from '../dtos/ruleGroup.dto';
+import { ArrLookupCache } from '../helpers/arr-lookup-cache';
 import {
   filterRuleCollectionNames,
+  isValidDate,
+  isWatchedAfter,
   mapRuleUserIdsToNames,
 } from '../helpers/rule-property.helper';
+import { MetadataRuleValueService } from './metadata-rule-value.service';
 
 /**
  * Jellyfin Getter Service
@@ -40,6 +44,7 @@ export class JellyfinGetterService {
 
   constructor(
     private readonly jellyfinAdapter: JellyfinAdapterService,
+    private readonly metadataRuleValueService: MetadataRuleValueService,
     private readonly logger: MaintainerrLogger,
   ) {
     logger.setContext(JellyfinGetterService.name);
@@ -54,7 +59,8 @@ export class JellyfinGetterService {
     id: number,
     libItem: MediaItem,
     dataType?: MediaItemType,
-    ruleGroup?: RulesDto,
+    ruleGroup?: RuleGroupDto,
+    arrLookupCache?: ArrLookupCache,
   ): Promise<RuleValueType> {
     try {
       if (!this.jellyfinAdapter.isSetup()) {
@@ -66,6 +72,13 @@ export class JellyfinGetterService {
       if (!prop) {
         this.logger.warn(`Unknown Jellyfin property ID: ${id}`);
         return null;
+      }
+
+      if (prop.name === 'studios') {
+        return await this.metadataRuleValueService.getStudios(
+          libItem,
+          arrLookupCache,
+        );
       }
 
       // Which library's prefetched watch snapshot may answer the reads below.
@@ -106,7 +119,9 @@ export class JellyfinGetterService {
 
       switch (prop.name) {
         case 'addDate': {
-          return metadata.addedAt ? new Date(metadata.addedAt) : null;
+          return isValidDate(metadata.addedAt)
+            ? new Date(metadata.addedAt)
+            : null;
         }
 
         case 'seenBy': {
@@ -198,9 +213,10 @@ export class JellyfinGetterService {
 
         case 'collections': {
           // Number of collections this item is in
+          // An episode's own library id is its season; the group knows the library
           const collectionNames = await this.getCollectionNames(
             metadata.id,
-            metadata.library.id,
+            libraryId ?? metadata.library.id,
             ruleGroup,
           );
           return collectionNames.length;
@@ -220,6 +236,15 @@ export class JellyfinGetterService {
             );
           }
           return await this.getLastViewedAt(metadata.id, libraryId);
+        }
+
+        case 'lastPlayedAt': {
+          // Get newest play attempt across all users (includes unfinished views)
+          return await this.getLastPlayedAt(
+            metadata.id,
+            metadata.type,
+            libraryId,
+          );
         }
 
         case 'fileVideoResolution': {
@@ -246,11 +271,15 @@ export class JellyfinGetterService {
           return metadata.genres?.map((genre) => genre.name) ?? [];
         }
 
-        case 'sw_allEpisodesSeenBy': {
+        case 'sw_allEpisodesSeenBy':
+        case 'sw_allEpisodesSeenBySinceAdded': {
           return await this.getAllEpisodesSeenBy(
             metadata.id,
             metadata.type,
             libraryId,
+            prop.name === 'sw_allEpisodesSeenBySinceAdded'
+              ? this.getAddedAtCutoff(metadata.addedAt)
+              : undefined,
           );
         }
 
@@ -260,6 +289,88 @@ export class JellyfinGetterService {
             metadata.type,
             libraryId,
           );
+        }
+
+        case 'sw_lastViewedAtThroughSeason': {
+          // Does not apply is an answer, not a failed read (#3402) - see the
+          // Plex getter.
+          if (metadata.type !== 'season') {
+            return null;
+          }
+
+          const targetSeason = metadata.index;
+          const showId = metadata.parentId;
+          // Jellyfin files episodes it cannot place under a "Season Unknown" with
+          // no IndexNumber. Such a season has no position in the run of
+          // seasons, so the value cannot be computed - hold the item, but that
+          // is normal library shape and must not read as a failed lookup.
+          if (targetSeason === undefined) {
+            this.logger.debug(
+              `'${libItem.title}' has no season number, so a view date through it cannot be computed`,
+            );
+            return undefined;
+          }
+          if (
+            !Number.isSafeInteger(targetSeason) ||
+            targetSeason < 0 ||
+            typeof showId !== 'string' ||
+            !showId
+          ) {
+            throw new Error(
+              'Jellyfin season metadata is missing its valid scope',
+            );
+          }
+
+          const watchHistory = await this.descendantWatchHistory(
+            showId,
+            'show',
+            libraryId,
+          );
+          const seasons = await this.jellyfinAdapter.getChildrenMetadata(
+            showId,
+            'season',
+            true,
+          );
+          let latestWatchedAt: Date | null = null;
+
+          for (const season of seasons) {
+            if (season.index === undefined) continue;
+            if (!Number.isSafeInteger(season.index) || season.index < 0) {
+              throw new Error('Jellyfin returned an invalid season index');
+            }
+
+            const qualifies =
+              targetSeason === 0
+                ? season.index === 0
+                : season.index > 0 && season.index <= targetSeason;
+            if (!qualifies) continue;
+            if (!season.id) {
+              throw new Error('Jellyfin returned a season without an id');
+            }
+
+            const episodes = await this.jellyfinAdapter.getChildrenMetadata(
+              season.id,
+              'episode',
+              true,
+            );
+            for (const episode of episodes) {
+              if (!episode.id) {
+                throw new Error('Jellyfin returned an episode without an id');
+              }
+              const watchedAt = this.newestWatchedAt(
+                watchHistory[episode.id] ?? [],
+              );
+              if (!watchedAt) continue;
+              if (!Number.isFinite(watchedAt.getTime())) {
+                throw new Error('Jellyfin returned an invalid watch date');
+              }
+              if (!latestWatchedAt || watchedAt > latestWatchedAt) {
+                latestWatchedAt = watchedAt;
+              }
+            }
+          }
+
+          return latestWatchedAt;
         }
 
         case 'sw_episodes': {
@@ -333,18 +444,22 @@ export class JellyfinGetterService {
         // covered by the #2559 regression test in
         // jellyfin-getter.service.spec.ts. Use `sw_allEpisodesSeenBy` when
         // you need "watched every episode" semantics instead.
-        case 'sw_watchers': {
+        case 'sw_watchers':
+        case 'sw_watchersSinceAdded': {
           return await this.getSwWatchers(
             metadata.id,
             metadata.type,
             libraryId,
+            prop.name === 'sw_watchersSinceAdded'
+              ? this.getAddedAtCutoff(metadata.addedAt)
+              : undefined,
           );
         }
 
         case 'collection_names': {
           return await this.getCollectionNames(
             metadata.id,
-            metadata.library.id,
+            libraryId ?? metadata.library.id,
             ruleGroup,
           );
         }
@@ -364,7 +479,7 @@ export class JellyfinGetterService {
             metadata.id,
             parent?.id,
             grandparent?.id,
-            metadata.library.id,
+            libraryId ?? metadata.library.id,
             ruleGroup,
           );
         }
@@ -376,7 +491,7 @@ export class JellyfinGetterService {
             metadata.id,
             parent?.id,
             grandparent?.id,
-            metadata.library.id,
+            libraryId ?? metadata.library.id,
             ruleGroup,
           );
         }
@@ -530,15 +645,33 @@ export class JellyfinGetterService {
     itemId: string,
     type: MediaItemType,
     libraryId: string | undefined,
+    watchedAfter?: Date,
   ): Promise<Record<string, WatchRecord[]>> {
     if (!isMediaType(type, 'show') && !isMediaType(type, 'season')) {
       return {};
     }
 
-    return this.jellyfinAdapter.getDescendantEpisodeWatchHistory(
-      itemId,
-      libraryId,
+    const watchHistory =
+      await this.jellyfinAdapter.getDescendantEpisodeWatchHistory(
+        itemId,
+        libraryId,
+      );
+
+    if (watchedAfter === undefined) return watchHistory;
+
+    return Object.fromEntries(
+      Object.entries(watchHistory).map(([episodeId, records]) => [
+        episodeId,
+        records.filter((record) => isWatchedAfter(record, watchedAfter)),
+      ]),
     );
+  }
+
+  private getAddedAtCutoff(addedAt: Date): Date {
+    if (!isValidDate(addedAt)) {
+      throw new Error('Jellyfin metadata has an invalid addedAt timestamp');
+    }
+    return addedAt;
   }
 
   private newestWatchedAt(records: WatchRecord[]): Date | null {
@@ -559,14 +692,63 @@ export class JellyfinGetterService {
     );
   }
 
+  /**
+   * Jellyfin resolves a parentId that is not a container by falling back to the
+   * whole library, so only a show or a season may be walked; anything else is
+   * read directly. Series and seasons carry no LastPlayedDate of their own,
+   * hence the walk. `libraryId` lets each episode read come from the
+   * prefetched snapshot rather than a per-user fan-out.
+   */
+  private async getLastPlayedAt(
+    itemId: string,
+    type: MediaItemType,
+    libraryId: string | undefined,
+  ): Promise<Date | null> {
+    if (!isMediaType(type, 'show') && !isMediaType(type, 'season')) {
+      return this.jellyfinAdapter.getLastPlayedAt(itemId, libraryId);
+    }
+
+    const seasons =
+      type === 'season'
+        ? [{ id: itemId }]
+        : await this.jellyfinAdapter.getChildrenMetadata(
+            itemId,
+            'season',
+            true,
+          );
+    let latestDate: Date | null = null;
+
+    for (const season of seasons) {
+      const episodes = await this.jellyfinAdapter.getChildrenMetadata(
+        season.id,
+        'episode',
+        true,
+      );
+      for (const episode of episodes) {
+        const lastPlayedAt = await this.jellyfinAdapter.getLastPlayedAt(
+          episode.id,
+          libraryId,
+        );
+        if (lastPlayedAt && (!latestDate || lastPlayedAt > latestDate)) {
+          latestDate = lastPlayedAt;
+        }
+      }
+    }
+
+    return latestDate;
+  }
+
   private async getAllEpisodesSeenBy(
     itemId: string,
     type: MediaItemType,
     libraryId: string | undefined,
+    watchedAfter?: Date,
   ): Promise<string[]> {
-    const users = await this.jellyfinAdapter.getUsers();
+    const users = await this.jellyfinAdapter.getUsers(
+      watchedAfter !== undefined,
+    );
     const episodeWatchers = Object.values(
-      await this.descendantWatchHistory(itemId, type, libraryId),
+      await this.descendantWatchHistory(itemId, type, libraryId, watchedAfter),
     );
 
     if (episodeWatchers.length === 0) return [];
@@ -732,7 +914,7 @@ export class JellyfinGetterService {
       );
       for (const episode of episodes) {
         if (
-          episode.addedAt &&
+          isValidDate(episode.addedAt) &&
           (!latestAddedAt || episode.addedAt > latestAddedAt)
         ) {
           latestAddedAt = episode.addedAt;
@@ -773,8 +955,11 @@ export class JellyfinGetterService {
     itemId: string,
     type: MediaItemType,
     libraryId: string | undefined,
+    watchedAfter?: Date,
   ): Promise<string[]> {
-    const users = await this.jellyfinAdapter.getUsers();
+    const users = await this.jellyfinAdapter.getUsers(
+      watchedAfter !== undefined,
+    );
     let watcherIds: string[];
 
     switch (type) {
@@ -794,6 +979,7 @@ export class JellyfinGetterService {
           itemId,
           type,
           libraryId,
+          watchedAfter,
         );
         const watched = new Set(
           Object.values(watchHistory).flatMap((records) =>
@@ -827,7 +1013,7 @@ export class JellyfinGetterService {
   private async getCollectionNames(
     itemId: string,
     libraryId: string,
-    ruleGroup?: RulesDto,
+    ruleGroup?: RuleGroupDto,
   ): Promise<string[]> {
     // Cache the raw collection names (without exclusion filtering)
     // so we can apply different exclusions for different rule groups
@@ -835,19 +1021,9 @@ export class JellyfinGetterService {
     let allCollectionNames = this.cache.data.get<string[]>(cacheKey);
 
     if (!allCollectionNames) {
-      const collections = await this.jellyfinAdapter.getCollections(libraryId);
-      allCollectionNames = [];
-
-      for (const collection of collections) {
-        const children = await this.jellyfinAdapter.getCollectionChildren(
-          collection.id,
-        );
-
-        if (children.some((child) => child.id === itemId)) {
-          allCollectionNames.push(collection.title.trim());
-        }
-      }
-
+      allCollectionNames = (
+        await this.collectionNamesContaining([itemId], libraryId)
+      ).map((name) => name.trim());
       this.cache.data.set(cacheKey, allCollectionNames, 600);
     }
 
@@ -929,7 +1105,7 @@ export class JellyfinGetterService {
     parentId: string | undefined,
     grandparentId: string | undefined,
     libraryId: string,
-    ruleGroup?: RulesDto,
+    ruleGroup?: RuleGroupDto,
   ): Promise<number> {
     const names = await this.getCollectionNamesIncludingParent(
       itemId,
@@ -946,36 +1122,60 @@ export class JellyfinGetterService {
     parentId: string | undefined,
     grandparentId: string | undefined,
     libraryId: string,
-    ruleGroup?: RulesDto,
+    ruleGroup?: RuleGroupDto,
   ): Promise<string[]> {
-    const collections = await this.jellyfinAdapter.getCollections(libraryId);
-    const collectionNames: string[] = [];
-
     const idsToCheck = [itemId, parentId, grandparentId].filter(
       (id): id is string => id !== undefined,
     );
-
-    for (const collection of collections) {
-      const children = await this.jellyfinAdapter.getCollectionChildren(
-        collection.id,
-      );
-
-      const hasMatch = children.some((child) => idsToCheck.includes(child.id));
-
-      if (hasMatch) {
-        collectionNames.push(collection.title);
-      }
-    }
+    const collectionNames = await this.collectionNamesContaining(
+      idsToCheck,
+      libraryId,
+    );
 
     return Array.from(
       new Set(filterRuleCollectionNames(collectionNames, ruleGroup)),
     );
   }
 
+  /**
+   * Titles of the collections holding any of the ids, one entry per match.
+   * Jellyfin 12 lists an item's collections directly; older servers fall back
+   * to scanning the children of every collection in the library.
+   */
+  private async collectionNamesContaining(
+    ids: string[],
+    libraryId: string,
+  ): Promise<string[]> {
+    const names: string[] = [];
+    for (const id of ids) {
+      const direct = await this.jellyfinAdapter.getCollectionsContaining(id);
+      if (!direct) return this.collectionNamesByChildScan(ids, libraryId);
+      names.push(...direct.map((collection) => collection.title));
+    }
+    return names;
+  }
+
+  private async collectionNamesByChildScan(
+    ids: string[],
+    libraryId: string,
+  ): Promise<string[]> {
+    const collections = await this.jellyfinAdapter.getCollections(libraryId);
+    const names: string[] = [];
+    for (const collection of collections) {
+      const children = await this.jellyfinAdapter.getCollectionChildren(
+        collection.id,
+      );
+      if (children.some((child) => ids.includes(child.id))) {
+        names.push(collection.title);
+      }
+    }
+    return names;
+  }
+
   private async getCollectionSiblingsLastViewedAt(
     itemId: string,
     libraryId: string,
-    ruleGroup?: RulesDto,
+    ruleGroup?: RuleGroupDto,
   ): Promise<Date | null> {
     const collections = await this.jellyfinAdapter.getCollections(libraryId);
     const includedCollectionNames = new Set(

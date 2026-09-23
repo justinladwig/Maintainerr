@@ -1,5 +1,5 @@
-import { cleanup, render, screen } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { render, screen } from '../test-utils/render'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useCollection } from '../api/collections'
 import { useRuleGroupForCollection } from '../api/rules'
 import type { ICollection } from '../components/Collection'
@@ -79,15 +79,6 @@ vi.mock('react-router-dom', async () => {
   }
 })
 
-vi.mock(
-  '../components/Collection/CollectionDetail/CollectionDetailControlRow',
-  () => ({
-    default: ({ children }: { children?: React.ReactNode }) => (
-      <div data-testid="collection-detail-control-row">{children}</div>
-    ),
-  }),
-)
-
 vi.mock('../components/Common/LazyModalBoundary', () => ({
   default: ({ children }: { children?: React.ReactNode }) => (
     <div>{children}</div>
@@ -107,7 +98,6 @@ describe('CollectionDetailPage', () => {
   const useRuleGroupForCollectionMock = vi.mocked(useRuleGroupForCollection)
 
   beforeEach(() => {
-    cleanup()
     navigate.mockReset()
     useLocation.mockReset()
     useParams.mockReset()
@@ -122,10 +112,6 @@ describe('CollectionDetailPage', () => {
     useRuleGroupForCollectionMock.mockReturnValue(
       buildQuerySuccessResult(buildRuleGroup()),
     )
-  })
-
-  afterEach(() => {
-    cleanup()
   })
 
   it('renders collection content once collection data is available', () => {

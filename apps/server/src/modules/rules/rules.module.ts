@@ -1,4 +1,4 @@
-import { Module, forwardRef } from '@nestjs/common';
+import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ActionsModule } from '../actions/actions.module';
 import { MediaServerModule } from '../api/media-server/media-server.module';
@@ -7,6 +7,7 @@ import { PlexApiModule } from '../api/plex-api/plex-api.module';
 import { ServarrApiModule } from '../api/servarr-api/servarr-api.module';
 import { StreamystatsApiModule } from '../api/streamystats-api/streamystats-api.module';
 import { TautulliApiModule } from '../api/tautulli-api/tautulli-api.module';
+import { TracearrApiModule } from '../api/tracearr-api/tracearr-api.module';
 import { CollectionsModule } from '../collections/collections.module';
 import { Collection } from '../collections/entities/collection.entities';
 import { CollectionMedia } from '../collections/entities/collection_media.entities';
@@ -24,13 +25,16 @@ import { Rules } from './entities/rules.entities';
 import { EmbyGetterService } from './getter/emby-getter.service';
 import { ValueGetterService } from './getter/getter.service';
 import { JellyfinGetterService } from './getter/jellyfin-getter.service';
+import { MetadataRuleValueService } from './getter/metadata-rule-value.service';
 import { SeerrGetterService } from './getter/seerr-getter.service';
 import { PlexGetterService } from './getter/plex-getter.service';
 import { RadarrGetterService } from './getter/radarr-getter.service';
 import { SonarrGetterService } from './getter/sonarr-getter.service';
 import { SportarrGetterService } from './getter/sportarr-getter.service';
+import { RuleUsersService } from './rule-users.service';
 import { StreamystatsGetterService } from './getter/streamystats-getter.service';
 import { TautulliGetterService } from './getter/tautulli-getter.service';
+import { TracearrGetterService } from './getter/tracearr-getter.service';
 import {
   RuleComparatorService,
   RuleComparatorServiceFactory,
@@ -65,9 +69,10 @@ import { RuleMaintenanceService } from './tasks/rule-maintenance.service';
     SeerrApiModule,
     TautulliApiModule,
     StreamystatsApiModule,
+    TracearrApiModule,
     MetadataModule,
     ActionsModule,
-    forwardRef(() => CollectionsModule),
+    CollectionsModule,
     TasksModule,
   ],
   providers: [
@@ -81,12 +86,15 @@ import { RuleMaintenanceService } from './tasks/rule-maintenance.service';
     PlexGetterService,
     JellyfinGetterService,
     EmbyGetterService,
+    MetadataRuleValueService,
     RadarrGetterService,
     SonarrGetterService,
     SportarrGetterService,
     SeerrGetterService,
     TautulliGetterService,
     StreamystatsGetterService,
+    RuleUsersService,
+    TracearrGetterService,
     ValueGetterService,
     RuleYamlService,
     RuleComparatorService,

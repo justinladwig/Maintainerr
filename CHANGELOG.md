@@ -1,3 +1,280 @@
+# [3.29.0](https://github.com/Maintainerr/Maintainerr/compare/v3.28.0...v3.29.0) (2026-09-16)
+
+
+## Highlights
+- Trigger a targeted media server folder rescan immediately after an *arr delete to ensure items are removed from libraries without waiting for a full scan (#3720).
+- Optimize collection size calculations to perform one sweep per collection instead of one per removed item, preventing media server flooding (#3718).
+
+## Dependencies
+- Update 18 dependencies including yaml, nodemailer, konva, @types/node, react-konva, lingui, compression, @jellyfin/sdk, @babel/core, react-hook-form, @lingui/vite-plugin, rolldown, knip, vite, @lingui/babel-plugin-lingui-macro, zod, react, and @nestjs/schematics.
+
+# [3.28.0](https://github.com/Maintainerr/Maintainerr/compare/v3.27.0...v3.28.0) (2026-09-11)
+
+
+## Highlights
+- Add support for Transmission as a download client for job cleanup (#3693).
+- Correct the seeding time unit comparison for qBittorrent and ensure unlimited downloads seed for at least 23 hours (#3692).
+
+## Features
+- Add Podman Quadlet example to the README (#3694).
+
+## Fixes
+- Read no download client as null instead of defaulting to qBittorrent (#3714).
+- Clear the download client URL when the client type changes.
+- Honour forced request removal for delete-show-if-empty actions (#3691).
+
+## Database migrations
+- Added `download_client_type` column to the settings table.
+- Updated the `download_client_type` column to allow null values.
+
+## Dependencies
+- Bumped 25 dependencies including typescript-eslint, typeorm, and vitest.
+
+## New Contributors
+* @MartyPortatoes made their first contribution in https://github.com/Maintainerr/Maintainerr/pull/3693
+
+# [3.27.0](https://github.com/Maintainerr/Maintainerr/compare/v3.26.0...v3.27.0) (2026-09-05)
+
+
+## Highlights
+- Resolved an issue where items were incorrectly marked as manual in collections, preventing rule-based removal (#3636).
+- Added new watcher list rules for Plex, Jellyfin, and Emby to filter by users who watched media since it was added (#3532).
+
+## Fixes
+- Read the Sonarr episode list fresh before unmonitoring or deleting files (#3676).
+- Increase HTTP timeouts to prevent premature deletion failures during large media server operations (#3674, #3673).
+- Improve UI error reporting for bulk actions to provide specific failure reasons (#3643).
+- Drop rule-removal markers when a collection stops syncing (#3644).
+- Correctly identify custom collections as siblings when guarding adoption (#3641).
+- Clear cached collection children after a Plex collection mutation (#3640).
+- Treat an unset deletion window as never instead of immediately (#3639).
+- Report additions that failed due to missing media server collections (#3638).
+- Prevent stale-link resync from incorrectly marking manual collection members as manual (#3637).
+- Prevent calendar month skipping when navigating dates (#3635).
+
+## Database migrations
+- Added a `direction` column to the `collection_media_rule_removal` table to track pending removal actions.
+
+## Internal
+- Refactor bulk outcome reporting to use the outcome object directly (#3654).
+- Refactor rule capability checks to query server capabilities instead of server type (#3642).
+- Transpile NestJS packages to support ESM under Jest (#3628).
+
+## Dependencies
+- Updated 34 dependencies including NestJS, Jest, and various ESLint plugins.
+
+# [3.26.0](https://github.com/Maintainerr/Maintainerr/compare/v3.25.0...v3.26.0) (2026-08-30)
+
+
+## Highlights
+- Add Sportarr metadata provider for league artwork and descriptions (#3606).
+- Add season view date rules for Plex, Jellyfin, and Emby (#3531).
+
+## Features
+- Read native Sportarr IDs stamped by media server agents (#3604).
+
+## Fixes
+- Fix Fider users endpoint pagination (#3623).
+- Fix metadata provider ID parsing for non-numeric values (#3620).
+- Fix settings repository reads to properly await database operations (#3614).
+- Fix HTTP rate limiting and retry policy to respect declared wait times (#3613).
+- Fix Sportarr metadata availability, refresh behavior, and UI display (#3606).
+- Fix telemetry prompt to respect existing environment configuration (#3608).
+
+## Internal
+- Document Playwright evidence expectations and outbound HTTP rules (#3612, #3613).
+- Document Podman devbox confinement (#3531).
+- Update Sportarr ID helpers and metadata hub specifications (#3604, #3606).
+- Refactor UI refresh logic (#3606).
+
+## Dependencies
+- 9 dependency bumps including nestjs, typescript-eslint, eslint, and @tanstack/react-query.
+
+## New Contributors
+* @whitestrake made their first contribution in https://github.com/Maintainerr/Maintainerr/pull/3531
+
+# [3.25.0](https://github.com/Maintainerr/Maintainerr/compare/v3.24.0...v3.25.0) (2026-08-25)
+
+
+## Highlights
+- Added anonymous weekly telemetry to help development track usage (#3582).
+- Added a per-collection option to keep collections local to Maintainerr without syncing to the media server (#3579).
+
+## Features
+- Added telemetry schedule visibility and support for the `TELEMETRY=off` environment variable (#3592).
+
+## Fixes
+- Improved modal and dialog layout, including consistent close controls and improved responsiveness (#3595, #3600).
+- Fixed telemetry consent prompt to only appear for existing installs (#3599).
+- Fixed Monaco editor loading by serving it locally and compressing assets (#3592).
+- Removed telemetry information from the About page (#3592).
+- Fixed collection teardown logic to prevent accidental deletion of shared collections when settings change (#3579, #3583).
+- Fixed *arr exclusion tag application when multiple instances are configured (#3578).
+
+## Database migrations
+- Added `keepInMaintainerrOnly` column to the collection table.
+- Added `telemetryEnabled` column to the settings table.
+
+## Internal
+- Updated CI to allow the release PR to carry Weblate translations.
+
+## Dependencies
+- Updated 8 dependencies including react-hook-form, vite, and vitest.
+
+# [3.24.0](https://github.com/Maintainerr/Maintainerr/compare/v3.23.0...v3.24.0) (2026-08-21)
+
+
+## Highlights
+- Make the remaining UI strings translatable to support full localization (#3510).
+- Automatically label issues and pull requests by media server to improve triage (#3562).
+
+## Features
+- Report upstream API endpoint drift to detect breaking changes early (#3541).
+- Link untranslated text hints to the Weblate engagement page (#3560).
+
+## Fixes
+- Overlays: queue reverts behind runs, guard countdown math (#3558), and ensure reset removes all drawn elements (#3557).
+- Overlays: propagate episode countdowns to series when Plex hides seasons (#3534) and map templates to visible artwork regions (#3533).
+- Prevent collections from being incorrectly matched as movies (#3550).
+- CI: gate labels on precision checks (#3567), honour pinned servers on BoxSet reports, and drop unused AI_MODEL_ENDPOINT passthrough (#3566).
+- UI: fix layout viewport overflow, clipped panel labels, and sort order (#3560).
+- UI: remove BETA wording from the About page (#3553).
+- i18n: give layer-visibility toggle unique Show/Hide strings (#3554).
+- i18n: reject translations that change ICU argument structures (#3548) or fail to compile (#3546).
+- i18n: decode catalogs using pofile-ts to ensure validator matches runtime (#3510).
+- CI: fix review job crashes by installing pofile-ts dependencies (#3547).
+- UI: restore reachable loading states and fix event stream handling (#3510).
+
+## Internal
+- Document Jellyfin 12 changes and collection collapsing safety (#3572, #3573).
+- Add translation status badge to README (#3572).
+- Refactor i18n parsers, apply formatting, and harden review tooling (#3510).
+- Fix release sync issues and judge checks by newest runs (#3541).
+
+## Dependencies
+- Bump 10 dependencies including @nestjs/swagger, konva, and @swc/core.
+
+# [3.23.0](https://github.com/Maintainerr/Maintainerr/compare/v3.22.1...v3.23.0) (2026-08-17)
+
+
+## Highlights
+
+- Add `lastPlayedAt` rule for Plex, Tautulli, Tracearr, Streamystats, Jellyfin, and Emby (#3505, #3508).
+- Implement UI translation pipeline using Lingui and add initial translated strings (#3486, #3488).
+- Enable overlay countdowns on media items that leave the library alongside collection members (#3471).
+
+## Features
+
+- Include media type, title, and provider IDs in webhook media item payloads (#3464).
+
+## Fixes
+
+- Restrict overlay countdowns to only appear on media that the rule is configured to delete (#3514, #3515).
+- Batch collection removal notifications to prevent webhook rate limiting (#3500, #3506).
+- Ensure Fider bot re-checks post status before writing to prevent updates on closed requests (#3499).
+- Improve calendar display by correctly naming seasons scheduled for removal (#3472).
+- Clarify overlay template modes in the UI to distinguish between poster and title card templates (#3475).
+- Rescue missing Swedish translation strings and improve catalog validation (#3490, #3491).
+
+## Performance
+
+- Optimize Test Media runs by preventing redundant Tracearr history re-reads (#3483).
+
+## Internal
+
+- Update CI workflows to handle retired GitHub Models and Gemini endpoints (#3492, #3497).
+- Harden CI security and translation review processes (#3487, #3489, #3494, #3495, #3517).
+- Improve CI reliability with retry logic for model endpoints (#3528, #3529).
+
+## Dependencies
+
+- Update 25 dependencies including rolldown, turbo, and vite.
+
+## New Contributors
+* @jamcalli made their first contribution in https://github.com/Maintainerr/Maintainerr/pull/3464
+* @hosted-weblate[bot] made their first contribution in https://github.com/Maintainerr/Maintainerr/pull/3493
+* @dmunozv04 made their first contribution in https://github.com/Maintainerr/Maintainerr/pull/3505
+
+# [3.22.1](https://github.com/Maintainerr/Maintainerr/compare/v3.22.0...v3.22.1) (2026-08-09)
+
+
+### Fixes
+
+- fix: add search results to a collection, and exclude globally from a collection page (#3453)
+- fix(collections): size a collection in one read, not a request per item (#3449) (#3451)
+- fix(tracearr): keep watcher rules working and re-check a stale server binding (#3450)
+- fix(ui): keep the glass panels blurred in the production build
+- fix(tracearr): bind to the Tracearr server that tracks the managed media server (#3446)
+- fix(ui): drop the Tracearr-only unconfigured warning
+
+### Performance
+
+- perf(maintenance): clear the daily sweeps with one read, not one per row (#3452)
+
+### Other
+
+- test(ui): catch a vendor prefix written after its standard property
+
+### Dependencies
+
+- 1 dependency update (dompurify)
+
+# [3.22.0](https://github.com/Maintainerr/Maintainerr/compare/v3.21.1...v3.22.0) (2026-08-07)
+
+
+### Database migrations
+
+- `1785714034481-AddTracearrSettings.ts`
+
+### Features
+
+- feat(ui): keep the media actions reachable while the grid scrolls (#3443)
+- feat(collections): studio sorting for Plex, and manual/excluded sorts on collection media (#3430)
+- feat(media-server): read metadata for many items in one request (#3432)
+- feat(rules): scope watch statistics to one user (#3426)
+- feat: bulk media actions from one shared modal (#3411)
+- feat(notifications): notify when a Maintainerr update is available (#3414)
+- feat: add studio rules, sorting, and bulk exclusions (#3393)
+- feat(rules): add Tracearr watch history application (#3387)
+
+### Fixes
+
+- fix(download-client): keep the qBittorrent session on 5.2+ (#3437) (#3438)
+- fix: address release-review findings across rules, collections and integrations (#3436)
+- fix(collections): read collection media parents in one request (#3435)
+- fix(seerr): keep the other seasons' requests when one has none (#3433)
+- fix(collections): keep the enrichment reads under SQLite's parameter cap (#3431)
+- fix(plex): read collection children ids from the listing, not per child (#3429)
+- fix(seerr): only report a removal or a sync that actually happened (#3428)
+- fix(settings): normalise trailing slashes off service URLs instead of rejecting them (#3422)
+- fix: reject the identifiers that turn a single delete into a bulk one (#3420)
+- fix(rules): scope Sonarr season rules to the season being evaluated (#3419)
+- fix(seerr): key the forced media removal on the collection type (#3418)
+- fix(sonarr): require a season number before any season-scoped action (#3417)
+- fix(emby): user-scope the item reads that decide a collection's fate (#3413)
+- fix: harden the appliance against cross-origin reads, unvalidated settings bodies, HTML in email and world-writable code (#3407)
+- fix(rules): say which integration a stalled rule group is waiting on (#3402)
+- fix(rules): keep items that cannot be looked up out of NOT_EXISTS matches (#3406)
+- fix(rules): keep Plex watchlist rules working when a user's watchlist is private (#3400)
+- fix(rules): stop a failed arr disk space read counting as a real figure (#3401)
+- fix(rules): stop shows without a league alias pinning Sportarr rules forever (#3405)
+- fix(rules): stop items with no external IDs pinning arr and Seerr rules forever (#3403)
+
+### Refactors
+
+- refactor(rules): name the rule group DTO for what it holds (#3425)
+
+### Other
+
+- docs(release-review): audit the dependency tree before tagging
+- test(jellyfin): cover the batch metadata read, with a date the clock cannot move
+- test(emby): stop the metadata parity test racing the clock (#3434)
+- test(ui): unmount rendered components after every test in one place (#3409)
+
+### Dependencies
+
+- 17 dependency updates (@typescript-eslint/eslint-plugin, @typescript-eslint/parser, typescript-eslint, rolldown, globals, @hookform/resolvers, fast-uri, nodemailer, react-hook-form, @types/lodash, …)
+
 # [3.21.1](https://github.com/Maintainerr/Maintainerr/compare/v3.21.0...v3.21.1) (2026-08-02)
 
 

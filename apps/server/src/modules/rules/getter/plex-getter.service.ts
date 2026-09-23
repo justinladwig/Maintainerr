@@ -4,9 +4,13 @@ import {
   RuleValueType,
 } from '@maintainerr/contracts';
 import { Injectable } from '@nestjs/common';
-import { SimplePlexUser } from '../../..//modules/api/plex-api/interfaces/library.interfaces';
+import {
+  PlexSeenBy,
+  SimplePlexUser,
+} from '../../..//modules/api/plex-api/interfaces/library.interfaces';
 import { PlexApiService } from '../../../modules/api/plex-api/plex-api.service';
 import { PlexAdapterService } from '../../api/media-server/plex/plex-adapter.service';
+import { PlexMapper } from '../../api/media-server/plex/plex.mapper';
 import { PlexMetadata } from '../../api/plex-api/interfaces/media.interface';
 import { MaintainerrLogger } from '../../logging/logs.service';
 import {
@@ -14,7 +18,8 @@ import {
   Property,
   RuleConstants,
 } from '../constants/rules.constants';
-import { RulesDto } from '../dtos/rules.dto';
+import { RuleGroupDto } from '../dtos/ruleGroup.dto';
+import { ArrLookupCache } from '../helpers/arr-lookup-cache';
 import {
   countRuleCollectionNames,
   definedUniqueValues,
@@ -24,6 +29,7 @@ import {
   trimRulePropertyNames,
   uniqueTrimmedRulePropertyNames,
 } from '../helpers/rule-property.helper';
+import { MetadataRuleValueService } from './metadata-rule-value.service';
 
 @Injectable()
 export class PlexGetterService {
@@ -33,6 +39,7 @@ export class PlexGetterService {
   constructor(
     private readonly plexApi: PlexApiService,
     private readonly plexAdapter: PlexAdapterService,
+    private readonly metadataRuleValueService: MetadataRuleValueService,
     private readonly logger: MaintainerrLogger,
   ) {
     logger.setContext(PlexGetterService.name);
@@ -46,10 +53,18 @@ export class PlexGetterService {
     id: number,
     libItem: MediaItem,
     dataType?: MediaItemType,
-    ruleGroup?: RulesDto,
+    ruleGroup?: RuleGroupDto,
+    arrLookupCache?: ArrLookupCache,
   ): Promise<RuleValueType> {
     try {
       const prop = this.plexProperties.find((el) => el.id === id);
+
+      if (prop?.name === 'studios') {
+        return await this.metadataRuleValueService.getStudios(
+          libItem,
+          arrLookupCache,
+        );
+      }
 
       // Which library's prefetched watch-history snapshot may answer the reads
       // below. Absent (a single-item rule test) means every watch read goes
@@ -84,6 +99,16 @@ export class PlexGetterService {
         );
         return grandparentPromise;
       };
+
+      // The show a season/episode belongs to. Undefined for anything else, so
+      // the `*Show` properties answer `null` (does not apply) instead of
+      // throwing into the transient signal - same as Jellyfin and Emby.
+      const getShowMetadata = async (): Promise<PlexMetadata | undefined> =>
+        metadata?.type === 'season'
+          ? getParent()
+          : metadata?.type === 'episode'
+            ? getGrandparent()
+            : undefined;
 
       switch (prop.name) {
         case 'addDate': {
@@ -273,6 +298,13 @@ export class PlexGetterService {
           );
           return newest > 0 ? new Date(newest) : null;
         }
+        case 'lastPlayedAt': {
+          // Plex moves the item's own lastViewedAt on any playback but only
+          // writes a history row for a completed view, so the item field alone
+          // is the last play attempt (verified on 1.43). It therefore reports
+          // the same value lastViewedAt does on Plex.
+          return libItem.lastViewedAt ?? null;
+        }
         case 'fileVideoResolution': {
           return metadata.Media[0].videoResolution
             ? metadata.Media[0].videoResolution
@@ -295,61 +327,22 @@ export class PlexGetterService {
           );
           return item.Genre ? item.Genre.map((el) => el.tag) : null;
         }
-        case 'sw_allEpisodesSeenBy': {
-          const plexUsers = await this.plexApi.getCorrectedUsers(false);
-
-          const seasons =
-            metadata.type !== 'season'
-              ? await this.plexApi.getChildrenMetadata(metadata.ratingKey)
-              : [metadata];
-          const allViewers = plexUsers.slice();
-          for (const season of seasons) {
-            const episodes = await this.plexApi.getChildrenMetadata(
-              season.ratingKey,
-            );
-            for (const episode of episodes) {
-              // Errors propagate to the outer catch - silently treating a
-              // failed lookup as "no viewers" would drop genuine viewers from
-              // `allViewers` and mark the show as unwatched-by-everyone.
-              const viewers = await this.plexApi.getWatchHistory(
-                episode.ratingKey,
-                true,
-                'episode',
-                libraryId,
-              );
-
-              const arrLength = allViewers.length - 1;
-              allViewers
-                .slice()
-                .reverse()
-                .forEach((el, idx) => {
-                  if (
-                    !viewers.find((viewEl) => el.plexId === viewEl.accountID)
-                  ) {
-                    allViewers.splice(arrLength - idx, 1);
-                  }
-                });
-            }
-          }
-
-          if (allViewers && allViewers.length > 0) {
-            const viewerIds = allViewers.map((el) => +el.plexId);
-            return mapMatchingRuleUsersToNames(
-              viewerIds,
-              plexUsers,
-              (user) => user.plexId,
-              (user) => user.username,
-            );
-          }
-
-          return [];
-        }
+        case 'sw_allEpisodesSeenBy':
+        case 'sw_allEpisodesSeenBySinceAdded':
+          return await this.getUsersWhoWatchedEveryEpisode(
+            metadata,
+            libraryId,
+            prop.name === 'sw_allEpisodesSeenBySinceAdded'
+              ? this.getAddedAtCutoff(metadata)
+              : undefined,
+          );
         // At season/show level this returns the UNION of users that watched
         // any descendant episode - not the intersection. Plex's per-show
         // watch history aggregates child views, so any account that watched
         // at least one episode appears here. Use `sw_allEpisodesSeenBy` when
         // you need "watched every episode" semantics instead.
-        case 'sw_watchers': {
+        case 'sw_watchers':
+        case 'sw_watchersSinceAdded': {
           const plexUsers = await this.plexApi.getCorrectedUsers(false);
 
           const watchHistory = await this.plexApi.getWatchHistory(
@@ -359,9 +352,15 @@ export class PlexGetterService {
             libraryId,
           );
 
-          const viewers = watchHistory
-            ? watchHistory.map((el) => +el.accountID)
-            : [];
+          const watchedAfter =
+            prop.name === 'sw_watchersSinceAdded'
+              ? this.getAddedAtCutoff(metadata)
+              : undefined;
+          const viewers = (
+            watchedAfter === undefined
+              ? watchHistory
+              : this.filterWatchHistoryAfter(watchHistory, watchedAfter)
+          ).map((entry) => +entry.accountID);
           const uniqueViewers = [...new Set(viewers)];
 
           if (uniqueViewers && uniqueViewers.length > 0) {
@@ -394,6 +393,77 @@ export class PlexGetterService {
           );
           newestSeason.sort((a, b) => b.index - a.index);
           return new Date(+newestSeason[0].viewedAt * 1000);
+        }
+        case 'sw_lastViewedAtThroughSeason': {
+          // Does not apply is an answer, not a failed read. The executor sweeps
+          // a whole library at one dataType, so the transient signal would
+          // freeze every item in a wrongly-typed group (#3402).
+          if (metadata.type !== 'season') {
+            return null;
+          }
+
+          const currentSeason = metadata.index;
+          const showRatingKey = metadata.parentRatingKey;
+          if (
+            currentSeason === undefined ||
+            !Number.isSafeInteger(currentSeason) ||
+            currentSeason < 0 ||
+            typeof showRatingKey !== 'string' ||
+            !showRatingKey
+          ) {
+            throw new Error('Plex season metadata is missing its valid scope');
+          }
+
+          // Plex show history retains rows for episodes no longer in the
+          // library, so those views count. Jellyfin and Emby instead inspect
+          // the show's current episode children.
+          const watchHistory = await this.plexApi.getWatchHistory(
+            showRatingKey,
+            true,
+            'show',
+            libraryId,
+          );
+          let latestViewedAtMs: number | undefined;
+
+          for (const view of watchHistory) {
+            const viewedSeason = view.parentIndex;
+            if (
+              viewedSeason === undefined ||
+              !Number.isSafeInteger(viewedSeason) ||
+              viewedSeason < 0
+            ) {
+              // Stop rather than skip the row: dropping it under-reports views
+              // and would let NOT_EXISTS delete watched media. Name the cause -
+              // some connections omit the parent fields on history rows (#3082).
+              throw new Error(
+                `Plex history row for show ${showRatingKey} has no usable season (parentIndex ${viewedSeason}); some connections omit the parent fields on history rows (#3082)`,
+              );
+            }
+
+            const qualifies =
+              currentSeason === 0
+                ? viewedSeason === 0
+                : viewedSeason > 0 && viewedSeason <= currentSeason;
+            if (!qualifies) continue;
+            if (!Number.isFinite(view.viewedAt) || view.viewedAt < 0) {
+              throw new Error('Plex history row has invalid view date');
+            }
+
+            const viewedAtMs = view.viewedAt * 1000;
+            if (!Number.isFinite(new Date(viewedAtMs).getTime())) {
+              throw new Error('Plex history row has invalid view date');
+            }
+            if (
+              latestViewedAtMs === undefined ||
+              viewedAtMs > latestViewedAtMs
+            ) {
+              latestViewedAtMs = viewedAtMs;
+            }
+          }
+
+          return latestViewedAtMs === undefined
+            ? null
+            : new Date(latestViewedAtMs);
         }
         case 'sw_episodes': {
           if (metadata.type === 'season') {
@@ -510,55 +580,10 @@ export class PlexGetterService {
           // originallyAvailableAt is usually an ISO 8601 date string, no need to convert from epoch time
           return lastEpDate ? new Date(lastEpDate) : null;
         }
-        case 'watchlist_isListedByUsers': {
-          // returns a list of users that have this media item, or parent, in their watchlist
-          const parent = await getParent();
-          const grandparent = await getGrandparent();
-          const guid = grandparent
-            ? grandparent.guid
-            : parent
-              ? parent.guid
-              : metadata.guid;
-          const media_uuid = guid.match(/plex:\/\/[a-z]+\/([a-z0-9]+)$/);
-
-          const plexUsers: SimplePlexUser[] =
-            await this.plexApi.getCorrectedUsers();
-
-          // When plex.tv is unreachable, no users will have UUIDs. This is a
-          // transient transport failure, so return `undefined` - `null` would
-          // read as "confirmed absent" and let the executor remove protected
-          // items (#3307).
-          if (
-            plexUsers.length > 0 &&
-            !plexUsers.some((u) => u.uuid !== undefined)
-          ) {
-            this.logger.warn(
-              'Unable to check watchlists: no user UUIDs available (plex.tv may be unreachable)',
-            );
-            return undefined;
-          }
-
-          const usernames: string[] = [];
-          for (const u of plexUsers.filter(
-            (u) => u.uuid !== undefined && media_uuid !== undefined,
-          )) {
-            const watchlist = await this.plexApi.getWatchlistIdsForUser(
-              u.uuid,
-              u.username,
-            );
-            // A failed fetch would silently understate the list, so surface
-            // it as transient instead of a confirmed answer.
-            if (watchlist === undefined) {
-              return undefined;
-            }
-            if (watchlist.find((i) => i.id === media_uuid[1]) !== undefined) {
-              usernames.push(u.username);
-            }
-          }
-
-          return usernames;
-        }
+        case 'watchlist_isListedByUsers':
         case 'watchlist_isWatchlisted': {
+          // returns the users that have this media item, or its parent, in
+          // their watchlist
           const parent = await getParent();
           const grandparent = await getGrandparent();
           const guid = grandparent
@@ -566,43 +591,18 @@ export class PlexGetterService {
             : parent
               ? parent.guid
               : metadata.guid;
-          const media_uuid = guid.match(/plex:\/\/[a-z]+\/([a-z0-9]+)$/);
 
-          const plexUsers: SimplePlexUser[] =
-            await this.plexApi.getCorrectedUsers();
+          const asBoolean = prop.name === 'watchlist_isWatchlisted';
+          const usernames = await this.getWatchlistedByUsernames(
+            guid,
+            asBoolean,
+          );
 
-          // When plex.tv is unreachable, no users will have UUIDs. This is a
-          // transient transport failure, so return `undefined` - `null` would
-          // read as "confirmed absent" and let the executor remove protected
-          // items (#3307).
-          if (
-            plexUsers.length > 0 &&
-            !plexUsers.some((u) => u.uuid !== undefined)
-          ) {
-            this.logger.warn(
-              'Unable to check watchlists: no user UUIDs available (plex.tv may be unreachable)',
-            );
+          if (usernames === undefined) {
             return undefined;
           }
 
-          for (const u of plexUsers.filter(
-            (u) => u.uuid !== undefined && media_uuid !== undefined,
-          )) {
-            const watchlist = await this.plexApi.getWatchlistIdsForUser(
-              u.uuid,
-              u.username,
-            );
-            // A failed fetch cannot confirm "not watchlisted", so surface it
-            // as transient instead of a false negative.
-            if (watchlist === undefined) {
-              return undefined;
-            }
-            if (watchlist.find((i) => i.id === media_uuid[1]) !== undefined) {
-              return true;
-            }
-          }
-
-          return false;
+          return asBoolean ? usernames.length > 0 : usernames;
         }
         case 'sw_seasonLastEpisodeAiredAt': {
           const parent = await getParent();
@@ -649,10 +649,8 @@ export class PlexGetterService {
           );
         }
         case 'rating_imdbShow': {
-          const showMetadata =
-            metadata.type === 'season'
-              ? await getParent()
-              : await getGrandparent();
+          const showMetadata = await getShowMetadata();
+          if (!showMetadata) return null;
 
           return (
             showMetadata.Rating?.find(
@@ -661,10 +659,8 @@ export class PlexGetterService {
           );
         }
         case 'rating_rottenTomatoesCriticShow': {
-          const showMetadata =
-            metadata.type === 'season'
-              ? await getParent()
-              : await getGrandparent();
+          const showMetadata = await getShowMetadata();
+          if (!showMetadata) return null;
 
           return (
             showMetadata.Rating?.find(
@@ -673,10 +669,8 @@ export class PlexGetterService {
           );
         }
         case 'rating_rottenTomatoesAudienceShow': {
-          const showMetadata =
-            metadata.type === 'season'
-              ? await getParent()
-              : await getGrandparent();
+          const showMetadata = await getShowMetadata();
+          if (!showMetadata) return null;
 
           return (
             showMetadata.Rating?.find(
@@ -686,10 +680,8 @@ export class PlexGetterService {
           );
         }
         case 'rating_tmdbShow': {
-          const showMetadata =
-            metadata.type === 'season'
-              ? await getParent()
-              : await getGrandparent();
+          const showMetadata = await getShowMetadata();
+          if (!showMetadata) return null;
 
           return (
             showMetadata.Rating?.find(
@@ -904,5 +896,139 @@ export class PlexGetterService {
       );
       return undefined;
     }
+  }
+
+  private async getUsersWhoWatchedEveryEpisode(
+    metadata: PlexMetadata,
+    libraryId: string | undefined,
+    watchedAfter?: number,
+  ): Promise<string[]> {
+    const plexUsers = await this.plexApi.getCorrectedUsers(false);
+    const seasons =
+      metadata.type === 'season'
+        ? [metadata]
+        : await this.plexApi.getChildrenMetadata(metadata.ratingKey);
+    const allViewerIds = new Set(plexUsers.map((user) => user.plexId));
+    let hasEpisodes = false;
+
+    for (const season of seasons) {
+      const episodes = await this.plexApi.getChildrenMetadata(season.ratingKey);
+      for (const episode of episodes) {
+        hasEpisodes = true;
+        // Errors propagate to the outer catch - silently treating a failed
+        // lookup as "no viewers" would drop genuine viewers from `allViewerIds`
+        // and mark the show as unwatched-by-everyone.
+        const watchHistory = await this.plexApi.getWatchHistory(
+          episode.ratingKey,
+          true,
+          'episode',
+          libraryId,
+        );
+        const viewers =
+          watchedAfter === undefined
+            ? watchHistory
+            : this.filterWatchHistoryAfter(watchHistory, watchedAfter);
+        const episodeViewerIds = new Set(viewers.map((view) => view.accountID));
+        for (const viewerId of allViewerIds) {
+          if (!episodeViewerIds.has(viewerId)) {
+            allViewerIds.delete(viewerId);
+          }
+        }
+      }
+    }
+
+    if (!hasEpisodes) {
+      return [];
+    }
+
+    return mapMatchingRuleUsersToNames(
+      [...allViewerIds],
+      plexUsers,
+      (user) => user.plexId,
+      (user) => user.username,
+    );
+  }
+
+  private filterWatchHistoryAfter(
+    watchHistory: PlexSeenBy[],
+    watchedAfter: number,
+  ): PlexSeenBy[] {
+    return watchHistory.filter((entry) => {
+      if (!Number.isSafeInteger(entry.viewedAt) || entry.viewedAt < 0) {
+        throw new Error('Plex watch history has an invalid viewedAt timestamp');
+      }
+      return entry.viewedAt > watchedAfter;
+    });
+  }
+
+  private getAddedAtCutoff(metadata: PlexMetadata): number {
+    if (!Number.isSafeInteger(metadata.addedAt) || metadata.addedAt < 0) {
+      throw new Error('Plex metadata has an invalid addedAt timestamp');
+    }
+    return metadata.addedAt;
+  }
+
+  /**
+   * The users whose plex.tv watchlist holds the item behind `guid`.
+   *
+   * `undefined` means the answer could not be established and must not be read
+   * as "nobody" (#3307). `stopAtFirstMatch` skips the remaining lookups once a
+   * user matches, for the boolean property.
+   */
+  private async getWatchlistedByUsernames(
+    guid: string | undefined,
+    stopAtFirstMatch: boolean,
+  ): Promise<string[] | undefined> {
+    // Watchlist entries are keyed on the Plex agent id, so an item without one
+    // cannot be correlated with any watchlist. Transient rather than an empty
+    // answer: a definitive one would let unmatched and personal media match a
+    // "not watchlisted" rule.
+    const plexAgentId = PlexMapper.extractPlexAgentId(guid);
+    if (!plexAgentId) {
+      return undefined;
+    }
+
+    const plexUsers: SimplePlexUser[] = await this.plexApi.getCorrectedUsers();
+
+    // When plex.tv is unreachable, no users will have UUIDs. This is a
+    // transient transport failure, so return `undefined` - `null` would
+    // read as "confirmed absent" and let the executor remove protected
+    // items (#3307).
+    if (plexUsers.length > 0 && !plexUsers.some((u) => u.uuid !== undefined)) {
+      this.logger.warn(
+        'Unable to check watchlists: no user UUIDs available (plex.tv may be unreachable)',
+      );
+      return undefined;
+    }
+
+    const usernames: string[] = [];
+    for (const user of plexUsers.filter((u) => u.uuid !== undefined)) {
+      const watchlist = await this.plexApi.getWatchlistIdsForUser(
+        user.uuid,
+        user.username,
+      );
+
+      // A failed fetch would silently understate the list, so surface it as
+      // transient instead of a confirmed answer.
+      if (watchlist === undefined) {
+        return undefined;
+      }
+
+      // A watchlist Plex refuses to share is permanently unreadable, so skip
+      // that user and let the others still decide the rule - blocking on it
+      // stalls the whole rule forever (#3395).
+      if (watchlist === null) {
+        continue;
+      }
+
+      if (watchlist.some((entry) => entry.id === plexAgentId)) {
+        usernames.push(user.username);
+        if (stopAtFirstMatch) {
+          break;
+        }
+      }
+    }
+
+    return usernames;
   }
 }

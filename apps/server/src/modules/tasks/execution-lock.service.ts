@@ -2,6 +2,10 @@ import { Injectable } from '@nestjs/common';
 
 export const RULES_COLLECTIONS_EXECUTION_LOCK_KEY = 'rules-collections-lock';
 
+// Overlay runs, resets and reverts all read and write the same posters and
+// backups, so they take turns on this one.
+export const OVERLAY_EXECUTION_LOCK_KEY = 'overlay-lock';
+
 /*
  * A lightweight async lock for coordinating exclusive execution between tasks.
  * Acquiring returns a release function that must be called in a finally block.
@@ -9,6 +13,20 @@ export const RULES_COLLECTIONS_EXECUTION_LOCK_KEY = 'rules-collections-lock';
 @Injectable()
 export class ExecutionLockService {
   private readonly locks = new Map<string, Promise<void>>();
+  private ruleQueueProcessing = false;
+
+  /**
+   * True while the rule queue is draining, which spans the gaps between the
+   * per-run locks below. Kept here so the collections side can see it without
+   * depending on the rules module.
+   */
+  public isRuleQueueProcessing(): boolean {
+    return this.ruleQueueProcessing;
+  }
+
+  public setRuleQueueProcessing(processing: boolean): void {
+    this.ruleQueueProcessing = processing;
+  }
 
   public tryAcquire(key: string): (() => void) | null {
     if (this.locks.has(key)) {

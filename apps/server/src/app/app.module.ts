@@ -20,6 +20,8 @@ import { StreamystatsApiModule } from '../modules/api/streamystats-api/streamyst
 import { StreamystatsApiService } from '../modules/api/streamystats-api/streamystats-api.service';
 import { TautulliApiModule } from '../modules/api/tautulli-api/tautulli-api.module';
 import { TautulliApiService } from '../modules/api/tautulli-api/tautulli-api.service';
+import { TracearrApiModule } from '../modules/api/tracearr-api/tracearr-api.module';
+import { TracearrApiService } from '../modules/api/tracearr-api/tracearr-api.service';
 import { CollectionsModule } from '../modules/collections/collections.module';
 import { EventsModule } from '../modules/events/events.module';
 import { LogsModule } from '../modules/logging/logs.module';
@@ -31,11 +33,13 @@ import { RulesModule } from '../modules/rules/rules.module';
 import { SettingsModule } from '../modules/settings/settings.module';
 import { SettingsDataService } from '../modules/settings/settings-data.service';
 import { StorageMetricsModule } from '../modules/storage-metrics/storage-metrics.module';
+import { TelemetryModule } from '../modules/telemetry/telemetry.module';
+import { VersionModule } from '../modules/version/version.module';
 import { AppController } from './app.controller';
-import { AppService } from './app.service';
 import { HealthController } from './health.controller';
 import { HealthService } from './health.service';
 import ormConfig from './config/typeOrmConfig';
+import { resolveUiRootPath } from './config/uiPath';
 
 @Module({
   imports: [
@@ -55,6 +59,7 @@ import ormConfig from './config/typeOrmConfig';
     SeerrApiModule,
     TautulliApiModule,
     StreamystatsApiModule,
+    TracearrApiModule,
     DownloadClientApiModule,
     RulesModule,
     CollectionsModule,
@@ -62,6 +67,8 @@ import ormConfig from './config/typeOrmConfig';
     EventsModule,
     OverlaysModule,
     StorageMetricsModule,
+    TelemetryModule,
+    VersionModule,
     ServeStaticModule.forRootAsync({
       useFactory: () => {
         if (process.env.NODE_ENV !== 'production') {
@@ -70,7 +77,7 @@ import ormConfig from './config/typeOrmConfig';
 
         return [
           {
-            rootPath: join(__dirname, '..', 'ui'),
+            rootPath: resolveUiRootPath(join(__dirname, '..', 'ui')),
             serveRoot: process.env.BASE_PATH || undefined,
             exclude: ['/api/{*path}'],
           },
@@ -80,7 +87,6 @@ import ormConfig from './config/typeOrmConfig';
   ],
   controllers: [AppController, HealthController],
   providers: [
-    AppService,
     HealthService,
     {
       provide: APP_PIPE,
@@ -95,6 +101,7 @@ export class AppModule implements OnModuleInit {
     private readonly seerrApi: SeerrApiService,
     private readonly tautulliApi: TautulliApiService,
     private readonly streamystatsApi: StreamystatsApiService,
+    private readonly tracearrApi: TracearrApiService,
     private readonly downloadClientApi: DownloadClientApiService,
     private readonly notificationService: NotificationService,
   ) {}
@@ -108,6 +115,7 @@ export class AppModule implements OnModuleInit {
     this.seerrApi.init();
     this.tautulliApi.init();
     this.streamystatsApi.init();
+    this.tracearrApi.init();
     this.downloadClientApi.init();
 
     // intialize notification agents

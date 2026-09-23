@@ -12,6 +12,7 @@ import {
   watchHistoryCacheKey,
 } from './plex-api.constants';
 import { PlexConnection } from './interfaces/server.interface';
+import { NO_TIMEOUT } from '../lib/httpTimeouts';
 import { PlexApiService } from './plex-api.service';
 
 const createDeferred = () => {
@@ -142,6 +143,106 @@ describe('PlexApiService.getMetadata', () => {
     );
   });
 
+  // A membership decision made from a stale child list has already produced
+  // phantom manual members once (#1446), and nothing invalidated this cache.
+  it('drops the cached child pages after a collection add, and after one that failed', async () => {
+    const invalidateCachedUri = jest.fn();
+    (service as any).plexClient = {
+      putQuery: jest
+        .fn()
+        .mockResolvedValue({ MediaContainer: { Metadata: [{}] } }),
+      invalidateCachedUri,
+    };
+    (service as any).machineId = 'machine-1';
+
+    await service.addChildrenToCollection('col-1', ['item-1']);
+
+    expect(invalidateCachedUri).toHaveBeenCalledWith(
+      '/library/collections/col-1/children',
+    );
+
+    // The batch path is the one collection sync uses: Plex commits a write it
+    // has begun and can answer past the client timeout, so the cached list is
+    // no more trustworthy than on the success path.
+    invalidateCachedUri.mockClear();
+    (service as any).plexClient.putQuery = jest
+      .fn()
+      .mockRejectedValue(new Error('timeout of 30000ms exceeded'));
+
+    await service.addChildrenToCollection('col-1', ['item-1']);
+    expect(invalidateCachedUri).toHaveBeenCalledWith(
+      '/library/collections/col-1/children',
+    );
+  });
+
+  it('drops the cached child pages after a removal, and after one that failed', async () => {
+    const invalidateCachedUri = jest.fn();
+    (service as any).plexClient = {
+      deleteQuery: jest.fn().mockResolvedValue({}),
+      invalidateCachedUri,
+    };
+
+    await service.deleteChildFromCollection('col-1', 'item-1');
+    expect(invalidateCachedUri).toHaveBeenCalledWith(
+      '/library/collections/col-1/children',
+    );
+
+    // A write that failed may still have been applied, so the cached list is no
+    // more trustworthy than on the success path.
+    invalidateCachedUri.mockClear();
+    (service as any).plexClient.deleteQuery = jest
+      .fn()
+      .mockRejectedValue(new Error('timeout of 30000ms exceeded'));
+
+    await service.deleteChildFromCollection('col-1', 'item-1');
+    expect(invalidateCachedUri).toHaveBeenCalledWith(
+      '/library/collections/col-1/children',
+    );
+  });
+
+  // #3449: a collection still listing deleted media logged one
+  // "is the application running?" ERROR per item against a healthy Plex.
+  it('reports a 404 as a missing item, not as a communication failure', async () => {
+    (service as any).plexClient = {
+      query: jest.fn().mockRejectedValue(
+        new Error('GET /library/metadata/123 failed: not found', {
+          cause: { response: { status: 404 } } as any,
+        }),
+      ),
+    };
+
+    expect(await service.getMetadata('123')).toBeUndefined();
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  it('still reports a non-404 metadata failure as a communication failure', async () => {
+    (service as any).plexClient = {
+      query: jest.fn().mockRejectedValue(
+        new Error('GET /library/metadata/123 failed: server error', {
+          cause: { response: { status: 503 } } as any,
+        }),
+      ),
+    };
+
+    expect(await service.getMetadata('123')).toBeUndefined();
+    expect(logger.error).toHaveBeenCalledWith(
+      'Plex api communication failure.. Is the application running?',
+    );
+  });
+
+  it('reads an all-missing batch as an empty answer, not a failure', async () => {
+    (service as any).plexClient = {
+      query: jest.fn().mockRejectedValue(
+        new Error('GET /library/metadata/1,2 failed: not found', {
+          cause: { response: { status: 404 } } as any,
+        }),
+      ),
+    };
+
+    expect(await service.getMetadataBatch(['1', '2'])).toEqual([]);
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+
   it('preserves includeChildren queries while requesting external media enrichment', async () => {
     const query = jest.fn().mockResolvedValue({
       MediaContainer: { Metadata: [{ ratingKey: '123' }] },
@@ -198,6 +299,49 @@ describe('PlexApiService.getMetadata', () => {
     expect(await service.getCollectionChildren('col-1')).toEqual([]);
   });
 
+  it('asks for external guids so children arrive with provider ids', async () => {
+    const queryAll = jest.fn().mockResolvedValue({
+      MediaContainer: { Metadata: [{ ratingKey: '1' }] },
+    });
+
+    (service as any).plexClient = { queryAll };
+
+    await service.getCollectionChildren('col-1');
+
+    expect(queryAll).toHaveBeenCalledWith(
+      { uri: '/library/collections/col-1/children?includeGuids=1' },
+      true,
+    );
+  });
+
+  it('reads a batch of ids in one guid-carrying metadata request', async () => {
+    const query = jest.fn().mockResolvedValue({
+      MediaContainer: { Metadata: [{ ratingKey: '1' }, { ratingKey: '2' }] },
+    });
+
+    (service as any).plexClient = { query };
+
+    expect(await service.getMetadataBatch(['1', '2'])).toHaveLength(2);
+    expect(query).toHaveBeenCalledWith('/library/metadata/1,2?includeGuids=1');
+  });
+
+  it('makes no request for an empty batch', async () => {
+    const query = jest.fn();
+
+    (service as any).plexClient = { query };
+
+    expect(await service.getMetadataBatch([])).toEqual([]);
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it('reports no ids rather than failing the caller when a batch read fails', async () => {
+    const query = jest.fn().mockRejectedValue(new Error('boom'));
+
+    (service as any).plexClient = { query };
+
+    expect(await service.getMetadataBatch(['1'])).toEqual([]);
+  });
+
   it('re-throws children query failures instead of reporting an empty collection', async () => {
     const queryAll = jest.fn().mockRejectedValue(new Error('boom'));
 
@@ -245,7 +389,7 @@ describe('PlexApiService.getMetadata', () => {
     });
 
     (service as any).machineId = 'machine123';
-    (service as any).plexClient = { putQuery };
+    (service as any).plexClient = { putQuery, invalidateCachedUri: jest.fn() };
 
     await service.addChildrenToCollection('55', ['1', '2']);
 
@@ -265,7 +409,7 @@ describe('PlexApiService.getMetadata', () => {
     });
 
     (service as any).machineId = 'machine123';
-    (service as any).plexClient = { putQuery };
+    (service as any).plexClient = { putQuery, invalidateCachedUri: jest.fn() };
 
     const result = await service.addChildrenToCollection('55', ['1', '2']);
 
@@ -301,7 +445,7 @@ describe('PlexApiService.getMetadata', () => {
     );
 
     (service as any).machineId = 'machine123';
-    (service as any).plexClient = { putQuery };
+    (service as any).plexClient = { putQuery, invalidateCachedUri: jest.fn() };
 
     const result = await service.addChildrenToCollection('55', ['1', '2']);
 
@@ -317,7 +461,7 @@ describe('PlexApiService.getMetadata', () => {
 
   it('switches a collection into custom sort mode via prefs', async () => {
     const putQuery = jest.fn().mockResolvedValue(undefined);
-    (service as any).plexClient = { putQuery };
+    (service as any).plexClient = { putQuery, invalidateCachedUri: jest.fn() };
 
     await service.setCollectionCustomSort('55');
 
@@ -328,7 +472,7 @@ describe('PlexApiService.getMetadata', () => {
 
   it('omits the after parameter when moving an item to the front', async () => {
     const putQuery = jest.fn().mockResolvedValue(undefined);
-    (service as any).plexClient = { putQuery };
+    (service as any).plexClient = { putQuery, invalidateCachedUri: jest.fn() };
 
     await service.moveCollectionItem('55', '99');
 
@@ -339,7 +483,7 @@ describe('PlexApiService.getMetadata', () => {
 
   it('places an item after the given sibling when moving', async () => {
     const putQuery = jest.fn().mockResolvedValue(undefined);
-    (service as any).plexClient = { putQuery };
+    (service as any).plexClient = { putQuery, invalidateCachedUri: jest.fn() };
 
     await service.moveCollectionItem('55', '99', '42');
 
@@ -351,7 +495,10 @@ describe('PlexApiService.getMetadata', () => {
   it('uses the canonical Plex items path when deleting a collection child', async () => {
     const deleteQuery = jest.fn().mockResolvedValue(undefined);
 
-    (service as any).plexClient = { deleteQuery };
+    (service as any).plexClient = {
+      deleteQuery,
+      invalidateCachedUri: jest.fn(),
+    };
 
     await expect(
       service.deleteChildFromCollection('55', '99'),
@@ -373,7 +520,7 @@ describe('PlexApiService.getMetadata', () => {
       .mockRejectedValue(new Error('connect ECONNREFUSED 127.0.0.1:32400'));
 
     (service as any).machineId = 'machine123';
-    (service as any).plexClient = { putQuery };
+    (service as any).plexClient = { putQuery, invalidateCachedUri: jest.fn() };
 
     const result = await service.addChildrenToCollection('55', ['1']);
 
@@ -570,6 +717,62 @@ describe('PlexApiService.getMetadata', () => {
 // The diagnostic still distinguishes a missing section from an auth failure;
 // #3344 only changed the outcome - every failure now propagates instead of
 // reading downstream as "this library has no collections".
+describe('PlexApiService.deleteMediaFromDisk', () => {
+  let service: PlexApiService;
+
+  beforeEach(async () => {
+    const { unit } = await TestBed.solitary(PlexApiService).compile();
+    service = unit;
+  });
+
+  // Plex removes the file before it answers, so the request waits for it. The
+  // failure has to reach the caller: swallowed here, the adapter logged a
+  // success and the handler retired an item whose file was still on disk.
+  it('waits for the answer and surfaces a refused delete', async () => {
+    const deleteQuery = jest.fn().mockRejectedValue(new Error('denied'));
+    (service as any).plexClient = { deleteQuery };
+
+    await expect(service.deleteMediaFromDisk('4')).rejects.toThrow('denied');
+    expect(deleteQuery).toHaveBeenCalledWith({
+      uri: '/library/metadata/4',
+      timeout: NO_TIMEOUT,
+    });
+  });
+});
+
+describe('PlexApiService.scanFolder', () => {
+  let service: PlexApiService;
+
+  beforeEach(async () => {
+    const { unit } = await TestBed.solitary(PlexApiService).compile();
+    service = unit;
+  });
+
+  it('asks for an uncached partial scan of the folder', async () => {
+    const query = jest.fn().mockResolvedValue('');
+    (service as any).plexClient = { query };
+
+    await service.scanFolder('2', '/media/movies/Movie A (2021)');
+
+    expect(query).toHaveBeenCalledWith(
+      {
+        uri: '/library/sections/2/refresh?path=%2Fmedia%2Fmovies%2FMovie%20A%20(2021)',
+      },
+      false,
+    );
+  });
+
+  it('refuses an empty path, which would scan the whole section', async () => {
+    const query = jest.fn();
+    (service as any).plexClient = { query };
+
+    await expect(service.scanFolder('2', '')).rejects.toThrow(
+      'scanFolder called without a folder path',
+    );
+    expect(query).not.toHaveBeenCalled();
+  });
+});
+
 describe('PlexApiService.getCollections (invalid section vs auth)', () => {
   let service: PlexApiService;
   let settingsDataService: PlexApiSettingsStub;
@@ -1737,6 +1940,23 @@ describe('PlexApiService.resetMetadataCache', () => {
     );
   });
 
+  // A batch caches a whole id list under one key, which matching the uri as a
+  // whole never found.
+  it('drops a batched entry that holds the item among its ids', () => {
+    cache.set(key('/library/metadata/9,12,15?includeGuids=1'), 'batched');
+    cache.set(key('/library/metadata/9,15?includeGuids=1'), 'without the item');
+    cache.set(key('/library/metadata/121,123?includeGuids=1'), 'longer ids');
+
+    service.resetMetadataCache('12');
+
+    expect(cache.keys().sort()).toEqual(
+      [
+        key('/library/metadata/9,15?includeGuids=1'),
+        key('/library/metadata/121,123?includeGuids=1'),
+      ].sort(),
+    );
+  });
+
   // Jellyfin and Emby both drop watch state on reset; Plex did not, so a
   // just-watched item kept testing stale. History entries are keyed by leaf
   // ratingKey - not the id passed in - so the whole namespace goes.
@@ -1759,5 +1979,108 @@ describe('PlexApiService.resetMetadataCache', () => {
 
     expect(cache.keys()).toEqual([key('/library/sections')]);
     expect(watchCache.keys()).toEqual([]);
+  });
+});
+
+describe('PlexApiService.getWatchlistIdsForUser', () => {
+  let service: PlexApiService;
+  let communityLogger: { warn: jest.Mock; debug: jest.Mock };
+
+  const entry = {
+    id: 'movieuuid',
+    key: '/movieuuid',
+    title: 'Fixture Movie',
+    type: 'MOVIE',
+  };
+
+  const page = (nodes: unknown[], hasNextPage = false, endCursor = null) => ({
+    data: {
+      user: { watchlist: { nodes, pageInfo: { hasNextPage, endCursor } } },
+    },
+  });
+
+  beforeEach(async () => {
+    const { unit, unitRef } = await TestBed.solitary(PlexApiService).compile();
+    service = unit;
+
+    communityLogger = { warn: jest.fn(), debug: jest.fn() };
+    unitRef.get(MaintainerrLoggerFactory).createLogger.mockReturnValue({
+      setContext: jest.fn(),
+      log: jest.fn(),
+      error: jest.fn(),
+      ...communityLogger,
+    } as any);
+    Object.assign(unitRef.get(MaintainerrLogger), communityLogger);
+  });
+
+  const withQuery = (query: jest.Mock) => {
+    (service as any).plexCommunityClient = { query };
+    return query;
+  };
+
+  it('collects every page of the watchlist', async () => {
+    const query = withQuery(
+      jest
+        .fn()
+        .mockResolvedValueOnce(page([entry], true, 'cursor'))
+        .mockResolvedValueOnce(page([{ ...entry, id: 'showuuid' }])),
+    );
+
+    await expect(
+      service.getWatchlistIdsForUser('uuid-a', 'alice'),
+    ).resolves.toEqual([entry, { ...entry, id: 'showuuid' }]);
+    expect(query).toHaveBeenCalledTimes(2);
+  });
+
+  // plex.tv answers HTTP 200 with a `User not found:` GraphQL error for an
+  // account that hides its watchlist. That is definitive, so the caller must be
+  // able to skip the user instead of stalling the whole rule (#3395).
+  it.each([
+    ['a private watchlist', 'User not found: User privacy prevents viewing'],
+    [
+      'an account plex.tv does not know',
+      'User not found: Data loader item not found: users uuid=0000000000000000',
+    ],
+  ])('resolves null for %s', async (label, message) => {
+    withQuery(
+      jest.fn().mockResolvedValue({ errors: [{ message }], data: null }),
+    );
+
+    await expect(
+      service.getWatchlistIdsForUser('uuid-a', 'alice'),
+    ).resolves.toBeNull();
+    expect(communityLogger.warn).not.toHaveBeenCalled();
+  });
+
+  // Anything else stays transient: collapsing it would let a rule act on a
+  // watchlist that was never read (#3307).
+  it('resolves undefined for any other GraphQL error', async () => {
+    withQuery(
+      jest.fn().mockResolvedValue({
+        errors: [{ message: 'Internal server error' }],
+        data: null,
+      }),
+    );
+
+    await expect(
+      service.getWatchlistIdsForUser('uuid-a', 'alice'),
+    ).resolves.toBeUndefined();
+    expect(communityLogger.warn).toHaveBeenCalled();
+  });
+
+  it('resolves undefined when the request itself fails', async () => {
+    withQuery(jest.fn().mockResolvedValue(undefined));
+
+    await expect(
+      service.getWatchlistIdsForUser('uuid-a', 'alice'),
+    ).resolves.toBeUndefined();
+  });
+
+  it('resolves undefined when the community client throws', async () => {
+    withQuery(jest.fn().mockRejectedValue(new Error('boom')));
+
+    await expect(
+      service.getWatchlistIdsForUser('uuid-a', 'alice'),
+    ).resolves.toBeUndefined();
   });
 });

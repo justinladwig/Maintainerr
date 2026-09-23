@@ -1,4 +1,4 @@
-import axios from 'axios';
+import { rateLimitAwareHttp, retryingHttp } from '../../api/lib/httpRetry';
 import { MaintainerrLogger } from '../../logging/logs.service';
 import { SettingsDataService } from '../../settings/settings-data.service';
 import { Notification } from '../entities/notification.entities';
@@ -58,7 +58,7 @@ class PushoverAgent implements NotificationAgent {
     imageUrl: string,
   ): Promise<Partial<PushoverImagePayload>> {
     try {
-      const response = await axios.get(imageUrl, {
+      const response = await retryingHttp.get(imageUrl, {
         responseType: 'arraybuffer',
       });
       const base64 = Buffer.from(response.data, 'binary').toString('base64');
@@ -129,7 +129,7 @@ class PushoverAgent implements NotificationAgent {
       this.logger.log('Sending Pushover notification');
 
       try {
-        await axios.post(endpoint, {
+        await rateLimitAwareHttp.post(endpoint, {
           ...notificationPayload,
           token: settings.options.accessToken,
           user: settings.options.userToken,

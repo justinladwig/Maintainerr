@@ -360,6 +360,60 @@ describe('RuleMigrationService', () => {
       expect(result.rules[0].firstVal?.[0]).toBe(6); // 6 = JELLYFIN
     });
 
+    // The migration rewrites the property slots; everything else that gives a
+    // rule its meaning has to survive a server switch untouched.
+    it('keeps the per-rule fields when it rewrites a property', () => {
+      const rules: RuleDto[] = [
+        {
+          operator: null,
+          action: RulePossibility.BIGGER,
+          firstVal: [Application.PLEX, 0],
+          customVal: { ruleTypeId: 0, value: '3' },
+          username: 'alice',
+          arrDiskPath: '/movies',
+          section: 0,
+        },
+      ];
+
+      const result = service.migrateImportedRuleDtos(
+        rules,
+        MediaServerType.JELLYFIN,
+      );
+
+      expect(result.rules[0]).toMatchObject({
+        firstVal: [Application.JELLYFIN, 0],
+        customVal: { ruleTypeId: 0, value: '3' },
+        username: 'alice',
+        arrDiskPath: '/movies',
+      });
+    });
+
+    // Tautulli, Streamystats and Tracearr rules are carried across a server
+    // change untouched; the executor warns when the companion is unavailable.
+    it('leaves a companion per-user rule alone', () => {
+      const rules: RuleDto[] = [
+        {
+          operator: null,
+          action: RulePossibility.BIGGER,
+          firstVal: [Application.TAUTULLI, 9],
+          customVal: { ruleTypeId: 0, value: '1' },
+          username: 'alice',
+          section: 0,
+        },
+      ];
+
+      const result = service.migrateImportedRuleDtos(
+        rules,
+        MediaServerType.JELLYFIN,
+      );
+
+      expect(result.skippedRules).toBe(0);
+      expect(result.rules[0]).toMatchObject({
+        firstVal: [Application.TAUTULLI, 9],
+        username: 'alice',
+      });
+    });
+
     it('backfills an unset within-section operator to OR (pre-explicit-operator community rule)', () => {
       // Mirrors a real community rule (appVersion 2.19.0): three rules in one
       // section with the third operator left unset. reassert only fixes section
@@ -1111,6 +1165,39 @@ describe('RuleMigrationService', () => {
         'watchlist_isWatchlisted',
       );
       expect(rulesRepo.delete).toHaveBeenCalledWith(1);
+    });
+
+    it('migrates the shared studios property from Plex to Jellyfin', async () => {
+      const mockRules: Partial<Rules>[] = [
+        {
+          id: 1,
+          ruleGroupId: 1,
+          ruleJson: JSON.stringify({
+            operator: null,
+            action: RulePossibility.CONTAINS,
+            firstVal: [Application.PLEX, 46],
+            customVal: { ruleTypeId: 4, value: 'Company One' },
+            section: 0,
+          }),
+          ruleGroup: { id: 1, name: 'Studio Group' } as RuleGroup,
+        },
+      ];
+
+      rulesRepo.find.mockResolvedValue(mockRules as Rules[]);
+      rulesRepo.update.mockResolvedValue({ affected: 1 } as any);
+
+      const result = await service.migrateRules(
+        MediaServerType.PLEX,
+        MediaServerType.JELLYFIN,
+        true,
+      );
+
+      expect(result.migratedRules).toBe(1);
+      expect(result.skippedRules).toBe(0);
+      const updatedJson = JSON.parse(
+        rulesRepo.update.mock.calls[0][1].ruleJson as string,
+      );
+      expect(updatedJson.firstVal).toEqual([Application.JELLYFIN, 46]);
     });
 
     it('migrates Jellyfin rules to Emby as a no-op property remap (shared props)', async () => {

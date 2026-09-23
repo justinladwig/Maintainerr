@@ -32,6 +32,7 @@ import { addProviderId, emptyProviderIds } from '../media-provider-ids.utils';
 
 const GUID_SCHEME_SEPARATOR = '://';
 const LEGACY_AGENT_PREFIX = 'com.plexapp.agents.';
+const PLEX_AGENT_GUID_PREFIX = `plex${GUID_SCHEME_SEPARATOR}`;
 
 /**
  * Mapper for converting Plex-specific types to server-agnostic MediaItem types.
@@ -42,7 +43,7 @@ const LEGACY_AGENT_PREFIX = 'com.plexapp.agents.';
  * - type → type (with enum mapping)
  * - addedAt (unix timestamp) → addedAt (Date)
  * - duration (ms) → durationMs
- * - Guid[] → providerIds { imdb, tmdb, tvdb }
+ * - Guid[] → providerIds { imdb, tmdb, tvdb, sportarr }
  * - Media[] → mediaSources
  */
 export class PlexMapper {
@@ -114,12 +115,13 @@ export class PlexMapper {
   }
 
   /**
-   * Extract provider IDs (IMDB, TMDB, TVDB) from Plex GUID format.
+   * Extract provider IDs (IMDB, TMDB, TVDB, Sportarr) from Plex GUID format.
    *
    * Plex GUIDs look like:
    * - "imdb://tt1234567"
    * - "tmdb://12345"
    * - "tvdb://12345"
+   * - "sportarr://lg-000278"
    * - "plex://movie/5d776830880197001ec7f3eb"
    * - "com.plexapp.agents.thetvdb://73141/1/1?lang=en" (legacy agent)
    *
@@ -163,6 +165,36 @@ export class PlexMapper {
   }
 
   /**
+   * The id Plex's own agent gives an item, from a `plex://<type>/<uuid>` guid.
+   *
+   * Undefined for anything else - a legacy-agent, unmatched or personal-media
+   * guid carries no such id. plex.tv keys watchlist entries on it, so an item
+   * without one can never appear on a watchlist.
+   */
+  static extractPlexAgentId(guid?: string): string | undefined {
+    if (!guid?.startsWith(PLEX_AGENT_GUID_PREFIX)) {
+      return undefined;
+    }
+
+    const typeEnd = guid.indexOf('/', PLEX_AGENT_GUID_PREFIX.length);
+    if (typeEnd <= PLEX_AGENT_GUID_PREFIX.length) {
+      return undefined;
+    }
+
+    const id = guid.slice(typeEnd + 1);
+    for (const character of id) {
+      const isDigit = character >= '0' && character <= '9';
+      const isLowercaseLetter = character >= 'a' && character <= 'z';
+
+      if (!isDigit && !isLowercaseLetter) {
+        return undefined;
+      }
+    }
+
+    return id || undefined;
+  }
+
+  /**
    * Convert a Plex library item to a MediaItem.
    */
   static toMediaItem(plex: PlexLibraryItem): MediaItem {
@@ -172,7 +204,7 @@ export class PlexMapper {
       grandparentId: plex.grandparentRatingKey,
       title: plex.title,
       parentTitle: plex.parentTitle,
-      grandparentTitle: undefined, // Not available on PlexLibraryItem
+      grandparentTitle: plex.grandparentTitle,
       guid: plex.guid,
       parentGuid: plex.parentGuid,
       grandparentGuid: plex.grandparentGuid,
@@ -201,6 +233,7 @@ export class PlexMapper {
       userRating: plex.userRating,
       genres: PlexMapper.toMediaGenres(plex.Genre),
       actors: PlexMapper.toMediaActors(plex.Role),
+      studios: PlexMapper.toMediaStudios(plex.studio),
       childCount: plex.leafCount,
       watchedChildCount: plex.viewedLeafCount,
       index: plex.index,
@@ -230,9 +263,12 @@ export class PlexMapper {
       updatedAt: plex.updatedAt ? new Date(plex.updatedAt * 1000) : undefined,
       providerIds: PlexMapper.extractProviderIds(plex.Guid, plex.guid),
       mediaSources: PlexMapper.toMediaSources(plex.Media || plex.media),
+      path:
+        (plex.Media || plex.media)?.[0]?.Part?.[0]?.file ??
+        plex.Location?.[0]?.path,
       library: {
-        id: '', // Not available on PlexMetadata
-        title: '',
+        id: plex.librarySectionID?.toString() ?? '',
+        title: plex.librarySectionTitle ?? '',
       },
       summary: plex.summary,
       viewCount: plex.viewCount,
@@ -250,6 +286,7 @@ export class PlexMapper {
       userRating: plex.userRating,
       genres: PlexMapper.toMediaGenres(plex.Genre),
       actors: PlexMapper.toMediaActors(plex.Role),
+      studios: PlexMapper.toMediaStudios(plex.studio),
       childCount: plex.leafCount,
       watchedChildCount: plex.viewedLeafCount,
       index: plex.index,
@@ -392,6 +429,16 @@ export class PlexMapper {
       role: a.role,
       thumb: a.thumb,
     }));
+  }
+
+  /**
+   * Plex sends one studio as a string where Jellyfin and Emby send a list.
+   * Undefined rather than empty, so the sort still reads it as unknown.
+   */
+  private static toMediaStudios(
+    studio: string | undefined,
+  ): string[] | undefined {
+    return studio?.trim() ? [studio] : undefined;
   }
 
   private static toMediaRatings(plex: PlexLibraryItem): MediaRating[] {

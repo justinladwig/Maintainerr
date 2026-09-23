@@ -1,6 +1,6 @@
 import { MaintainerrEvent } from '@maintainerr/contracts';
 import { ServiceUnavailableException } from '@nestjs/common';
-import { createMockLogger } from '../../../test/utils/data';
+import { createMediaItem, createMockLogger } from '../../../test/utils/data';
 import {
   CollectionMediaAddedDto,
   CollectionMediaRemovedDto,
@@ -204,8 +204,10 @@ describe('NotificationService', () => {
       expect(content).toContain('(requested by alice)');
       expect(content).not.toContain('{requested_by}');
     });
+  });
 
-    it('puts the requester on the wire for external approval workflows', async () => {
+  describe('media items on the wire', () => {
+    it('carries the identity an external workflow needs, and nothing else', async () => {
       const { service } = createService();
       const sendNotification = jest
         .spyOn(service, 'sendNotification')
@@ -214,7 +216,15 @@ describe('NotificationService', () => {
       await service.handleNotification(
         NotificationType.MEDIA_ABOUT_TO_BE_HANDLED,
         [
-          { mediaServerId: '1', requestedBy: ['alice'] },
+          {
+            mediaServerId: '1',
+            metadata: createMediaItem({
+              title: 'A Sample Movie',
+              type: 'movie',
+              providerIds: { imdb: ['tt0111161'], tmdb: ['278'], tvdb: [] },
+            }),
+            requestedBy: ['alice'],
+          },
           { mediaServerId: '2' },
         ],
         undefined,
@@ -227,9 +237,85 @@ describe('NotificationService', () => {
       );
 
       expect(mediaItems).toEqual([
-        { mediaServerId: '1', requestedBy: ['alice'] },
+        {
+          mediaServerId: '1',
+          type: 'movie',
+          title: 'A Sample Movie',
+          providerIds: { imdb: ['tt0111161'], tmdb: ['278'], tvdb: [] },
+          requestedBy: ['alice'],
+        },
         { mediaServerId: '2' },
       ]);
+    });
+
+    it('titles an item on the wire exactly as the message does', async () => {
+      const { service } = createService();
+      const sendNotification = jest
+        .spyOn(service, 'sendNotification')
+        .mockResolvedValue(undefined);
+
+      await service.handleNotification(
+        NotificationType.MEDIA_HANDLED,
+        [
+          {
+            mediaServerId: '1',
+            metadata: createMediaItem({
+              type: 'season',
+              parentTitle: 'Sample Series',
+              title: 'Season 1',
+              index: 1,
+            }),
+          },
+          // Jellyfin files an unnumbered season under "Season Unknown"; naming
+          // it beats rendering "season undefined".
+          {
+            mediaServerId: '2',
+            metadata: createMediaItem({
+              type: 'season',
+              parentTitle: 'Sample Series',
+              title: 'Season Unknown',
+              index: undefined,
+            }),
+          },
+          {
+            mediaServerId: '3',
+            metadata: createMediaItem({
+              type: 'episode',
+              grandparentTitle: 'Sample Series',
+              title: 'A Sample Episode',
+              index: undefined,
+              parentIndex: undefined,
+            }),
+          },
+          // A sports library names the episode after the show already.
+          {
+            mediaServerId: '4',
+            metadata: createMediaItem({
+              type: 'episode',
+              grandparentTitle: 'Sample Series',
+              title: 'Sample Series - S2026E01 - A Sample Event',
+              index: undefined,
+              parentIndex: undefined,
+            }),
+          },
+        ],
+        'A Sample Collection',
+      );
+
+      const payload = sendNotification.mock.calls[0][1];
+      const mediaItems: { title: string }[] = JSON.parse(
+        payload.extra!.find((e) => e.name === 'mediaItems')!.value,
+      );
+
+      expect(mediaItems.map((item) => item.title)).toEqual([
+        'Sample Series - season 1',
+        'Sample Series - Season Unknown',
+        'Sample Series - A Sample Episode',
+        'Sample Series - S2026E01 - A Sample Event',
+      ]);
+      for (const { title } of mediaItems) {
+        expect(payload.message).toContain(`* ${title}`);
+      }
     });
   });
 
@@ -555,6 +641,73 @@ describe('NotificationService', () => {
     });
   });
 
+  describe('collection handler run batching', () => {
+    const removedDto = (
+      collectionId: number,
+      collectionName: string,
+      ids: string[],
+    ) =>
+      new CollectionMediaRemovedDto(
+        ids.map((mediaServerId) => ({ mediaServerId })),
+        collectionName,
+        { type: 'collection', value: collectionId },
+        collectionId,
+        7,
+      );
+
+    const runRemovals = async (
+      service: NotificationService,
+      dtos: CollectionMediaRemovedDto[],
+    ) => {
+      (service as any).collectionHandlerStarted();
+      for (const dto of dtos) {
+        await (service as any).collectionMediaRemoved(dto);
+      }
+      await (service as any).collectionHandlerFinished();
+    };
+
+    it('sends one notification per collection, per run', async () => {
+      const { service } = createService();
+      const handle = jest
+        .spyOn(service, 'handleNotification')
+        .mockResolvedValue('Success' as any);
+
+      await runRemovals(service, [
+        removedDto(1, 'Stale Movies', ['m1']),
+        removedDto(1, 'Stale Movies', ['m2']),
+        removedDto(2, 'Stale Shows', ['s1']),
+      ]);
+      // A second run must not resend the first one's items.
+      await runRemovals(service, [removedDto(1, 'Stale Movies', ['m3'])]);
+
+      expect(handle).toHaveBeenCalledTimes(3);
+      expect(handle).toHaveBeenNthCalledWith(
+        1,
+        NotificationType.MEDIA_REMOVED_FROM_COLLECTION,
+        [{ mediaServerId: 'm1' }, { mediaServerId: 'm2' }],
+        'Stale Movies',
+        7,
+        undefined,
+        { type: 'collection', value: 1 },
+      );
+      expect(handle.mock.calls[1][1]).toEqual([{ mediaServerId: 's1' }]);
+      expect(handle.mock.calls[2][1]).toEqual([{ mediaServerId: 'm3' }]);
+    });
+
+    it('sends immediately outside a run', async () => {
+      const { service } = createService();
+      const handle = jest
+        .spyOn(service, 'handleNotification')
+        .mockResolvedValue('Success' as any);
+
+      await (service as any).collectionMediaRemoved(
+        removedDto(1, 'Stale Movies', ['m1']),
+      );
+
+      expect(handle).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it('defines content for overlay reverted notifications', () => {
     const { service } = createService();
 
@@ -572,6 +725,116 @@ describe('NotificationService', () => {
       subject: 'Overlay Reverted',
       message:
         "↩️ Overlays have been reverted for these media items in '{collection_name}'.\n\n{media_items}",
+    });
+  });
+
+  describe('update available notification', () => {
+    const releaseUrl =
+      'https://github.com/Maintainerr/Maintainerr/releases/tag/v3.19.0';
+
+    it('carries both versions, the release page and the upgrade guide', async () => {
+      const { service, mediaServerFactory } = createService();
+      const sendNotification = jest
+        .spyOn(service, 'sendNotification')
+        .mockResolvedValue(['Success']);
+
+      await expect(
+        service.handleUpdateAvailableNotification(
+          '3.18.0',
+          '3.19.0',
+          releaseUrl,
+        ),
+      ).resolves.toBe(true);
+
+      expect(sendNotification).toHaveBeenCalledWith(
+        NotificationType.UPDATE_AVAILABLE,
+        {
+          subject: 'Update Available',
+          message:
+            "📦 Maintainerr 3.19.0 is available. You're running 3.18.0." +
+            `\n\nRelease notes: ${releaseUrl}` +
+            '\n\nHow to update: https://docs.maintainerr.info/installation/#updating',
+          extra: [
+            { name: 'currentVersion', value: '3.18.0' },
+            { name: 'newVersion', value: '3.19.0' },
+            { name: 'releaseUrl', value: releaseUrl },
+          ],
+        },
+      );
+      expect(mediaServerFactory.getService).not.toHaveBeenCalled();
+    });
+
+    it('drops the release clause for a build with no release page', async () => {
+      const { service } = createService();
+      const sendNotification = jest
+        .spyOn(service, 'sendNotification')
+        .mockResolvedValue(['Success']);
+
+      await service.handleUpdateAvailableNotification(
+        'main-bd8a1e0',
+        'main-fffffff',
+      );
+
+      const message = sendNotification.mock.calls[0][1].message;
+      // A raw placeholder must never reach a user.
+      expect(message).not.toContain('{release_notes}');
+      expect(message).not.toContain('Release notes:');
+      expect(message).toContain(
+        'How to update: https://docs.maintainerr.info/installation/#updating',
+      );
+    });
+
+    it('reports whether an agent actually took it', async () => {
+      const { service } = createService();
+      jest
+        .spyOn(service, 'sendNotification')
+        .mockResolvedValue([
+          'Failure: connect ETIMEDOUT',
+          'Agent is not allowed to send this message.',
+        ]);
+
+      await expect(
+        service.handleUpdateAvailableNotification('3.18.0', '3.19.0'),
+      ).resolves.toBe(false);
+    });
+  });
+
+  describe('hasSubscribers', () => {
+    const agentWith = (types: number[], enabled = true) => ({
+      shouldSend: () => enabled,
+      getSettings: () => ({ types }),
+    });
+
+    it('reports whether any agent would deliver the type', () => {
+      const { service } = createService();
+
+      service.registerAgents(
+        [
+          agentWith([NotificationType.MEDIA_HANDLED]) as any,
+          agentWith([NotificationType.UPDATE_AVAILABLE]) as any,
+        ],
+        true,
+      );
+
+      expect(service.hasSubscribers(NotificationType.UPDATE_AVAILABLE)).toBe(
+        true,
+      );
+      expect(service.hasSubscribers(NotificationType.OVERLAY_APPLIED)).toBe(
+        false,
+      );
+    });
+
+    it('ignores an agent that cannot send', () => {
+      const { service } = createService();
+
+      service.registerAgents(
+        [agentWith([NotificationType.UPDATE_AVAILABLE], false) as any],
+        true,
+      );
+
+      expect(service.hasSubscribers(NotificationType.UPDATE_AVAILABLE)).toBe(
+        false,
+      );
     });
   });
 });

@@ -1,4 +1,11 @@
-import { MediaItemType, RuleExecuteStatusDto } from '@maintainerr/contracts';
+import {
+  BULK_MEDIA_ACTION_MAX_ITEMS,
+  bulkExclusionRequestSchema,
+  type BulkExclusionRequest,
+  type BulkMediaResponse,
+  MediaItemType,
+  RuleExecuteStatusDto,
+} from '@maintainerr/contracts';
 import {
   BadRequestException,
   Body,
@@ -18,13 +25,23 @@ import {
 } from '@nestjs/common';
 import { ApiResponse } from '@nestjs/swagger';
 import { Response } from 'express';
+import { omit } from 'lodash';
+import { ZodValidationPipe } from 'nestjs-zod';
 import { MaintainerrLogger } from '../logging/logs.service';
+import {
+  ExecutionLockService,
+  RULES_COLLECTIONS_EXECUTION_LOCK_KEY,
+} from '../tasks/execution-lock.service';
 import { CommunityRule } from './dtos/communityRule.dto';
 import { ExclusionAction, ExclusionContextDto } from './dtos/exclusion.dto';
-import { RulesDto } from './dtos/rules.dto';
+import { RuleGroupDto } from './dtos/ruleGroup.dto';
+import { RuleUsersService } from './rule-users.service';
 import { ReturnStatus, RulesService } from './rules.service';
 import { RuleExecutorJobManagerService } from './tasks/rule-executor-job-manager.service';
 import { RuleExecutorSchedulerService } from './tasks/rule-executor-scheduler.service';
+
+/** Matches the postpone endpoint: wait out a short run rather than 409 at once. */
+const EXCLUSION_LOCK_WAIT_MS = 30000;
 
 @Controller('api/rules')
 export class RulesController {
@@ -32,6 +49,8 @@ export class RulesController {
     private readonly rulesService: RulesService,
     private readonly ruleExecutorSchedulerService: RuleExecutorSchedulerService,
     private readonly ruleExecutorJobManagerService: RuleExecutorJobManagerService,
+    private readonly ruleUsersService: RuleUsersService,
+    private readonly executionLock: ExecutionLockService,
     private readonly logger: MaintainerrLogger,
   ) {
     this.logger.setContext(RulesController.name);
@@ -40,6 +59,11 @@ export class RulesController {
   @Get('/constants')
   async getRuleConstants() {
     return await this.rulesService.getRuleConstants();
+  }
+
+  @Get('/users')
+  async getRuleUsernames(): Promise<string[]> {
+    return await this.ruleUsersService.getUsernames();
   }
 
   @Get('/community')
@@ -95,7 +119,7 @@ export class RulesController {
   }
 
   @Get('/:id')
-  getRuleGroup(@Param('id', ParseIntPipe) id: number): Promise<RulesDto> {
+  getRuleGroup(@Param('id', ParseIntPipe) id: number): Promise<RuleGroupDto> {
     return this.rulesService.getRuleGroup(id);
   }
 
@@ -261,17 +285,85 @@ export class RulesController {
     status: 503,
     description: 'The configured media server adapter could not initialize.',
   })
-  async setRules(@Body() body: RulesDto): Promise<ReturnStatus> {
+  async setRules(@Body() body: RuleGroupDto): Promise<ReturnStatus> {
     return this.orFail(await this.rulesService.setRules(body));
   }
 
+  /**
+   * Excluding shares the execution lock, as postpone does: a run picks its media
+   * up front, so an exclusion landing mid-run would answer success while that
+   * run still acts on the item. Un-excluding frees media, so it stays lock-free.
+   */
+  private async whileNotHandling<T>(run: () => Promise<T>): Promise<T> {
+    const release = await this.executionLock.acquireWithin(
+      RULES_COLLECTIONS_EXECUTION_LOCK_KEY,
+      EXCLUSION_LOCK_WAIT_MS,
+    );
+
+    if (!release) {
+      throw new ConflictException(
+        'Collection handling is already running. Try again when the current collection or rule execution finishes.',
+      );
+    }
+
+    try {
+      return await run();
+    } finally {
+      release();
+    }
+  }
+
   @Post('/exclusion')
+  @ApiResponse({
+    status: 409,
+    description:
+      'A collection or rule run held the execution lock for too long.',
+  })
   async setExclusion(@Body() body: ExclusionContextDto): Promise<ReturnStatus> {
     if (body.action === undefined || body.action === ExclusionAction.ADD) {
-      return await this.rulesService.setExclusion(body);
+      // handledIds serves the bulk path's collection pairing; it is not part of
+      // this endpoint's response.
+      return await this.whileNotHandling(async () =>
+        omit(await this.rulesService.setExclusion(body), 'handledIds'),
+      );
     } else {
       return await this.rulesService.removeExclusionWitData(body);
     }
+  }
+
+  @Post('/exclusions/bulk')
+  @ApiResponse({
+    status: 201,
+    description: 'Per-item results; failures are reported per media id.',
+  })
+  @ApiResponse({
+    status: 400,
+    description: `Rejected without processing: empty, or more than ${BULK_MEDIA_ACTION_MAX_ITEMS} media ids.`,
+  })
+  @ApiResponse({
+    status: 409,
+    description:
+      'A collection or rule run held the execution lock for too long.',
+  })
+  async setBulkExclusions(
+    @Body(new ZodValidationPipe(bulkExclusionRequestSchema))
+    body: BulkExclusionRequest,
+  ): Promise<BulkMediaResponse> {
+    if (body.action === ExclusionAction.REMOVE) {
+      return await this.rulesService.removeBulkExclusions(
+        body.mediaIds,
+        body.collectionId,
+        body.context,
+      );
+    }
+
+    return await this.whileNotHandling(() =>
+      this.rulesService.setBulkExclusions(
+        body.mediaIds,
+        body.collectionId,
+        body.context,
+      ),
+    );
   }
 
   @Delete('/exclusion/:id')
@@ -308,7 +400,7 @@ export class RulesController {
     status: 503,
     description: 'The configured media server adapter could not initialize.',
   })
-  async updateRule(@Body() body: RulesDto): Promise<ReturnStatus> {
+  async updateRule(@Body() body: RuleGroupDto): Promise<ReturnStatus> {
     return this.orFail(await this.rulesService.updateRules(body));
   }
 

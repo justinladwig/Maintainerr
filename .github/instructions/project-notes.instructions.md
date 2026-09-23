@@ -249,6 +249,11 @@ Non-obvious facts:
 - The getter returns `undefined` (transient skip) when membership is null;
   `false`/`[]` only when genuinely fetched. This prevents a failed lookup from
   flipping negative list comparisons and matching protected items.
+- Streamystats user ids ARE the Jellyfin user ids (verified live), while its
+  copy of the display name is nullable and can lag a rename. Rules store the
+  media-server username; the getter resolves that name against the Jellyfin
+  user list and then matches statistics rows **by id**, never by
+  Streamystats' name column.
 - Gating mirrors Tautulli: UI gate folded into the Jellyfin line in RuleInput
   `shouldFilterApplication`; server gate in `getRuleConstants()` removes the
   Application when `streamystats_url` / `jellyfin_api_key` are unset. Emby stays
@@ -345,6 +350,36 @@ Quick checks (Jellyfin server configured):
   `jellyfin-adapter.service.spec.ts` fabricates SDK-shaped errors instead
   (`createSdkAxiosError`). Emby is unaffected - its axios instance comes from
   the server's own import.
+- **Jellyfin 12 reports `Version: 12.0.0`, and nothing may compare that
+  string.** Upstream dropped the leading `10.`, so `10.12` became `12.0`. The
+  adapter stores and logs the version as an opaque string
+  (`jellyfin-adapter.service.ts` L233 and L350) and no code path compares it,
+  which is the only reason 12 works unchanged. Keep it that way: a naive
+  comparison against `"10.11"` reads `12.0.0` as older. `getLibrariesStorage`
+  is the shape to copy - it decides on the response status of
+  `GET /System/Info/Storage`, not on a version number.
+- **Jellyfin 12 rejects `X-Emby-Token` and `?api_key=` with 401.** Only
+  `Authorization: MediaBrowser Token="<key>"` is accepted, while 10.11 still
+  honours all three, so a script that works against one server 401s against the
+  other. `@jellyfin/sdk` sends the header form and no Jellyfin call in this repo
+  builds its own URL (images go through `getImageApi`), so this reaches users'
+  own scripts rather than Maintainerr, and it is worth naming in a support
+  reply. Checked against 12.0-rc5 with 10.11.11 as a control: public system
+  info, users, media folders, item listings and `GET /System/Info/Storage` all
+  answer on both, on `@jellyfin/sdk` 0.13.0; re-checked on 1.0.0 against 12.0.0.
+- **Collection collapsing is where 12 does behave differently, and
+  `collapseBoxSetItems=false` is what makes that safe.**
+  `Folder.CollapseBoxSetItems` is identical on both branches and short-circuits
+  on an explicit parameter, so `false` beats the server's own grouping setting
+  everywhere - which is the only reason a grouped library does not feed
+  collections into rule matching. Without the parameter the two diverge: 10.11
+  collapses in memory and only when `EnableGroupingMoviesIntoCollections` is on,
+  while 12 collapses in the new database query path, where the empty
+  collapse-type list you get with grouping off reads as "collapse everything"
+  and only name filters are re-applied after the substitution, never the type
+  filter. So on 12 a Movie-typed listing can answer with BoxSet rows on a
+  default-configured server. Send the parameter on every library-scoped query;
+  never rely on the server's grouping setting being off (#3550).
 
 ---
 
@@ -386,6 +421,15 @@ constructor params (DI tokens unchanged). **If you add a cross-module import tha
 closes a cycle, follow that pattern**, or SWC's strict CommonJS live bindings
 will turn it into a runtime TDZ `ReferenceError: Cannot access 'X' before
 initialization`.
+
+**Every `@nestjs/*` package is pure ESM from v12 on** (`"type": "module"`, no
+CJS entry). Node 26 loads them from the CommonJS build through `require(esm)`,
+so the app, `nest build` and the e2e harness are unaffected - but Jest's own
+CommonJS runtime cannot, and skipping the transform gives
+`SyntaxError: Cannot use import statement outside a module` on the first
+`@nestjs/common` import. That is why `@nestjs` is listed in the server's
+`transformIgnorePatterns` negative lookahead: it has to be transpiled, not
+ignored. Any future Nest package added there needs the same treatment.
 
 Yarn uses the **node-modules linker** (`.yarnrc.yml` → `nodeLinker: node-modules`,
 not PnP), so `node_modules/.bin/jest` and `node_modules/jest/bin/jest.js` exist and

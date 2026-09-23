@@ -168,12 +168,13 @@ export class JellyfinMapper {
       parentGuid: parentId,
       grandparentGuid: grandparentId,
       type: JellyfinMapper.toMediaItemType(item.Type),
-      addedAt: item.DateCreated ? new Date(item.DateCreated) : new Date(),
+      addedAt: new Date(item.DateCreated ?? ''),
       updatedAt: (item as JellyfinItemDto).DateLastSaved
         ? new Date((item as JellyfinItemDto).DateLastSaved!)
         : undefined,
       providerIds: JellyfinMapper.extractProviderIds(item.ProviderIds),
       mediaSources: JellyfinMapper.toMediaSources(item.MediaSources),
+      path: item.Path || undefined,
       library: {
         id: item.ParentId || '',
         title: '',
@@ -207,6 +208,9 @@ export class JellyfinMapper {
       parentIndex: item.ParentIndexNumber ?? undefined,
       collections: undefined, // Need to query separately
       labels: item.Tags || undefined,
+      studios: item.Studios?.map((studio) => studio.Name ?? '').filter(
+        (studio) => studio.length > 0,
+      ),
     };
   }
 

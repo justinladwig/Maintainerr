@@ -4,6 +4,7 @@ import {
   createCollection,
   createCollectionMedia,
   createCollectionMediaWithMetadata,
+  createMediaItem,
   createMediaLibraries,
 } from '../../../test/utils/data';
 import { RadarrActionHandler } from '../actions/radarr-action-handler';
@@ -11,6 +12,7 @@ import { SonarrActionHandler } from '../actions/sonarr-action-handler';
 import { MediaServerFactory } from '../api/media-server/media-server.factory';
 import { IMediaServerService } from '../api/media-server/media-server.interface';
 import { SeerrApiService } from '../api/seerr-api/seerr-api.service';
+import { MaintainerrLogger } from '../logging/logs.service';
 import { MetadataService } from '../metadata/metadata.service';
 import { SettingsDataService } from '../settings/settings-data.service';
 import { CollectionHandler } from './collection-handler';
@@ -29,6 +31,7 @@ describe('CollectionHandler', () => {
   let settings: Mocked<SettingsDataService>;
   let metadataService: Mocked<MetadataService>;
   let recentlyHandledMedia: Mocked<RecentlyHandledMediaService>;
+  let logger: Mocked<MaintainerrLogger>;
 
   beforeEach(async () => {
     const { unit, unitRef } =
@@ -43,11 +46,16 @@ describe('CollectionHandler', () => {
     settings = unitRef.get(SettingsDataService);
     metadataService = unitRef.get(MetadataService);
     recentlyHandledMedia = unitRef.get(RecentlyHandledMediaService);
+    logger = unitRef.get(MaintainerrLogger);
 
     metadataService.resolveIdsForService.mockResolvedValue(undefined);
     // The sibling-prune cascade returns the collection ids it pruned; default
     // to none so the disk-freeing tests don't iterate `undefined`.
     collectionsService.removeMediaFromOtherCollections.mockResolvedValue([]);
+    // Default the Seerr removals to a confirmed removal; the unreachable tests
+    // override with undefined.
+    seerrApi.removeSeasonRequest.mockResolvedValue(true);
+    seerrApi.removeMediaByTmdbId.mockResolvedValue(true);
 
     // Setup media server mock. `itemExists` defaults to true (item present) so
     // the action-failure tests exercise the retryable path; the gone-item test
@@ -57,6 +65,7 @@ describe('CollectionHandler', () => {
       deleteFromDisk: jest.fn(),
       getLibraries: jest.fn(),
       itemExists: jest.fn().mockResolvedValue(true),
+      scanFolder: jest.fn(),
     } as unknown as Mocked<IMediaServerService>;
     mediaServerFactory.getService.mockResolvedValue(mediaServer);
   });
@@ -276,6 +285,171 @@ describe('CollectionHandler', () => {
     );
   });
 
+  it.each([
+    [
+      '/media/movies/Movie A (2021)/Movie A (2021).mkv',
+      '/media/movies/Movie A (2021)',
+    ],
+    [
+      'C:\\Media\\Movie A (2021)\\Movie A (2021).mkv',
+      'C:\\Media\\Movie A (2021)',
+    ],
+  ])(
+    'asks the media server to rescan the movie folder after an *arr delete (%s)',
+    async (path, folder) => {
+      const collection = createCollection({
+        arrAction: ServarrAction.DELETE,
+        radarrSettingsId: 1,
+        type: 'movie',
+      });
+      const collectionMedia = createCollectionMedia(collection);
+
+      mediaServer.getLibraries.mockResolvedValue(
+        createMediaLibraries({
+          id: collection.libraryId.toString(),
+          type: 'movie',
+        }),
+      );
+      mediaServer.getMetadata.mockResolvedValue(
+        createMediaItem({ type: 'movie', path }),
+      );
+      radarrActionHandler.handleAction.mockResolvedValue(true);
+
+      await collectionHandler.handleMedia(collection, collectionMedia);
+
+      expect(mediaServer.scanFolder).toHaveBeenCalledWith(
+        collection.libraryId.toString(),
+        folder,
+      );
+      expect(
+        radarrActionHandler.handleAction.mock.invocationCallOrder[0],
+      ).toBeLessThan(mediaServer.scanFolder.mock.invocationCallOrder[0]);
+    },
+  );
+
+  it('rescans the show folder for a season the server reports no path for', async () => {
+    const collection = createCollection({
+      arrAction: ServarrAction.UNMONITOR_DELETE_EXISTING,
+      sonarrSettingsId: 1,
+      type: 'season',
+    });
+    const collectionMedia = createCollectionMedia(collection);
+
+    mediaServer.getLibraries.mockResolvedValue(
+      createMediaLibraries({
+        id: collection.libraryId.toString(),
+        type: 'show',
+      }),
+    );
+    mediaServer.getMetadata
+      .mockResolvedValueOnce(
+        createMediaItem({ type: 'season', parentId: 'show-1' }),
+      )
+      .mockResolvedValueOnce(
+        createMediaItem({ type: 'show', path: '/media/series/Show A' }),
+      );
+    sonarrActionHandler.handleAction.mockResolvedValue(true);
+
+    await collectionHandler.handleMedia(collection, collectionMedia);
+
+    expect(mediaServer.getMetadata).toHaveBeenCalledWith('show-1');
+    expect(mediaServer.scanFolder).toHaveBeenCalledWith(
+      collection.libraryId.toString(),
+      '/media/series/Show A',
+    );
+  });
+
+  it('reads no folder and does not rescan for an unmonitor-only action', async () => {
+    const collection = createCollection({
+      arrAction: ServarrAction.UNMONITOR,
+      sonarrSettingsId: 1,
+      type: 'show',
+    });
+    const collectionMedia = createCollectionMedia(collection);
+
+    mediaServer.getLibraries.mockResolvedValue(
+      createMediaLibraries({
+        id: collection.libraryId.toString(),
+        type: 'show',
+      }),
+    );
+    sonarrActionHandler.handleAction.mockResolvedValue(true);
+
+    await collectionHandler.handleMedia(collection, collectionMedia);
+
+    expect(mediaServer.getMetadata).not.toHaveBeenCalled();
+    expect(mediaServer.scanFolder).not.toHaveBeenCalled();
+  });
+
+  it('still handles the item when its folder cannot be read', async () => {
+    const collection = createCollection({
+      arrAction: ServarrAction.DELETE,
+      radarrSettingsId: 1,
+      type: 'movie',
+    });
+    const collectionMedia = createCollectionMedia(collection);
+
+    mediaServer.getLibraries.mockResolvedValue(
+      createMediaLibraries({
+        id: collection.libraryId.toString(),
+        type: 'movie',
+      }),
+    );
+    mediaServer.getMetadata.mockRejectedValue(new Error('offline'));
+    radarrActionHandler.handleAction.mockResolvedValue(true);
+
+    await expect(
+      collectionHandler.handleMedia(collection, collectionMedia),
+    ).resolves.toBe('handled');
+    expect(mediaServer.scanFolder).not.toHaveBeenCalled();
+  });
+
+  it('does not rescan when the media server deleted the files itself', async () => {
+    const collection = createCollection({
+      arrAction: ServarrAction.DELETE,
+      type: 'show',
+    });
+    const collectionMedia = createCollectionMedia(collection);
+
+    mediaServer.getLibraries.mockResolvedValue(
+      createMediaLibraries({ id: collection.libraryId.toString() }),
+    );
+
+    await collectionHandler.handleMedia(collection, collectionMedia);
+
+    expect(mediaServer.deleteFromDisk).toHaveBeenCalled();
+    expect(mediaServer.scanFolder).not.toHaveBeenCalled();
+  });
+
+  it('keeps the action handled when the rescan request fails', async () => {
+    const collection = createCollection({
+      arrAction: ServarrAction.DELETE,
+      radarrSettingsId: 1,
+      type: 'movie',
+    });
+    const collectionMedia = createCollectionMedia(collection);
+
+    mediaServer.getLibraries.mockResolvedValue(
+      createMediaLibraries({
+        id: collection.libraryId.toString(),
+        type: 'movie',
+      }),
+    );
+    mediaServer.getMetadata.mockResolvedValue(
+      createMediaItem({
+        type: 'movie',
+        path: '/media/movies/Movie A (2021)/Movie A (2021).mkv',
+      }),
+    );
+    mediaServer.scanFolder.mockRejectedValue(new Error('offline'));
+    radarrActionHandler.handleAction.mockResolvedValue(true);
+
+    await expect(
+      collectionHandler.handleMedia(collection, collectionMedia),
+    ).resolves.toBe('handled');
+    expect(logger.warn).toHaveBeenCalled();
+  });
+
   it('should call Sonarr action handler', async () => {
     const collection = createCollection({
       arrAction: ServarrAction.DELETE,
@@ -492,7 +666,7 @@ describe('CollectionHandler', () => {
     expect(seerrApi.removeMediaByTmdbId).not.toHaveBeenCalled();
   });
 
-  it('should not mutate Seerr requests for DELETE_SHOW_IF_EMPTY season actions', async () => {
+  it('removes the season request for DELETE_SHOW_IF_EMPTY when forced', async () => {
     const collection = createCollection({
       arrAction: ServarrAction.DELETE_SHOW_IF_EMPTY,
       forceSeerr: true,
@@ -510,13 +684,40 @@ describe('CollectionHandler', () => {
       }),
     );
     mockMediaServerMetadata(collectionMedia.mediaData);
+    sonarrActionHandler.handleAction.mockResolvedValue(true);
 
-    await collectionHandler.handleMedia(collection, collectionMedia);
+    await expect(
+      collectionHandler.handleMedia(collection, collectionMedia),
+    ).resolves.toBe('handled');
 
-    expect(sonarrActionHandler.handleAction).toHaveBeenCalledWith(
-      collection,
-      collectionMedia,
+    expect(seerrApi.removeSeasonRequest).toHaveBeenCalledWith(
+      collectionMedia.tmdbId,
+      collectionMedia.mediaData.index,
     );
+  });
+
+  it('does not touch Seerr for UNMONITOR_SHOW_IF_EMPTY (no files are removed)', async () => {
+    const collection = createCollection({
+      arrAction: ServarrAction.UNMONITOR_SHOW_IF_EMPTY,
+      forceSeerr: true,
+      sonarrSettingsId: 1,
+      type: 'season',
+    });
+    const collectionMedia = createCollectionMediaWithMetadata(collection);
+
+    settings.seerrConfigured.mockReturnValue(true);
+    mediaServer.getLibraries.mockResolvedValue(
+      createMediaLibraries({
+        id: collection.libraryId.toString(),
+        type: 'show',
+      }),
+    );
+    sonarrActionHandler.handleAction.mockResolvedValue(true);
+
+    await expect(
+      collectionHandler.handleMedia(collection, collectionMedia),
+    ).resolves.toBe('handled');
+
     expect(seerrApi.removeSeasonRequest).not.toHaveBeenCalled();
     expect(seerrApi.removeMediaByTmdbId).not.toHaveBeenCalled();
   });
@@ -598,6 +799,43 @@ describe('CollectionHandler', () => {
     );
   });
 
+  // #3427: a removal that never reached Seerr logged as though it had, so a run
+  // against an unreachable Seerr read as fully successful.
+  it.each([
+    { title: 'a season', type: 'season' as const, index: 1 },
+    { title: 'a movie', type: 'movie' as const, index: undefined },
+  ])(
+    'warns instead of claiming the Seerr removal for $title',
+    async ({ type, index }) => {
+      const collection = createCollection({
+        arrAction: ServarrAction.DELETE,
+        forceSeerr: true,
+        type,
+      });
+      const collectionMedia = createCollectionMedia(collection);
+
+      settings.seerrConfigured.mockReturnValue(true);
+      seerrApi.removeSeasonRequest.mockResolvedValue(undefined);
+      seerrApi.removeMediaByTmdbId.mockResolvedValue(undefined);
+      mockMediaServerMetadata({ index } as MediaItem);
+      mediaServer.getLibraries.mockResolvedValue(
+        createMediaLibraries({
+          id: collection.libraryId.toString(),
+          type: type === 'season' ? 'show' : 'movie',
+        }),
+      );
+
+      await collectionHandler.handleMedia(collection, collectionMedia);
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("[Seerr] Couldn't remove"),
+      );
+      expect(logger.log).not.toHaveBeenCalledWith(
+        expect.stringContaining('[Seerr] Removed'),
+      );
+    },
+  );
+
   it('should call removeMediaByTmdbId for movies', async () => {
     const collection = createCollection({
       arrAction: ServarrAction.DELETE,
@@ -652,6 +890,31 @@ describe('CollectionHandler', () => {
       'tv',
     );
     expect(seerrApi.removeMediaByTmdbId).toHaveBeenCalledTimes(1);
+  });
+
+  it('should still remove a show as tv when the library is no longer listed', async () => {
+    const collection = createCollection({
+      arrAction: ServarrAction.DELETE,
+      forceSeerr: true,
+      type: 'show',
+    });
+    const collectionMedia = createCollectionMedia(collection);
+
+    settings.seerrConfigured.mockReturnValue(true);
+
+    // The media server no longer lists the collection's library, so the lookup
+    // misses. Reading the type off it would send the show's TMDB id to the
+    // movie endpoint, where it can name an unrelated film.
+    mediaServer.getLibraries.mockResolvedValue([]);
+
+    await expect(
+      collectionHandler.handleMedia(collection, collectionMedia),
+    ).resolves.toBe('handled');
+
+    expect(seerrApi.removeMediaByTmdbId).toHaveBeenCalledWith(
+      collectionMedia.tmdbId,
+      'tv',
+    );
   });
 
   it('should not call SeerrApiService if forceSeerr is false', async () => {

@@ -4,7 +4,7 @@ import {
   RequestMediaStatus,
 } from '@maintainerr/contracts';
 import { Injectable } from '@nestjs/common';
-import _ from 'lodash';
+import { cloneDeep } from 'lodash';
 import { MediaServerFactory } from '../../api/media-server/media-server.factory';
 import {
   resolveRequestUsername,
@@ -53,7 +53,7 @@ export class SeerrGetterService {
 
       // get original show in case of season / episode
       if (dataType === 'season' || dataType === 'episode') {
-        origLibItem = _.cloneDeep(libItem);
+        origLibItem = cloneDeep(libItem);
         const mediaServer = await this.mediaServerFactory.getService();
         libItem = await mediaServer.getMetadata(
           dataType === 'season' ? libItem.parentId : libItem.grandparentId,
@@ -87,10 +87,9 @@ export class SeerrGetterService {
         this.logger.debug(
           `Couldn't find tmdb id for media '${libItem.title}' with id '${libItem.id}'. As a result, no Seerr query could be made.`,
         );
-        // An empty resolution cannot distinguish "item has no tmdb id" from a
-        // transient TMDB failure (validation runs online), so it must stay
-        // `undefined` - `null` would defeat the transient-removal guard and
-        // wipe collections during an internet outage (#3307).
+        // Transient either way: "we could not look it up" is not the same claim
+        // as "it is not requested", and a definitive answer would let unmatched
+        // and personal media match NOT_EXISTS rules.
         return undefined;
       }
 

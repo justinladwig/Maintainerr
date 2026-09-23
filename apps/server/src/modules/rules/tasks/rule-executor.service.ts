@@ -1,10 +1,10 @@
 import {
+  ApplicationNames,
   IComparisonStatistics,
   MaintainerrEvent,
   MediaItem,
   MediaItemType,
   MediaServerFeature,
-  MediaServerType,
   RuleHandlerFinishedEventDto,
   RuleHandlerStartedEventDto,
 } from '@maintainerr/contracts';
@@ -13,6 +13,7 @@ import { EventEmitter2 } from '@nestjs/event-emitter';
 import cacheManager from '../../api/lib/cache';
 import { MediaServerFactory } from '../../api/media-server/media-server.factory';
 import { IMediaServerService } from '../../api/media-server/media-server.interface';
+import { TracearrApiService } from '../../api/tracearr-api/tracearr-api.service';
 import { CollectionsService } from '../../collections/collections.service';
 import { Collection } from '../../collections/entities/collection.entities';
 import {
@@ -30,8 +31,9 @@ import {
 import { ServarrTagService } from '../../actions/servarr-tag.service';
 import { MaintainerrLogger } from '../../logging/logs.service';
 import { SettingsDataService } from '../../settings/settings-data.service';
-import { RuleConstants } from '../constants/rules.constants';
-import { RulesDto } from '../dtos/rules.dto';
+import { Application, RuleConstants } from '../constants/rules.constants';
+import { RuleDto } from '../dtos/rule.dto';
+import { RuleGroupDto } from '../dtos/ruleGroup.dto';
 import { RuleGroup } from '../entities/rule-group.entities';
 import {
   buildExclusionCascadeSets,
@@ -111,6 +113,7 @@ export class RuleExecutorService {
     private readonly logger: MaintainerrLogger,
     private readonly recentlyHandledMedia: RecentlyHandledMediaService,
     private readonly servarrTagService: ServarrTagService,
+    private readonly tracearrApi: TracearrApiService,
   ) {
     logger.setContext(RuleExecutorService.name);
     this.ruleConstants = new RuleConstants();
@@ -119,6 +122,41 @@ export class RuleExecutorService {
 
   private async getMediaServer(): Promise<IMediaServerService> {
     return this.mediaServerFactory.getService();
+  }
+
+  private usesTracearr(ruleGroup: RuleGroupDto): boolean {
+    return ruleGroup.rules.some((rule) => {
+      const parsedRule = (
+        'ruleJson' in rule ? JSON.parse(rule.ruleJson) : rule
+      ) as RuleDto;
+      return (
+        parsedRule.firstVal[0] === Application.TRACEARR ||
+        parsedRule.lastVal?.[0] === Application.TRACEARR
+      );
+    });
+  }
+
+  /** Both sides of a rule count: a Seerr date compared against a Tautulli one needs both. */
+  private async findUnavailableApplications(
+    ruleGroup: RuleGroupDto,
+  ): Promise<string[]> {
+    const referenced = new Set<Application>();
+    for (const rule of ruleGroup.rules) {
+      const parsedRule = (
+        'ruleJson' in rule ? JSON.parse(rule.ruleJson) : rule
+      ) as RuleDto;
+      referenced.add(parsedRule.firstVal[0]);
+      if (parsedRule.lastVal) {
+        referenced.add(parsedRule.lastVal[0]);
+      }
+    }
+
+    const unavailable = await this.rulesService.getUnavailableApplications();
+    return unavailable
+      .filter((application) => referenced.has(application))
+      .map(
+        (application) => ApplicationNames[application] ?? `app ${application}`,
+      );
   }
 
   private buildRuleHandlerFailedDto(
@@ -186,6 +224,17 @@ export class RuleExecutorService {
         );
         throw new RuleExecutionFailure(
           this.buildRuleHandlerFailedDto(ruleGroup, ruleGroup.name),
+        );
+      }
+
+      // Absent, not merely unreachable: every property reading it answers the
+      // transient signal for every item, which holds the collection and retries
+      // next run. That part is by design; being silent about it is not.
+      const missing = await this.findUnavailableApplications(ruleGroup);
+      if (missing.length > 0) {
+        this.logger.warn(
+          `Rule group '${ruleGroup.name}' reads ${missing.join(', ')}, not available for this server. ` +
+            `Its collection is held until you configure it or remove those rules.`,
         );
       }
 
@@ -284,6 +333,9 @@ export class RuleExecutorService {
             libraryId: ruleGroup.libraryId,
             abortSignal,
           });
+        }
+        if (this.usesTracearr(ruleGroup)) {
+          await this.tracearrApi.prefetchHistory();
         }
 
         // prepare
@@ -434,12 +486,14 @@ export class RuleExecutorService {
           return;
         }
 
-        // An empty child list is a trustworthy "empty" snapshot for Plex, but
-        // Jellyfin/Emby can transiently return [] during sync delays, so their
-        // empty result is treated as ambiguous (see the removal sweep below).
-        const isJellyfin =
-          this.settings.media_server_type === MediaServerType.JELLYFIN;
-        const isEmby = this.settings.media_server_type === MediaServerType.EMBY;
+        // Whether an empty child list means "this collection is empty" or only
+        // "the server answered with nothing this time". Asked as a capability
+        // rather than by server type: the shared layer must not branch on which
+        // server is configured, and a fourth one would otherwise silently
+        // inherit Plex's answer.
+        const emptyChildListIsTrustworthy = (
+          await this.getMediaServer()
+        ).supportsFeature(MediaServerFeature.TRUSTWORTHY_EMPTY_COLLECTION);
 
         // Handle manually added
         if (syncContext.skipManualChildImport) {
@@ -628,7 +682,7 @@ export class RuleExecutorService {
               collection,
               children ?? [],
               new Set(),
-              !(isJellyfin || isEmby),
+              emptyChildListIsTrustworthy,
             );
           } catch (error) {
             this.logger.warn(
@@ -638,21 +692,22 @@ export class RuleExecutorService {
           }
         }
 
-        // Handle manually removed items from collections
-        // Jellyfin/Emby workaround: Skip removal check when children array is empty.
-        // Unlike Plex, the .NET BoxSet collection API can return empty children
-        // during brief sync delays after collection modifications, causing false
-        // positives where valid items would be incorrectly flagged as "manually
-        // removed". This workaround can be removed if the upstream improves
-        // collection sync consistency.
+        // Handle manually removed items from collections.
+        // An empty child list only means "no members left" on a server whose
+        // empty answer is trustworthy. Where it is not, acting on it would flag
+        // every member as removed by hand during a brief post-modification sync
+        // delay, so the sweep waits for a non-empty read.
         const shouldCheckRemovals =
-          isJellyfin || isEmby ? children && children.length > 0 : true;
+          emptyChildListIsTrustworthy || (children && children.length > 0);
 
         if (
           collectionMedia &&
           collectionMedia.length > 0 &&
           shouldCheckRemovals
         ) {
+          // Members the media server collection no longer lists.
+          const droppedByMediaServer: CollectionMediaChange[] = [];
+
           for (const mediaItem of collectionMedia) {
             if (!mediaItem?.mediaServerId) {
               continue;
@@ -673,19 +728,23 @@ export class RuleExecutorService {
               !children ||
               !children.find((e) => mediaItem.mediaServerId === e.id.toString())
             ) {
-              await this.collectionService.removeFromCollection(
-                collection.id,
-                [
-                  {
-                    mediaServerId: mediaItem.mediaServerId,
-                    reason: {
-                      type: 'media_removed_manually',
-                    },
-                  },
-                ] satisfies CollectionMediaChange[],
-                'manual',
-              );
+              droppedByMediaServer.push({
+                mediaServerId: mediaItem.mediaServerId,
+                reason: {
+                  type: 'media_removed_manually',
+                },
+              });
             }
+          }
+
+          // One call for the whole set, so emptying a collection by hand costs
+          // one media-server request and one notification, not N of each.
+          if (droppedByMediaServer.length > 0) {
+            await this.collectionService.removeFromCollection(
+              collection.id,
+              droppedByMediaServer,
+              'manual',
+            );
           }
         }
 
@@ -745,9 +804,17 @@ export class RuleExecutorService {
     const linkedCollection =
       await this.collectionService.checkAutomaticMediaServerLink(collection);
 
+    // Kept in Maintainerr only still holds a link when the server refused the
+    // teardown above. The opt-in is what decides here, not the link: syncing
+    // would import remote members and push removals back to a collection the
+    // rule is no longer supposed to touch. The reconcile keeps retrying.
+    if (linkedCollection.keepInMaintainerrOnly) {
+      return {};
+    }
+
     if (!linkedCollection.mediaServerId) {
       this.logger.debug(
-        `Skipping media server sync for '${linkedCollection.title}' - no media server collection exists because no items currently match the rule.`,
+        `Skipping media server sync for '${linkedCollection.title}' - no media server collection exists.`,
       );
       return {};
     }
@@ -845,14 +912,22 @@ export class RuleExecutorService {
                 collection,
               );
           }
-          // if collection doesn't exist in media server but should.. resync current data
-          if (!collection.mediaServerId) {
+          // if collection doesn't exist in media server but should.. resync current data.
+          // Kept in Maintainerr only never should.
+          //
+          // The member list is deliberately empty: addToCollection reads the
+          // collection's current members from the database and syncs those to the
+          // freshly created server collection itself. Passing them in only ran every
+          // existing row back through the membership update, re-marking each one and
+          // writing an "Added" log record per item per run - and it passed
+          // `collection.manualCollection`, a property of the COLLECTION, as the
+          // per-MEMBERSHIP "added by hand" flag. On a manual collection that stamped
+          // every rule-owned row as a manual member, which no rule can then remove
+          // while it still ages into deleteAfterDays.
+          if (!collection.mediaServerId && !collection.keepInMaintainerrOnly) {
             collection = await this.collectionService.addToCollection(
               collection.id,
-              collMediaData.map((m) => ({
-                mediaServerId: m.mediaServerId,
-              })),
-              collection.manualCollection,
+              [],
             );
             if (collection) {
               collection =
@@ -1167,7 +1242,7 @@ export class RuleExecutorService {
     }
   }
 
-  private async getAllActiveRuleGroups(): Promise<RulesDto[]> {
+  private async getAllActiveRuleGroups(): Promise<RuleGroupDto[]> {
     return await this.rulesService.getRuleGroups(true);
   }
 

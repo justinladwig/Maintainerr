@@ -1,6 +1,7 @@
 import {
   embyLoginRequestSchema,
   radarrSettingSchema,
+  seerrSettingSchema,
 } from '@maintainerr/contracts';
 import { StreamableFile } from '@nestjs/common';
 import { Response } from 'express';
@@ -13,6 +14,7 @@ import { MetadataSettingsService } from './metadata-settings.service';
 import { SettingsController } from './settings.controller';
 import { SettingsOperationsService } from './settings-operations.service';
 import { SettingsDataService } from './settings-data.service';
+import { TelemetryService } from '../telemetry/telemetry.service';
 
 describe('SettingsController', () => {
   let controller: SettingsController;
@@ -28,6 +30,7 @@ describe('SettingsController', () => {
     testPlex: jest.fn(),
     testPlexAuthToken: jest.fn(),
     removeJellyfinSettings: jest.fn(),
+    getTracearrServers: jest.fn(),
   } as unknown as jest.Mocked<SettingsOperationsService>;
 
   const settingsDataService = {
@@ -53,6 +56,10 @@ describe('SettingsController', () => {
     getDatabaseDownload: jest.fn(),
   } as unknown as jest.Mocked<DatabaseDownloadService>;
 
+  const telemetryService = {
+    buildPayload: jest.fn(),
+  } as unknown as jest.Mocked<TelemetryService>;
+
   const createSettings = (overrides: Partial<Settings> = {}): Settings =>
     Object.assign(new Settings(), {
       tautulli_api_key: null,
@@ -73,6 +80,7 @@ describe('SettingsController', () => {
       metadataSettingsService,
       mediaServerSwitchService,
       databaseDownloadService,
+      telemetryService,
     );
   });
 
@@ -116,6 +124,20 @@ describe('SettingsController', () => {
           jellyfin_user_id: 'u-1',
         },
       },
+      {
+        name: 'Tracearr',
+        method: 'getTracearrSetting' as const,
+        entityOverrides: {
+          tracearr_url: 'http://tracearr.local',
+          tracearr_api_key: 'trr_pub_token',
+          tracearr_server_id: '11111111-1111-4111-8111-111111111111',
+        },
+        expected: {
+          url: 'http://tracearr.local',
+          api_key: 'trr_pub_token',
+          server_id: '11111111-1111-4111-8111-111111111111',
+        },
+      },
     ])(
       'maps $name settings from entity values',
       async ({ method, entityOverrides, expected }) => {
@@ -131,6 +153,7 @@ describe('SettingsController', () => {
       { name: 'Tautulli', method: 'getTautulliSetting' as const },
       { name: 'Seerr', method: 'getSeerrSetting' as const },
       { name: 'Jellyfin', method: 'getJellyfinSetting' as const },
+      { name: 'Tracearr', method: 'getTracearrSetting' as const },
     ])(
       'passes through non-entity response for $name settings',
       async ({ method }) => {
@@ -227,6 +250,24 @@ describe('SettingsController', () => {
         },
       ),
     ).toThrow('Validation failed');
+  });
+
+  it('normalises a trailing slash off a service URL rather than rejecting it (#3416)', () => {
+    const pipe = new ZodValidationPipe(seerrSettingSchema);
+
+    expect(
+      pipe.transform(
+        {
+          url: 'http://seerr.local:5055/',
+          api_key: 'key',
+        },
+        {
+          type: 'body',
+          metatype: Object,
+          data: '',
+        },
+      ),
+    ).toEqual({ url: 'http://seerr.local:5055', api_key: 'key' });
   });
 
   it('rejects invalid Emby login requests with the shared Zod schema', () => {

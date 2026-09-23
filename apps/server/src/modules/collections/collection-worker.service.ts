@@ -19,6 +19,12 @@ import {
   NotificationMediaItem,
 } from '../events/events.dto';
 import { MaintainerrLogger } from '../logging/logs.service';
+import { Exclusion } from '../rules/entities/exclusion.entities';
+import { RuleGroup } from '../rules/entities/rule-group.entities';
+import {
+  buildExclusionCascadeSets,
+  isMediaItemExcluded,
+} from '../rules/helpers/exclusion-cascade.helper';
 import { SettingsDataService } from '../settings/settings-data.service';
 import {
   ExecutionLockService,
@@ -38,6 +44,20 @@ import {
 } from './entities/collection_media.entities';
 import { ServarrAction } from './interfaces/collection.interface';
 
+/**
+ * The window the worker should act on, in days: `null` for "never", 0 for
+ * "now".
+ *
+ * The rule form hides the timer for CHANGE_QUALITY_PROFILE and saves no window,
+ * so a profile change is always due now. Any window still stored on such a
+ * collection is vestigial - left behind by the action it was converted from -
+ * and must neither strand the collection nor delay it.
+ */
+const effectiveDeletionWindow = (collection: Collection): number | null =>
+  collection.arrAction === ServarrAction.CHANGE_QUALITY_PROFILE
+    ? 0
+    : (collection.deleteAfterDays ?? null);
+
 @Injectable()
 export class CollectionWorkerService extends TaskBase {
   protected name = 'Collection Handler';
@@ -48,6 +68,10 @@ export class CollectionWorkerService extends TaskBase {
     private readonly collectionRepo: Repository<Collection>,
     @InjectRepository(CollectionMedia)
     private readonly collectionMediaRepo: Repository<CollectionMedia>,
+    @InjectRepository(Exclusion)
+    private readonly exclusionRepo: Repository<Exclusion>,
+    @InjectRepository(RuleGroup)
+    private readonly ruleGroupRepo: Repository<RuleGroup>,
     private readonly seerrApi: SeerrApiService,
     protected readonly taskService: TasksService,
     private readonly settings: SettingsDataService,
@@ -64,6 +88,75 @@ export class CollectionWorkerService extends TaskBase {
 
   protected onBootstrapHook(): void {
     this.cronSchedule = this.settings.collection_handler_job_cron;
+  }
+
+  /** Every global exclusion, plus the ones scoped to a collection's own group. */
+  private async readExclusionsPerCollection(): Promise<
+    (collectionId: number) => Exclusion[]
+  > {
+    const [exclusions, ruleGroups] = await Promise.all([
+      this.exclusionRepo.find(),
+      this.ruleGroupRepo.find(),
+    ]);
+
+    const ruleGroupIdByCollectionId = new Map(
+      ruleGroups.map((ruleGroup) => [ruleGroup.collectionId, ruleGroup.id]),
+    );
+
+    return (collectionId) => {
+      const ruleGroupId = ruleGroupIdByCollectionId.get(collectionId);
+      return exclusions.filter(
+        (exclusion) =>
+          exclusion.ruleGroupId == null ||
+          exclusion.ruleGroupId === ruleGroupId,
+      );
+    };
+  }
+
+  /** The cascade a rule run applies, so a show or legacy row reaches its own
+   * descendants (#2858). The hierarchy costs a request, so it is only read when
+   * an exclusion can reach past its own id. */
+  private async dropExcludedMedia(
+    mediaServer: IMediaServerService,
+    exclusions: Exclusion[],
+    dueMedia: CollectionMedia[],
+  ): Promise<CollectionMedia[]> {
+    if (exclusions.length === 0 || dueMedia.length === 0) {
+      return dueMedia;
+    }
+
+    const cascade = buildExclusionCascadeSets(exclusions);
+    const cascades =
+      cascade.excludedShowIds.size > 0 ||
+      cascade.excludedSeasonIds.size > 0 ||
+      cascade.legacyParentIds.size > 0;
+
+    if (!cascades) {
+      return dueMedia.filter(
+        (media) => !isMediaItemExcluded(cascade, { id: media.mediaServerId }),
+      );
+    }
+
+    const hierarchyById = new Map<string, MediaItem>();
+    try {
+      for (const item of await mediaServer.getMetadataBatch(
+        dueMedia.map((media) => media.mediaServerId),
+      )) {
+        hierarchyById.set(item.id, item);
+      }
+    } catch (error) {
+      this.logger.debug(error);
+    }
+
+    return dueMedia.filter((media) => {
+      const item = hierarchyById.get(media.mediaServerId);
+
+      // A batch read omits what it could not resolve, so no hierarchy means
+      // unread, not unrelated. This is the only path that deletes.
+      if (!item) return false;
+
+      return !isMediaItemExcluded(cascade, item);
+    });
   }
 
   protected async executeTask() {
@@ -111,6 +204,7 @@ export class CollectionWorkerService extends TaskBase {
       let removedMissingMedia = 0;
       let collectionHandlingFailed = false;
       let doNothingCollectionCount = 0;
+      let noWindowCollectionCount = 0;
       let noDueMediaCollectionCount = 0;
 
       // loop over all active collections
@@ -127,6 +221,19 @@ export class CollectionWorkerService extends TaskBase {
           return false;
         }
 
+        // No window means no deadline, which is what every other consumer of
+        // deleteAfterDays already reads it as: the contracts helper answers no
+        // delete date, the collection card shows "Never", and the overlay
+        // processor draws no countdown. Only the due query read it as 0, which
+        // made the danger date now and every member due at once.
+        if (effectiveDeletionWindow(collection) == null) {
+          noWindowCollectionCount++;
+          this.logger.log(
+            `Skipping collection '${collection.title}' as it has no 'take action after days' set`,
+          );
+          return false;
+        }
+
         return true;
       });
 
@@ -135,10 +242,16 @@ export class CollectionWorkerService extends TaskBase {
         mediaToHandle: CollectionMedia[];
       }[] = [];
 
-      for (const collection of collectionsToHandle) {
-        const dangerDate = getCollectionDangerDate(collection.deleteAfterDays);
+      // Nothing else protects an excluded member: membership is reconciled only
+      // by a rule run, and never for a manually added one.
+      const exclusionsFor = await this.readExclusionsPerCollection();
 
-        const eligibleMedia = (
+      for (const collection of collectionsToHandle) {
+        const dangerDate = getCollectionDangerDate(
+          effectiveDeletionWindow(collection),
+        );
+
+        const dueMedia = (
           await this.collectionMediaRepo.find({
             where: {
               collectionId: collection.id,
@@ -149,6 +262,12 @@ export class CollectionWorkerService extends TaskBase {
           (media) =>
             !media.ruleEvaluationFailed ||
             hasCollectionMediaManualMembership(media),
+        );
+
+        const eligibleMedia = await this.dropExcludedMedia(
+          mediaServer,
+          exclusionsFor(collection.id),
+          dueMedia,
         );
 
         // Defer any eligible media that is currently being streamed; it stays
@@ -182,7 +301,7 @@ export class CollectionWorkerService extends TaskBase {
       }
 
       this.logger.log(
-        `Collection handler summary: ${collections.length} total (isActive), ${doNothingCollectionCount} skipped (Do Nothing), ${noDueMediaCollectionCount} skipped (no due media), ${collectionHandleMediaGroup.length} queued for handling`,
+        `Collection handler summary: ${collections.length} total (isActive), ${doNothingCollectionCount} skipped (Do Nothing), ${noWindowCollectionCount} skipped (no window set), ${noDueMediaCollectionCount} skipped (no due media), ${collectionHandleMediaGroup.length} queued for handling`,
       );
 
       const totalMediaToHandle = collectionHandleMediaGroup.reduce(
@@ -342,8 +461,12 @@ export class CollectionWorkerService extends TaskBase {
         if (this.settings.seerrConfigured()) {
           await delay(7000, async () => {
             try {
+              // rethrow, or post() answers undefined and this catch never runs.
               await this.seerrApi.api.post(
                 '/settings/jobs/availability-sync/run',
+                undefined,
+                undefined,
+                { rethrow: true },
               );
 
               this.logger.log(
