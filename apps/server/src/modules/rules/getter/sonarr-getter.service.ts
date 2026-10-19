@@ -10,13 +10,17 @@ import {
 import { ServarrService } from '../../../modules/api/servarr-api/servarr.service';
 import { MediaServerFactory } from '../../api/media-server/media-server.factory';
 import { IMediaServerService } from '../../api/media-server/media-server.interface';
-import { SonarrApi } from '../../api/servarr-api/helpers/sonarr.helper';
+import {
+  findEpisodeByTvdbId,
+  SonarrApi,
+} from '../../api/servarr-api/helpers/sonarr.helper';
 import { MaintainerrLogger } from '../../logging/logs.service';
 import {
   findMetadataLookupMatch,
   formatMetadataLookupCandidates,
   MetadataLookupCandidate,
 } from '../../metadata/metadata-lookup.util';
+import { ArrLibrary } from '../../metadata/interfaces/metadata-lookup-policy.interface';
 import { MetadataService } from '../../metadata/metadata.service';
 import {
   Application,
@@ -115,8 +119,23 @@ export class SonarrGetterService {
         );
       }
 
+      const settingsId = ruleGroup.collection.sonarrSettingsId;
+      const sonarrApiClient =
+        await this.servarrService.getSonarrApiClient(settingsId);
+
+      // The library is the same for every item in the run.
+      const library = () =>
+        arrLookupCache
+          ? arrLookupCache.memoize(
+              `sonarr:${settingsId}:library`,
+              () => sonarrApiClient.getSeries(),
+              (series) => series === undefined,
+            )
+          : sonarrApiClient.getSeries();
+
       const lookupCandidates = await this.findLookupCandidatesFromMediaItem(
         libItem,
+        library,
         arrLookupCache,
       );
 
@@ -126,7 +145,7 @@ export class SonarrGetterService {
         // stays transient either way: "we could not look it up" is not the same
         // claim as "it is not there", and a definitive one would let unmatched
         // and personal media match NOT_EXISTS rules.
-        const message = `Failed to resolve external IDs for '${libItem.title}' (media server ID '${libItem.id}'). As a result, no Sonarr query could be made.`;
+        const message = `Failed to resolve external IDs for '${libItem.title}' (media server ID '${libItem.id}'). As a result, no Sonarr series could be identified.`;
         if (this.metadataService.hasExternalIds(libItem)) {
           this.logger.warn(message);
         } else {
@@ -136,17 +155,12 @@ export class SonarrGetterService {
         return undefined;
       }
 
-      const sonarrApiClient = await this.servarrService.getSonarrApiClient(
-        ruleGroup.collection.sonarrSettingsId,
-      );
-
       // The series lookup is keyed on the resolved tvdbId and is identical for
       // every episode/season of a show. The API call stays uncached (the
       // cleanup needs post-deletion truth - #2757/#2891), but during rule
       // evaluation we dedupe it through the run-scoped memo, which is gone
       // before any deletion runs. Evict on a failed (undefined) lookup so a
       // transient error doesn't mark the whole series unresolved for the run.
-      const settingsId = ruleGroup.collection.sonarrSettingsId;
       const resolveSeries = (lookupId: number) =>
         arrLookupCache
           ? arrLookupCache.memoize(
@@ -196,6 +210,46 @@ export class SonarrGetterService {
           `None of the resolved external IDs [${attemptedIds}] for '${libItem.title}' matched a series in Sonarr. Is the series tracked in Sonarr?`,
         );
         return null;
+      }
+
+      // Run-scoped cache for the full series episode list: one fetch per
+      // show per rule-run (single-`get()` memo without the cache). Evicts on
+      // transient `undefined` so one failed fetch doesn't poison the run
+      // (matches `resolveSeries` above).
+      let showEpisodesPromise: Promise<SonarrEpisode[] | undefined> | undefined;
+      const getShowEpisodes = async (): Promise<
+        SonarrEpisode[] | undefined
+      > => {
+        if (!showResponse.id) {
+          return undefined;
+        }
+
+        showEpisodesPromise ??= arrLookupCache
+          ? arrLookupCache.memoize(
+              `sonarr:${settingsId}:episodes-all:${showResponse.id}`,
+              () => sonarrApiClient.getEpisodes(showResponse.id),
+              (episodes) => episodes === undefined,
+            )
+          : sonarrApiClient.getEpisodes(showResponse.id);
+
+        return showEpisodesPromise;
+      };
+
+      // A media server can number an episode differently from Sonarr (#3819).
+      // When its TVDB id names one Sonarr episode, every value below reads
+      // that episode by Sonarr's numbers; otherwise by the media server's.
+      if (dataType === 'episode' && origLibItem.index !== undefined) {
+        const episode = origLibItem.providerIds?.tvdb?.length
+          ? findEpisodeByTvdbId(
+              (await getShowEpisodes()) ?? [],
+              origLibItem,
+              showResponse.tvdbId,
+            )
+          : undefined;
+        if (episode) {
+          seasonRatingKey = episode.seasonNumber;
+          origLibItem.index = episode.episodeNumber;
+        }
       }
 
       // Season 0 is the specials season, so test for a number rather than
@@ -283,29 +337,6 @@ export class SonarrGetterService {
         );
 
         return seasonEpisodesPromise;
-      };
-
-      // Run-scoped cache for the full series episode list: one fetch per
-      // show per rule-run (single-`get()` memo without the cache). Evicts on
-      // transient `undefined` so one failed fetch doesn't poison the run
-      // (matches `resolveSeries` above).
-      let showEpisodesPromise: Promise<SonarrEpisode[] | undefined> | undefined;
-      const getShowEpisodes = async (): Promise<
-        SonarrEpisode[] | undefined
-      > => {
-        if (!showResponse.id) {
-          return undefined;
-        }
-
-        showEpisodesPromise ??= arrLookupCache
-          ? arrLookupCache.memoize(
-              `sonarr:${settingsId}:episodes-all:${showResponse.id}`,
-              () => sonarrApiClient.getEpisodes(showResponse.id),
-              (episodes) => episodes === undefined,
-            )
-          : sonarrApiClient.getEpisodes(showResponse.id);
-
-        return showEpisodesPromise;
       };
 
       // Rank maps for episodeFileRank / seasonFileRank. Identical for every
@@ -763,6 +794,7 @@ export class SonarrGetterService {
 
   public async findLookupCandidatesFromMediaItem(
     libItem: MediaItem,
+    library: ArrLibrary,
     arrLookupCache?: ArrLookupCache,
   ): Promise<MetadataLookupCandidate[]> {
     // Candidate resolution (media-server ids -> validated provider ids) is
@@ -778,6 +810,8 @@ export class SonarrGetterService {
       this.metadataService.resolveLookupCandidatesFromMediaItemForService(
         libItem,
         'sonarr',
+        {},
+        library,
       );
 
     return arrLookupCache

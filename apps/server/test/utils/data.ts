@@ -69,6 +69,7 @@ export const createCollection = (
     collectionMedia: [],
     deleteAfterDays: 30,
     forceSeerr: false,
+    forceOmbi: false,
     handledMediaAmount: 0,
     keepLogsForMonths: 6,
     lastDurationInSeconds: 0,
@@ -492,6 +493,7 @@ export const createSonarrSeries = (
     imdbId: faker.string.sample(10),
     path: faker.system.directoryPath(),
     tvdbId: faker.number.int(),
+    tmdbId: faker.number.int(),
     qualityProfileId: faker.number.int(),
     ratings: {
       votes: faker.number.int(),
@@ -552,6 +554,7 @@ export const createSonarrEpisode = (
 ): SonarrEpisode => ({
   id: faker.number.int(),
   seriesId: faker.number.int(),
+  tvdbId: faker.number.int(),
   seasonNumber: faker.number.int(),
   episodeNumber: faker.number.int(),
   airDate: faker.date.past().toISOString().split('T')[0],
@@ -762,45 +765,6 @@ export const createMetadataProviderMock = ({
 };
 
 export const metadataLookupServiceTestCases: MetadataLookupServiceTestCase[] = [
-  {
-    title:
-      'resolves a Sonarr TVDB lookup candidate from TMDB provider details when TVDB is not directly available',
-    service: 'sonarr',
-    lookupPolicy: {
-      providerKeys: ['tvdb'],
-      providerMatchMode: 'any',
-    },
-    libraryItem: {
-      id: 'show-1',
-      type: 'show',
-      title: 'Fixture Story',
-      providerIds: {
-        tmdb: ['771'],
-        imdb: [],
-        tvdb: [],
-      },
-    },
-    providerMocks: [
-      {
-        name: 'TMDB',
-        idKey: 'tmdb',
-        details: {
-          title: 'Fixture Story',
-          type: 'tv',
-          externalIds: {
-            tmdb: 771,
-            tvdb: 202,
-            type: 'tv',
-          },
-        },
-      },
-      {
-        name: 'TVDB',
-        idKey: 'tvdb',
-      },
-    ],
-    expectedCandidates: [{ providerKey: 'tvdb', id: 202 }],
-  },
   {
     title:
       'resolves a Radarr TMDB lookup candidate from TVDB provider details because Radarr prefers TMDB',

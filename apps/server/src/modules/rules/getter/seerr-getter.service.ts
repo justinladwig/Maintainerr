@@ -58,6 +58,10 @@ export class SeerrGetterService {
         libItem = await mediaServer.getMetadata(
           dataType === 'season' ? libItem.parentId : libItem.grandparentId,
         );
+        // An unreadable show is transient: protect the item, not the run.
+        if (!libItem) {
+          return undefined;
+        }
       }
 
       const prop = this.appProperties.find((el) => el.id === id);
@@ -111,7 +115,10 @@ export class SeerrGetterService {
       // instead of a per-item getMovie/getShow - the per-item path rate-limited
       // under whole-library runs and silently degraded matches to near-zero
       // (#3152).
-      const requestsForMedia = await this.seerrApi.getRequestsForMedia(tmdbId);
+      const requestsForMedia = await this.seerrApi.getRequestsForMedia(
+        tmdbId,
+        resolvedIds.type,
+      );
       // undefined => the bulk sweep failed (Seerr unreachable). Transient: skip
       // so the comparator protects the item rather than treating it as "not
       // requested" (mirrors #3125).
@@ -252,10 +259,10 @@ export class SeerrGetterService {
       }
     } catch (error) {
       this.logger.warn(
-        `Seerr-Getter - Action failed for '${libItem.title}' with id '${libItem.id}'`,
+        `Seerr-Getter - Action failed for '${libItem?.title}' with id '${libItem?.id}'`,
       );
       this.logger.debug(
-        `Seerr-Getter - Action failed for '${libItem.title}' with id '${libItem.id}'`,
+        `Seerr-Getter - Action failed for '${libItem?.title}' with id '${libItem?.id}'`,
         error,
       );
       return undefined;

@@ -56,19 +56,9 @@ conversational chat.
   do the job, and say why. Such library suggestions in issues are often
   AI-sourced - don't take them at face value.
 
-- **Scope discipline.** Separate the actual blocker from cosmetic noise and fix
-  only what's needed. Before expanding scope (new deps, transformer swaps,
-  cross-cutting refactors), stop and confirm - don't turn a warning fix into an
-  architecture change. A known-benign warning can be left as a visible reminder
-  for a future dedicated overhaul rather than masked.
-
-- **But finish the job within the area you're touching.** If you're already in a
-  subsystem and spot a _real_ correctness bug adjacent to your change, fix it and
-  add coverage - "pre-existing" is not an excuse to leave a known bug. The
-  distinction from scope discipline: real-bug-in-scope → fix it; benign-noise →
-  leave it. For data changes, prefer **minimal behavioral change** - preserve how
-  existing data evaluates today, making values explicit rather than flipping
-  behavior.
+Scope, regression preservation, validation, and PR completion follow the
+[PR workflow](implementation.instructions.md#pr-workflow). For data changes,
+preserve existing evaluation semantics unless changing them is the requirement.
 
 ### Working-style preferences of the prior maintainer
 
@@ -80,7 +70,7 @@ Kept for continuity; the next maintainer may adjust these.
 - **Updating a PR branch:** rebase onto latest origin first (PR branches drift -
   one was 20 commits behind by the time edits finished), fold into one clean
   commit (`git reset --soft` then a single commit), run the **full** repo suite
-  (`yarn turbo test`, not just affected specs), then push. Verify
+  (`yarn test`, not just affected specs), then push. Verify
   `git rev-list --left-right --count origin/<branch>...HEAD` is `0 N` (clean
   fast-forward, no force-push). Keep diffs minimal - don't rename existing
   variables without cause.
@@ -148,6 +138,9 @@ The UI is on **Tailwind v4, CSS-first** - there is **no `tailwind.config.js`**.
   `SaveButton` and `TestingButton`, instead of recreating equivalent markup and
   Tailwind classes inline. If something is missing, extend the shared primitive
   rather than introducing a one-off version in a page component.
+- **Service card layout:** keep names, URLs and tag labels full width. Pair
+  short fields such as Base Path and API key in two-column rows, stacked on
+  mobile. Use the shared form inputs and global field styles.
 - **DRY** - no one-off duplicated feedback/loading patterns. Use
   `apps/ui/src/components/Settings/useSettingsFeedback.tsx` for inline page
   feedback (not toasts) on normal settings saves. For joined field layouts and
@@ -209,9 +202,11 @@ section-boundary default is AND. YAML export/import must use a **null check**
   no user-facing knob.
 - **`ArrLookupCache`** (`modules/rules/helpers/arr-lookup-cache.ts`): a run-scoped
   memo created in the executor for the eval loop only, never passed to
-  `handleCollection`/actions, so empty-show cleanup still reads fresh. Used only
-  by the sonarr/radarr getters (others already cache at the API layer); the API
-  lookup itself stays `getWithoutCache`.
+  `handleCollection`/actions, so empty-show cleanup still reads fresh. The
+  handling loop has a separate instance that memoizes only the full-library
+  listings the id fallback reads (#3787); identity lookups stay fresh there.
+  Used only by the sonarr/radarr getters (others already cache at the API
+  layer); the API lookup itself stays `getWithoutCache`.
 - **Do not retain full comparison stats for every scanned item.**
   `RuleExecutorService` should keep detailed `IComparisonStatistics` only for
   items that may be newly added to a collection. Holding per-item stats across
@@ -269,8 +264,8 @@ lists `rules` (sections + operators) and `values` (shifted per getter call, in
 rule order). It is a **script that prints JSON** (`yarn workspace
 @maintainerr/server test:e2e`), meant for cross-refactor comparison - add
 scenarios here to regression-test comparator / section-combine behavior end-to-end
-through the HTTP path. Use this when you want "real results" without standing up a
-mock HTTP media server. (For a fuller live setup, see the dev mocks below.)
+through the HTTP path. This verifies the rule engine with mocked providers;
+it does not establish real media-server integration coverage.
 
 ### Testing YAML import/export and community-rule import
 
@@ -411,6 +406,83 @@ must stay transport-only.
 
 ## Build, test & migrations
 
+### Writing tests
+
+A test records behaviour we approved: what the app deletes or keeps, what a
+rule matches, what it writes to a media server, an \*arr or the database, what
+the API returns and what a user can do. If that behaviour changes, a test has to
+fail, so the change is noticed and approved again by updating the test on
+purpose. Tests check outcomes at the boundary, the way an end-to-end check
+would, not how the code gets there.
+
+Keep it strict: add a test only when changing the behaviour it pins would break
+something in the app, and no other test already catches that change. The suite
+once passed 3,600 tests and a server run needed over 4 GB; about 2,500 is the
+size to hold.
+
+**What earns a test**
+
+- A data-safety guard (deletions, collection membership, manual-member
+  adoption, \*arr file deletes, fail-closed reads), a rule-value mapping, a
+  security contract, or a fixed bug (name the issue in a comment).
+- One test per behaviour. Another input on the same branch is an `it.each` row,
+  and only when it can fail differently. A negated action is one test over the
+  positive table (see the `NOT_*` test in
+  `rule.comparator.service.doRuleAction.spec.ts`).
+- Not worth a test: constants and static labels, log text and log levels, class
+  names and layout, argument or prop pass-through, which repository instance was
+  called, call counts that only measure performance, a library's own behaviour
+  (Zod schema shape, `Map`/`Set` semantics), and anything a required CI check
+  already runs (`validate-catalogs` over the translation catalogs).
+- Do not export a helper only to test it; test it through the unit that uses it.
+
+**Keep it honest**
+
+- A guard test must fail without its guard. Delete the guard once and watch the
+  test go red before trusting it. A "not called" assertion on a method the code
+  no longer uses passes forever.
+- Assert a rejection with `await expect(...).rejects`, never only inside `.catch`.
+- Tests must pass in any order (`jest --randomize`, `vitest run --sequence.shuffle`).
+  `jest.clearAllMocks()` keeps a `mockReturnValue`, so reset module-level mock
+  functions in `beforeEach` or one test's setup answers the next.
+
+**Keep it cheap**
+
+- No real network. The shared \*arr test clients in
+  `apps/server/test/utils/servarr-mock.ts` reject at the transport; stub what
+  the test needs.
+- No real time. Use fake timers for retries, backoff and debounce. Start the
+  call, advance the timers, then assert:
+  `const failure = call().catch((error) => error)`, then
+  `await jest.runAllTimersAsync()`, then `expect(await failure)...`. A deferred
+  `expect(call()).rejects` gets an `await` added by the server's
+  `eslint --fix` (`jest/valid-expect`), which then waits on timers nothing
+  advances.
+- No writes outside a temp folder: `mkdtempSync` under `os.tmpdir()`, removed in
+  `afterAll`, and mock `app/config/dataDir` when the code writes there. Do not
+  read host files such as `/etc/hosts`.
+- Use the smallest fixture that crosses the boundary: mock a ceiling such as
+  `MAX_RECORDS` down instead of building 500,000 rows.
+
+**One command everywhere**
+
+- `yarn test` from the root runs the server and UI suites at the same time,
+  and each runner uses half the cores, at most 4 workers. Do not add shards,
+  `--runInBand` chains or machine-specific flags.
+- Server: `apps/server/jest.config.ts` restarts a worker whose heap passes
+  256 MB after a spec file, and `apps/server/test/jest.setup.ts` closes the
+  module-level `cacheManager` caches, whose node-cache timers otherwise keep
+  every spec file's module graph in memory. Keep both.
+- `jest.config.ts` is excluded in `tsconfig.build.json` because `rootDir` is
+  `src`. Any new `.ts` file at the app root needs the same exclusion, or
+  `nest build` and the dev watcher fail.
+- UI: `findBy`/`waitFor` get 5 s and each test 20 s
+  (`apps/ui/src/test-utils/react-cleanup.ts`, `apps/ui/vite.config.ts`), because
+  heavy renders under parallel load pass the defaults. Fix a slow test rather
+  than raising its budget.
+- The UI reports unused imports through `tsc` (`yarn check-types`), not ESLint.
+  Run it after removing tests.
+
 ### Jest transform & circular imports
 
 Server tests run through **`@swc/jest`** (not ts-jest). The codebase has
@@ -502,17 +574,16 @@ Then: `cd apps/server && TS_NODE_PROJECT=./tsconfig.migrate.json yarn migration:
 
 **Verifying a migration:** the app uses `synchronize:false` + `migrationsRun:true`
 (`typeOrmConfig.ts`), so `migration:run` ≡ `yarn dev` for schema. Definitive sync
-check: build the branch DB from empty (`rm data/maintainerr.sqlite*` then
-`migration:run`), then `migration:generate` must report **"No changes in database
-schema were found."** `data/maintainerr.sqlite` is gitignored.
+check: use an empty, isolated test database, run `migration:run`, then
+`migration:generate` must report **"No changes in database schema were found."**
+Do not delete the shared development database for this check.
 
 ---
 
 ## Local dev: seeded DB + mock media servers
 
-For end-to-end checks of media-server-dependent flows (rules, collections,
-overview, storage) without a real Plex/Jellyfin - and to drive the UI with
-Playwright against deterministic data. Full workflow is in
+These mocks supplement real-stack validation with deterministic data, or serve
+as a reported fallback when a real service is unavailable. Full workflow is in
 [AGENTS.md](../../AGENTS.md); the scripts live in `tools/dev/`:
 
 - `tools/dev/fake-jellyfin.mjs` - stateless mock Jellyfin (`:8096`). Answers the
@@ -534,9 +605,10 @@ Playwright against deterministic data. Full workflow is in
   exists yet, so the seed's show collection is DO_NOTHING.
 - `tools/dev/seed-db.mjs` - the only DB-touching script. Resets and seeds
   collections / rule groups (with rules covering ~all properties) / settings /
-  notifications / exclusions / overlays into `data/maintainerr.sqlite`. Target a
-  server with `MEDIA_SERVER=plex|jellyfin` (default jellyfin). Run with `yarn dev`
-  **stopped** (SQLite is single-writer), then restart.
+  notifications / exclusions / overlays. Set `MAINTAINERR_DB` to an isolated
+  application database; the default is the shared `data/maintainerr.sqlite`.
+  Target a server with `MEDIA_SERVER=plex|jellyfin` (default jellyfin). Stop the
+  application using that database before seeding, then restart it.
 
 **Key limitation:** a DB-only seed does **not** populate the collection-detail
 media grid or Overview - `CollectionsService.hydrateCollectionMediaWithMetadata`
@@ -544,8 +616,8 @@ hydrates each row against the **live** media server and drops any id it can't
 resolve. You need the matching mock running for grids to render and for rule
 evaluation to run end-to-end via `POST /api/rules/test {rulegroupId, mediaId}`.
 
-After editing server code, **restart `yarn dev`** - a long-lived dev server serves
-stale getter logic. Watchlist / plex.tv user enrichment can't be mocked locally
+After a `yarn install`, **restart `yarn dev`** - its watcher keeps the old module
+resolution. Watchlist / plex.tv user enrichment can't be mocked locally
 (they hit plex.tv) and degrade gracefully.
 
 ---
@@ -557,6 +629,6 @@ The workspace configures MCP servers (kept in sync across `.codex/config.toml`,
 
 - **github** (HTTP, read-only): use for GitHub queries (issues, PRs, repo
   metadata) instead of shelling out to `gh` when an MCP tool is available.
-- **playwright** (stdio, `--headless --isolated`): use for browser-driven testing
-  / verification of UI changes instead of asking for manual verification. Save
-  screenshots under `.playwright-mcp/`.
+- **playwright** (stdio, `--headless --isolated`): often fails to connect, so
+  drive browser checks through the global `playwright` library instead (see
+  AGENTS.md). Save screenshots under `.playwright-mcp/`.

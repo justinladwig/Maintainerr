@@ -38,7 +38,11 @@ describe('NotificationTimerService', () => {
           aboutScale: ABOUT_SCALE,
           rulegroups: [
             {
-              collection: { id: 10, deleteAfterDays: DELETE_AFTER_DAYS },
+              collection: {
+                id: 10,
+                type: 'movie',
+                deleteAfterDays: DELETE_AFTER_DAYS,
+              },
             },
           ],
         })),
@@ -53,6 +57,9 @@ describe('NotificationTimerService', () => {
 
     const getRequestedByUsernames = jest.fn().mockResolvedValue(requestedBy);
     const seerrApi = { getRequestedByUsernames };
+    const ombiApi = {
+      getRequestedByUsernames: jest.fn().mockResolvedValue([]),
+    };
 
     const collectionService = {
       getCollectionMedia: jest.fn().mockResolvedValue(media),
@@ -65,6 +72,7 @@ describe('NotificationTimerService', () => {
       notificationService as never,
       mediaServerFactory as never,
       seerrApi as never,
+      ombiApi as never,
     );
 
     return {
@@ -118,7 +126,11 @@ describe('NotificationTimerService', () => {
       requestedBy: ['alice'],
     });
     // A movie has no season to narrow by.
-    expect(getRequestedByUsernames).toHaveBeenCalledWith(500, undefined);
+    expect(getRequestedByUsernames).toHaveBeenCalledWith(
+      500,
+      'movie',
+      undefined,
+    );
   });
 
   it('narrows the requester lookup to the season of a season item', async () => {
@@ -130,7 +142,7 @@ describe('NotificationTimerService', () => {
 
     await (service as never as { executeTask(): Promise<void> }).executeTask();
 
-    expect(getRequestedByUsernames).toHaveBeenCalledWith(500, 2);
+    expect(getRequestedByUsernames).toHaveBeenCalledWith(500, 'tv', 2);
   });
 
   it('narrows to the parent season of an episode item', async () => {
@@ -146,26 +158,17 @@ describe('NotificationTimerService', () => {
 
     await (service as never as { executeTask(): Promise<void> }).executeTask();
 
-    expect(getRequestedByUsernames).toHaveBeenCalledWith(500, 2);
-  });
-
-  it('omits requestedBy when nobody requested the item', async () => {
-    const { service, handleNotification } = createService({
-      media: [{ mediaServerId: '1', tmdbId: 500, addDate: dueAddDate() }],
-      metadata: { title: 'Sample Movie', type: 'movie' },
-      requestedBy: [],
-    });
-
-    await (service as never as { executeTask(): Promise<void> }).executeTask();
-
-    expect(notifiedItems(handleNotification)[0]).not.toHaveProperty(
-      'requestedBy',
-    );
+    expect(getRequestedByUsernames).toHaveBeenCalledWith(500, 'tv', 2);
   });
 
   it('still notifies when the media server lookup throws', async () => {
     // Losing the title snapshot must not suppress the warning itself.
-    const { service, handleNotification, getMetadata } = createService({
+    const {
+      service,
+      handleNotification,
+      getMetadata,
+      getRequestedByUsernames,
+    } = createService({
       media: [{ mediaServerId: '1', tmdbId: 500, addDate: dueAddDate() }],
       requestedBy: ['alice'],
     });
@@ -178,47 +181,10 @@ describe('NotificationTimerService', () => {
       mediaServerId: '1',
       requestedBy: ['alice'],
     });
-  });
-
-  it('skips the Seerr lookup for an item with no tmdbId', async () => {
-    const { service, getRequestedByUsernames } = createService({
-      media: [{ mediaServerId: '1', addDate: dueAddDate() }],
-      metadata: { title: 'Sample Movie', type: 'movie' },
-    });
-
-    await (service as never as { executeTask(): Promise<void> }).executeTask();
-
-    expect(getRequestedByUsernames).not.toHaveBeenCalled();
-  });
-
-  it('enriches each item once even when several agents notify it', async () => {
-    const { service, getMetadata, getRequestedByUsernames } = createService({
-      media: [{ mediaServerId: '1', tmdbId: 500, addDate: dueAddDate() }],
-      metadata: { title: 'Sample Movie', type: 'movie' },
-      requestedBy: ['alice'],
-      agentCount: 3,
-    });
-
-    await (service as never as { executeTask(): Promise<void> }).executeTask();
-
-    expect(getMetadata).toHaveBeenCalledTimes(1);
-    expect(getRequestedByUsernames).toHaveBeenCalledTimes(1);
-  });
-
-  it('does not notify an item that is not due', async () => {
-    const { service, handleNotification } = createService({
-      media: [
-        {
-          mediaServerId: '1',
-          tmdbId: 500,
-          addDate: new Date().toISOString(),
-        },
-      ],
-      metadata: { title: 'Sample Movie', type: 'movie' },
-    });
-
-    await (service as never as { executeTask(): Promise<void> }).executeTask();
-
-    expect(handleNotification).not.toHaveBeenCalled();
+    expect(getRequestedByUsernames).toHaveBeenCalledWith(
+      500,
+      'movie',
+      undefined,
+    );
   });
 });

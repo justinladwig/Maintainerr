@@ -36,6 +36,7 @@ export interface SonarrEpisode {
   airDate: string;
   airDateUtc: string;
   seriesId: number;
+  tvdbId: number;
   seasonNumber: number;
   episodeNumber: number;
   episodeFileId: number; // 0 if not downloaded
@@ -127,6 +128,7 @@ export interface SonarrSeries {
   useSceneNumbering: boolean;
   runtime: number;
   tvdbId: number;
+  tmdbId: number;
   tvRageId: number;
   tvMazeId: number;
   firstAired: string;

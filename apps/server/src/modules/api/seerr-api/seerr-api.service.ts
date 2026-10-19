@@ -1,6 +1,11 @@
-import { BasicResponseDto, stripTrailingSlashes } from '@maintainerr/contracts';
+import {
+  BasicResponseDto,
+  RequestMediaStatus,
+  stripTrailingSlashes,
+} from '@maintainerr/contracts';
 import { Injectable } from '@nestjs/common';
 import { cloneDeep } from 'lodash';
+import { assertApiKey, connectionTestConfig } from '../lib/connectionTest';
 import { SettingsDataService } from '../../../modules/settings/settings-data.service';
 import {
   formatConnectionFailureMessage,
@@ -51,7 +56,13 @@ export interface SeerrTVResponse {
 interface SeerrTVInfo extends SeerrMediaInfo {
   mediaType: 'tv';
   requests?: SeerrTVRequest[];
-  seasons?: SeerrSeasonResponse[];
+  seasons?: SeerrMediaSeason[];
+}
+
+interface SeerrMediaSeason {
+  seasonNumber: number;
+  status: RequestMediaStatus;
+  status4k: RequestMediaStatus;
 }
 
 export interface SeerrSeasonResponse {
@@ -85,7 +96,7 @@ export type SeerrBaseRequest = {
   updatedAt: string;
   requestedBy: SeerrUser;
   modifiedBy: SeerrUser;
-  is4k: false;
+  is4k: boolean;
   serverId: number;
   profileId: number;
   rootFolder: string;
@@ -103,6 +114,10 @@ export type SeerrMovieRequest = SeerrBaseRequest & {
 };
 
 export type SeerrRequest = SeerrMovieRequest | SeerrTVRequest;
+
+// TMDB numbers movies and shows independently, so one id can name both.
+const requestIndexKey = (type: SeerrRequest['type'], tmdbId: number) =>
+  `${type}:${tmdbId}`;
 
 /**
  * Reads the name off the request rather than looking the user up on the media
@@ -157,6 +172,7 @@ interface SeerrStatus {
 
 interface SeerrAbout {
   version: string;
+  totalRequests: number;
 }
 
 export interface SeerrBasicApiResponse {
@@ -206,8 +222,12 @@ export class SeerrApiService {
   // Deduplicates concurrent callers (the first batch of rule-evaluation items)
   // onto a single /request sweep while the run-scoped index is being built.
   private requestIndexPromise?: Promise<
-    Map<number, SeerrRequest[]> | undefined
+    Map<string, SeerrRequest[]> | undefined
   >;
+
+  // Seasons removed while the request covering them was kept for its others,
+  // by request id: Seerr marks them deleted only at its next availability sync.
+  private readonly removedSeasons = new Map<number, Set<number>>();
 
   constructor(
     private readonly settings: SettingsDataService,
@@ -428,12 +448,13 @@ export class SeerrApiService {
    */
   public async getRequestsForMedia(
     tmdbId: number,
+    type: 'movie' | 'tv',
   ): Promise<SeerrRequest[] | undefined> {
     const index = await this.getRequestIndex();
     if (index === undefined) {
       return undefined;
     }
-    const requests = index.get(tmdbId);
+    const requests = index.get(requestIndexKey(type, tmdbId));
     // cloneDeep, not structuredClone: it never throws on an unexpected
     // non-cloneable value (which would surface as a per-item warn + skip).
     return requests ? cloneDeep(requests) : [];
@@ -449,13 +470,14 @@ export class SeerrApiService {
    */
   public async getRequestedByUsernames(
     tmdbId: number,
+    type: 'movie' | 'tv',
     season?: number,
   ): Promise<string[]> {
     if (!this.isConfigured() || !tmdbId) {
       return [];
     }
 
-    const requests = await this.getRequestsForMedia(tmdbId);
+    const requests = await this.getRequestsForMedia(tmdbId, type);
     if (!requests?.length) {
       return [];
     }
@@ -474,10 +496,10 @@ export class SeerrApiService {
   }
 
   private async getRequestIndex(): Promise<
-    Map<number, SeerrRequest[]> | undefined
+    Map<string, SeerrRequest[]> | undefined
   > {
     const cache = cacheManager.getCache(SEERR_REQUESTS_CACHE_ID)?.data;
-    const cached = cache?.get<Map<number, SeerrRequest[]>>(
+    const cached = cache?.get<Map<string, SeerrRequest[]>>(
       SEERR_REQUESTS_CACHE_KEY,
     );
     if (cached) {
@@ -492,7 +514,7 @@ export class SeerrApiService {
   }
 
   private async buildRequestIndex(): Promise<
-    Map<number, SeerrRequest[]> | undefined
+    Map<string, SeerrRequest[]> | undefined
   > {
     const requests = await this.getRequests();
     // Don't cache a failed sweep: a later batch in the same run retries, giving
@@ -512,24 +534,25 @@ export class SeerrApiService {
         a.id - b.id,
     );
 
-    // Group by media.tmdbId: Seerr keys every media row by tmdbId (non-null,
+    // Group by type and tmdbId: Seerr keys every media row by tmdbId (non-null,
     // indexed - tvdbId/imdbId are optional extras), and the metadata service
     // resolves each library item to that tmdbId via all its providers (with
     // tvdb/imdb -> tmdb bridging), so tmdbId is the canonical join key (and
     // matches the per-item getMovie/getShow path this replaces). media.requests
     // is not populated on the list endpoint (it would be circular), so each
     // title's request set is rebuilt here.
-    const index = new Map<number, SeerrRequest[]>();
+    const index = new Map<string, SeerrRequest[]>();
     for (const request of requests) {
       const tmdbId = request.media?.tmdbId;
       if (typeof tmdbId !== 'number') {
         continue;
       }
-      const existing = index.get(tmdbId);
+      const key = requestIndexKey(request.type, tmdbId);
+      const existing = index.get(key);
       if (existing) {
         existing.push(request);
       } else {
-        index.set(tmdbId, [request]);
+        index.set(key, [request]);
       }
     }
 
@@ -566,6 +589,9 @@ export class SeerrApiService {
    * a caller never reports a removal that did not happen. The writes rethrow
    * rather than answering their body: a 204 carries an empty one, so success
    * and failure are both falsy.
+   *
+   * Seerr cannot drop one season from a request, so a request that also covers
+   * a season still there is kept, and goes with the last of them (#3879).
    */
   public async removeSeasonRequest(
     tmdbid: string | number,
@@ -589,11 +615,37 @@ export class SeerrApiService {
         el.seasons.find((s) => s.seasonNumber === season),
       );
       if (requests.length > 0) {
-        for (const el of requests) {
+        const seasons = media.mediaInfo.seasons ?? [];
+        const shared = requests.filter((el) =>
+          el.seasons.some(
+            ({ seasonNumber }) =>
+              seasonNumber !== season &&
+              !this.removedSeasons.get(el.id)?.has(seasonNumber) &&
+              seasons.find((s) => s.seasonNumber === seasonNumber)?.[
+                el.is4k ? 'status4k' : 'status'
+              ] !== RequestMediaStatus.DELETED,
+          ),
+        );
+        if (shared.length > 0) {
+          this.logger.log(
+            `Kept ${shared.length} Seerr request(s) covering season ${season} of show with TMDB ID '${tmdbid}': they also cover other seasons`,
+          );
+        }
+        for (const el of shared) {
+          this.removedSeasons.set(
+            el.id,
+            (this.removedSeasons.get(el.id) ?? new Set()).add(season),
+          );
+        }
+
+        const own = requests.filter((el) => !shared.includes(el));
+        for (const el of own) {
           await this.api.delete(`/request/${el.id}`, undefined, {
             rethrow: true,
           });
+          this.removedSeasons.delete(el.id);
         }
+        return own.length > 0;
       } else if (allRequests.length > 0) {
         // Other seasons are still requested. Deleting the media record cascades
         // into their requests, so leave it alone and report nothing removed.
@@ -654,7 +706,9 @@ export class SeerrApiService {
           request.seasons.some(
             (season) =>
               season.seasonNumber !== removedSeasonNumber &&
-              season.status !== SeerrRequestStatus.COMPLETED,
+              season.status !== SeerrRequestStatus.COMPLETED &&
+              // Removed earlier while this request was kept, not still coming.
+              !this.removedSeasons.get(request.id)?.has(season.seasonNumber),
           ),
         );
     } catch (error) {
@@ -750,20 +804,20 @@ export class SeerrApiService {
       : this.api;
 
     try {
+      assertApiKey(params ? params.apiKey : this.settings.seerr_api_key);
       const response = await api.getRawWithoutCache<SeerrAbout>(
         `/settings/about`,
-        {
-          signal: AbortSignal.timeout(CONNECTION_TEST_TIMEOUT_MS),
-        },
+        connectionTestConfig(),
       );
 
-      if (!response.data?.version) {
-        return {
-          status: 'NOK',
-          code: 0,
-          message:
-            'Failure, an unexpected response was returned. The URL is likely incorrect.',
-        };
+      // Ombi serves this path too, for any key, so check a Seerr-only field.
+      if (
+        !response.data?.version ||
+        typeof response.data.totalRequests !== 'number'
+      ) {
+        throw new Error(
+          'Failure, an unexpected response was returned. The URL is likely incorrect.',
+        );
       }
 
       return {
@@ -772,7 +826,7 @@ export class SeerrApiService {
         message: response.data.version,
       };
     } catch (error) {
-      logConnectionTestError(this.logger, 'Seerr');
+      logConnectionTestError(this.logger, 'Seerr', error);
 
       return {
         status: 'NOK',

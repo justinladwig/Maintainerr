@@ -8,6 +8,7 @@ const deleteSettingsMock = vi.fn()
 const testMock = vi.fn()
 const showUpdated = vi.fn()
 const showError = vi.fn()
+const clear = vi.fn()
 const clearError = vi.fn()
 
 let downloadClientData: {
@@ -18,12 +19,25 @@ let downloadClientData: {
   download_client_delete_data: boolean
   download_client_fallback_ratio: number
 }
+let arrServers: { id: number }[]
 
 vi.mock('..', () => ({
   useSettingsOutletContext: () => ({ settings: { id: 1 } }),
 }))
 
+vi.mock('react-router-dom', async () => {
+  const actual =
+    await vi.importActual<typeof import('react-router-dom')>('react-router-dom')
+  return {
+    ...actual,
+    Navigate: ({ to }: { to: string }) => (
+      <div data-testid="navigate" data-to={to} />
+    ),
+  }
+})
+
 vi.mock('../../../api/settings', () => ({
+  useServarrSettings: () => ({ isSuccess: true, data: arrServers }),
   useDownloadClientSettings: () => ({ data: downloadClientData }),
   useTestDownloadClient: () => ({ mutateAsync: testMock, isPending: false }),
   useSaveDownloadClientSettings: () => ({
@@ -41,12 +55,9 @@ vi.mock('../useSettingsFeedback', () => ({
     feedback: null,
     showUpdated,
     showError,
+    clear,
     clearError,
   }),
-}))
-
-vi.mock('../../Common/DocsButton', () => ({
-  default: () => <button type="button">Docs</button>,
 }))
 
 describe('DownloadClientSettings', () => {
@@ -56,6 +67,7 @@ describe('DownloadClientSettings', () => {
     testMock.mockReset()
     showUpdated.mockReset()
     showError.mockReset()
+    clear.mockReset()
     clearError.mockReset()
     downloadClientData = {
       download_client_type: DownloadClientType.QBITTORRENT,
@@ -65,6 +77,17 @@ describe('DownloadClientSettings', () => {
       download_client_delete_data: true,
       download_client_fallback_ratio: 0.5,
     }
+    arrServers = [{ id: 1 }]
+  })
+
+  it('sends the page to the services hub without a Radarr, Sonarr or Sportarr server', () => {
+    arrServers = []
+
+    render(<DownloadClientSettings />)
+
+    expect(screen.getByTestId('navigate').getAttribute('data-to')).toBe(
+      '/services',
+    )
   })
 
   it('saves the connection settings as a contract payload', async () => {
@@ -125,7 +148,7 @@ describe('DownloadClientSettings', () => {
     expect(saveSettingsMock).not.toHaveBeenCalled()
   })
 
-  it('tests the connection and shows a success alert', async () => {
+  it('tests the connection and keeps the success through an unchanged base path', async () => {
     testMock.mockResolvedValue({ status: 'OK', code: 1, message: 'v4.6.0' })
 
     render(<DownloadClientSettings />)
@@ -141,9 +164,10 @@ describe('DownloadClientSettings', () => {
         }),
       )
     })
-    expect(
-      await screen.findByText(/Successfully connected to the download client/),
-    ).toBeTruthy()
+    expect(await screen.findByText(/Success!/)).toBeTruthy()
+
+    fireEvent.blur(screen.getByLabelText('Base Path'))
+    expect(screen.getByText(/Success!/)).toBeTruthy()
   })
 
   it('clears the URL when the client changes and restores it for the saved client', async () => {
@@ -189,7 +213,7 @@ describe('DownloadClientSettings', () => {
       )
     })
   })
-  it('starts with no client selected and refuses to test without one', async () => {
+  it('starts with no client selected, refuses to test without one and keeps the typed URL', async () => {
     downloadClientData = {
       download_client_type: null,
       download_client_url: '',
@@ -216,9 +240,17 @@ describe('DownloadClientSettings', () => {
     })
     expect(testMock).not.toHaveBeenCalled()
 
-    fireEvent.change(clientSelect, {
-      target: { value: DownloadClientType.TRANSMISSION },
-    })
+    // Arrow keys reach the second client through the first.
+    for (const client of [
+      DownloadClientType.QBITTORRENT,
+      DownloadClientType.TRANSMISSION,
+    ]) {
+      fireEvent.change(clientSelect, { target: { value: client } })
+    }
     expect(clientSelect.getAttribute('aria-invalid')).toBe('false')
+    expect(screen.getByLabelText(/^URL \*/)).toHaveProperty(
+      'value',
+      'http://localhost:8080',
+    )
   })
 })

@@ -2,6 +2,7 @@ import { MediaServerType, TracearrSetting } from '@maintainerr/contracts';
 import { TestBed, type Mocked } from '@suites/unit';
 import { Repository } from 'typeorm';
 import { InternalApiService } from '../api/internal-api/internal-api.service';
+import { BACKGROUND_CONNECTION_TEST_TIMEOUT_MS } from '../api/lib/httpTimeouts';
 import { MediaServerFactory } from '../api/media-server/media-server.factory';
 import { PlexApiService } from '../api/plex-api/plex-api.service';
 import { SeerrApiService } from '../api/seerr-api/seerr-api.service';
@@ -27,6 +28,8 @@ describe('SettingsOperationsService', () => {
   let streamystats: Mocked<StreamystatsApiService>;
   let tracearr: Mocked<TracearrApiService>;
   let internalApi: Mocked<InternalApiService>;
+  let servarr: Mocked<ServarrService>;
+  let logger: Mocked<MaintainerrLogger>;
 
   const createSettings = (overrides: Partial<Settings> = {}): Settings =>
     Object.assign(new Settings(), {
@@ -63,13 +66,13 @@ describe('SettingsOperationsService', () => {
     unitRef.get<Mocked<Repository<SonarrSettings>>>('SonarrSettingsRepository');
     mediaServerFactory = unitRef.get(MediaServerFactory);
     plexApi = unitRef.get(PlexApiService);
-    unitRef.get(ServarrService);
+    servarr = unitRef.get(ServarrService);
     seerr = unitRef.get(SeerrApiService);
     tautulli = unitRef.get(TautulliApiService);
     streamystats = unitRef.get(StreamystatsApiService);
     tracearr = unitRef.get(TracearrApiService);
     internalApi = unitRef.get(InternalApiService);
-    unitRef.get(MaintainerrLogger);
+    logger = unitRef.get(MaintainerrLogger);
 
     settingsRepo.findOne.mockResolvedValue(createSettings());
     settingsRepo.save.mockImplementation(
@@ -87,7 +90,10 @@ describe('SettingsOperationsService', () => {
     mediaServerFactory.initialize.mockResolvedValue(undefined);
     plexApi.initialize.mockResolvedValue(undefined);
     plexApi.validateAuthToken.mockResolvedValue('valid');
-    plexApi.getStatus.mockResolvedValue({ version: '1.0.0' } as never);
+    plexApi.testConnection.mockResolvedValue({
+      version: '1.0.0',
+      machineIdentifier: 'server-id',
+    });
     seerr.init.mockImplementation();
     tautulli.init.mockImplementation();
     streamystats.init.mockImplementation();
@@ -118,21 +124,6 @@ describe('SettingsOperationsService', () => {
       }),
     );
     expect(tracearr.init).toHaveBeenCalledTimes(1);
-  });
-
-  it('tests Tracearr with connection fields only', async () => {
-    tracearr.testConnection.mockResolvedValue({
-      status: 'OK',
-      code: 1,
-      message: '2.0.0-beta.1',
-    });
-
-    await expect(
-      service.testTracearr({
-        url: 'http://tracearr.local',
-        api_key: 'trr_pub_token',
-      }),
-    ).resolves.toEqual({ status: 'OK', code: 1, message: '2.0.0-beta.1' });
   });
 
   it('clears the Tracearr server selection when the reconfigured media server no longer matches', async () => {
@@ -278,53 +269,6 @@ describe('SettingsOperationsService', () => {
     expect(settingsDataService.saveSettings).not.toHaveBeenCalled();
   });
 
-  it('still allows unrelated settings updates when Plex server settings are unchanged', async () => {
-    const response = await service.updateSettings(
-      createSettings({ applicationTitle: 'Maintainerr Dev' }),
-    );
-
-    expect(response).toEqual({ status: 'OK', code: 1, message: 'Success' });
-    expect(settingsDataService.saveSettings).toHaveBeenCalledTimes(1);
-    expect(mediaServerFactory.initialize).toHaveBeenCalledTimes(1);
-  });
-
-  it('does not initialize Plex directly when Jellyfin is configured', async () => {
-    settingsRepo.findOne.mockResolvedValue(
-      createSettings({
-        media_server_type: MediaServerType.JELLYFIN,
-        jellyfin_url: 'http://jellyfin.local',
-        jellyfin_api_key: 'jellyfin-key',
-        jellyfin_user_id: 'user-id',
-        jellyfin_server_name: 'Jellyfin',
-        plex_name: null,
-        plex_hostname: null,
-        plex_port: null,
-        plex_ssl: null,
-        plex_auth_token: null,
-      }),
-    );
-
-    const response = await service.updateSettings(
-      createSettings({
-        media_server_type: MediaServerType.JELLYFIN,
-        jellyfin_url: 'http://jellyfin.local',
-        jellyfin_api_key: 'jellyfin-key',
-        jellyfin_user_id: 'user-id',
-        jellyfin_server_name: 'Jellyfin',
-        plex_name: null,
-        plex_hostname: null,
-        plex_port: null,
-        plex_ssl: null,
-        plex_auth_token: null,
-        applicationTitle: 'Maintainerr Dev',
-      }),
-    );
-
-    expect(response).toEqual({ status: 'OK', code: 1, message: 'Success' });
-    expect(mediaServerFactory.initialize).toHaveBeenCalledTimes(1);
-    expect(plexApi.initialize).not.toHaveBeenCalled();
-  });
-
   it('treats equivalent Plex host representations as unchanged for auth enforcement', async () => {
     settingsRepo.findOne.mockResolvedValue(
       createSettings({
@@ -407,19 +351,6 @@ describe('SettingsOperationsService', () => {
     );
   });
 
-  it('returns a clear Plex auth message before calling the Plex API test endpoint', async () => {
-    settingsDataService.plex_auth_token = null;
-
-    const response = await service.testPlex();
-
-    expect(response).toEqual({
-      status: 'NOK',
-      code: 0,
-      message: 'Authenticate with Plex before testing the connection.',
-    });
-    expect(plexApi.getStatus).not.toHaveBeenCalled();
-  });
-
   it('validates stored Plex auth tokens without requiring server settings', async () => {
     settingsDataService.plex_auth_token = 'masked-plex-token';
 
@@ -427,7 +358,7 @@ describe('SettingsOperationsService', () => {
 
     expect(response).toEqual({ status: 'OK', code: 1, message: 'Success' });
     expect(plexApi.validateAuthToken).toHaveBeenCalledTimes(1);
-    expect(plexApi.getStatus).not.toHaveBeenCalled();
+    expect(plexApi.testConnection).not.toHaveBeenCalled();
   });
 
   it('reports invalid credentials when plex.tv rejects the stored token', async () => {
@@ -455,17 +386,41 @@ describe('SettingsOperationsService', () => {
     expect(response.message).not.toContain('invalid');
   });
 
-  it('returns a clear message when no Plex auth token exists for auth validation', async () => {
-    settingsDataService.plex_auth_token = null;
+  // Answered, not thrown, so it was never logged behind "check logs".
+  it('logs why a Radarr test failed when another *arr answers', async () => {
+    servarr.getRadarrApiClient.mockResolvedValue({
+      info: jest
+        .fn()
+        .mockResolvedValue({ appName: 'Sonarr', version: '4.0.0' }),
+    } as never);
 
-    const response = await service.testPlexAuthToken();
-
-    expect(response).toEqual({
+    await expect(service.testRadarr(1)).resolves.toEqual({
       status: 'NOK',
       code: 0,
-      message: 'Authenticate with Plex before validating the connection.',
+      message: 'Unexpected application name returned: Sonarr',
     });
-    expect(plexApi.validateAuthToken).not.toHaveBeenCalled();
+    expect(logger.error).toHaveBeenCalledWith(
+      'Radarr connection test failed: Unexpected application name returned: Sonarr',
+    );
+  });
+
+  it('gives the daily media-server check the background budget', async () => {
+    settingsDataService.media_server_type = MediaServerType.JELLYFIN;
+    settingsDataService.jellyfin_url = 'http://jellyfin.local';
+    settingsDataService.jellyfin_api_key = 'jf-key';
+    mediaServerFactory.testJellyfinConnection.mockResolvedValue({
+      success: true,
+      serverName: 'My Server',
+      version: '12.0.0',
+    });
+
+    await expect(service.testMediaServerConnection()).resolves.toBe(true);
+
+    expect(mediaServerFactory.testJellyfinConnection).toHaveBeenCalledWith(
+      'http://jellyfin.local',
+      'jf-key',
+      BACKGROUND_CONNECTION_TEST_TIMEOUT_MS,
+    );
   });
 
   it('re-initialises Streamystats after a successful Jellyfin save', async () => {

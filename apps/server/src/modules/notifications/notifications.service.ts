@@ -316,7 +316,10 @@ export class NotificationService implements OnModuleInit {
     }
   }
 
-  async getNotificationConfigurations(withRelation = false) {
+  // Undefined when the table could not be read, which is not "no agents".
+  async getNotificationConfigurations(
+    withRelation = false,
+  ): Promise<Notification[] | undefined> {
     try {
       if (withRelation) {
         const notifConfigs = await this.notificationRepo.find();
@@ -352,7 +355,8 @@ export class NotificationService implements OnModuleInit {
     const notification = new Notification();
     notification.id = -1;
     notification.agent = payload.agent;
-    notification.enabled = payload.enabled;
+    // A test is sent whether or not the agent is switched on yet.
+    notification.enabled = true;
     notification.aboutScale = payload.aboutScale;
     notification.name = payload.name;
     notification.options = payload.options;
@@ -363,6 +367,7 @@ export class NotificationService implements OnModuleInit {
 
   public async registerConfiguredAgents(skiplog = false) {
     const configuredAgents = await this.getNotificationConfigurations();
+    if (!configuredAgents) return;
 
     const sameAgents = (a: Notification[], b: Notification[]) =>
       isEqual(sortBy(a, 'id'), sortBy(b, 'id'));
@@ -377,7 +382,7 @@ export class NotificationService implements OnModuleInit {
       // configuring a newer agent type) yields no agent. Drop it here rather
       // than letting an undefined entry reach the send paths.
       const agents: NotificationAgent[] = [];
-      for (const notification of configuredAgents ?? []) {
+      for (const notification of configuredAgents) {
         const agent = this.createAgent(notification);
 
         if (!agent) {
@@ -551,6 +556,7 @@ export class NotificationService implements OnModuleInit {
       .replace(/\b\w/g, (char) => char.toUpperCase());
   }
 
+  // Labels and help for these options live in the UI, where they translate.
   public getAgentSpec() {
     return [
       {
@@ -566,19 +572,19 @@ export class NotificationService implements OnModuleInit {
             field: 'secure',
             type: 'checkbox',
             required: false,
-            extraInfo: 'TLS: Use implicit TLS',
+            extraInfo: '',
           },
           {
             field: 'ignoreTls',
             type: 'checkbox',
             required: false,
-            extraInfo: 'TLS: None',
+            extraInfo: '',
           },
           {
             field: 'requireTls',
             type: 'checkbox',
             required: false,
-            extraInfo: 'TLS: Always use STARTLS',
+            extraInfo: '',
           },
           { field: 'authUser', type: 'text', required: false, extraInfo: '' },
           {
@@ -630,7 +636,7 @@ export class NotificationService implements OnModuleInit {
             field: 'profileName',
             type: 'text',
             required: false,
-            extraInfo: 'Only required if not using the default profile',
+            extraInfo: '',
           },
         ],
       },
@@ -655,21 +661,19 @@ export class NotificationService implements OnModuleInit {
             field: 'botUsername',
             type: 'text',
             required: false,
-            extraInfo:
-              'Allow users to also start a chat with your bot and configure their own notifications',
+            extraInfo: '',
           },
           {
             field: 'chatId',
             type: 'text',
             required: true,
-            extraInfo:
-              'Start a chat with your bot, add @get_id_bot, and issue the /my_id command',
+            extraInfo: '',
           },
           {
             field: 'sendSilently',
             type: 'checkbox',
             required: false,
-            extraInfo: 'Send notifications with no sound',
+            extraInfo: '',
           },
         ],
       },
@@ -690,7 +694,7 @@ export class NotificationService implements OnModuleInit {
             field: 'userToken',
             type: 'text',
             required: true,
-            extraInfo: 'Your 30-character user or group identifier',
+            extraInfo: '',
           },
           { field: 'sound', type: 'text', required: false, extraInfo: '' },
         ],

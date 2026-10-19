@@ -1,16 +1,24 @@
 import {
   BasicResponseDto,
   MediaItem,
+  MediaWatchStats,
   MINIMUM_TRACEARR_VERSION,
+  stripTrailingSlashes,
   TracearrServer,
   TracearrHistoryItem,
+  TracearrItemHistoryRow,
+  tracearrItemHistoryPageSchema,
   tracearrHistoryPageSchema,
-  tracearrLibrariesPageSchema,
+  tracearrMediaChildrenSchema,
+  tracearrMediaSchema,
   tracearrRecentlyAddedPageSchema,
-  tracearrServerSchema,
+  TracearrServersResponse,
+  tracearrServersResponseSchema,
   tracearrUsersPageSchema,
 } from '@maintainerr/contracts';
 import { Injectable } from '@nestjs/common';
+import { isAxiosError } from 'axios';
+import { assertApiKey, connectionTestConfig } from '../lib/connectionTest';
 import { SettingsDataService } from '../../settings/settings-data.service';
 import { resolveDescendants } from '../media-server/context-action.util';
 import { MediaServerFactory } from '../media-server/media-server.factory';
@@ -18,7 +26,6 @@ import {
   formatConnectionFailureMessage,
   logConnectionTestError,
 } from '../../../utils/connection-error';
-import { CONNECTION_TEST_TIMEOUT_MS } from '../lib/httpTimeouts';
 import {
   MaintainerrLogger,
   MaintainerrLoggerFactory,
@@ -28,38 +35,14 @@ import {
   TRACEARR_CACHE_ID,
   TRACEARR_HISTORY_CACHE_KEY,
   TRACEARR_HISTORY_MAX_RECORDS,
+  TRACEARR_ITEM_HISTORY_MAX_PAGES,
+  TRACEARR_ITEM_SERVER_RETRY_MS,
   TRACEARR_PAGE_SIZE,
   TRACEARR_SERVER_MATCH_THRESHOLD,
   TRACEARR_SERVER_PROBE_MINIMUM,
   TRACEARR_SERVER_PROBE_SIZE,
 } from './tracearr-api.constants';
 import { TracearrApi } from './helpers/tracearr-api.helper';
-import { isBelowMinimumVersion } from '../../../utils/required-version-helper';
-
-interface TracearrOpenApiDocument {
-  openapi?: string;
-  info?: {
-    title?: string;
-    version?: string;
-  };
-  paths?: Record<
-    string,
-    Record<string, TracearrOpenApiOperation | undefined> | undefined
-  >;
-}
-
-interface TracearrOpenApiOperation {
-  parameters?: TracearrOpenApiParameter[];
-}
-
-interface TracearrOpenApiParameter {
-  name?: string;
-  in?: string;
-  description?: string;
-  schema?: {
-    enum?: unknown[];
-  };
-}
 
 // Tracearr truncates the media server's added date to milliseconds, so the two
 // only agree to the second.
@@ -67,6 +50,32 @@ const sameSecond = (left: Date | undefined, right: number): boolean =>
   left != null &&
   !Number.isNaN(right) &&
   Math.floor(left.getTime() / 1000) === Math.floor(right / 1000);
+
+/**
+ * The plays of a show that belong to this show, or to this season of it.
+ * Undefined when the item cannot be placed: a season is only told apart by
+ * its show and its number, and one without either must not read as unwatched.
+ */
+export const keepPlaysOfShowOrSeason = <
+  T extends Pick<
+    TracearrHistoryItem,
+    'grandparent_rating_key' | 'season_number'
+  >,
+>(
+  plays: T[],
+  item: MediaItem,
+): T[] | undefined => {
+  const showRatingKey = item.type === 'show' ? item.id : item.parentId;
+  if (!showRatingKey || (item.type === 'season' && item.index === undefined)) {
+    return undefined;
+  }
+
+  return plays.filter(
+    (play) =>
+      play.grandparent_rating_key === showRatingKey &&
+      (item.type === 'show' || play.season_number === item.index),
+  );
+};
 
 export interface TracearrHistoryIndex {
   rowsById: Map<string, TracearrHistoryItem>;
@@ -83,6 +92,8 @@ export class TracearrApiService {
   private activeUsernamesByTracearrUserId: Map<string, string[]> | undefined;
   private episodeIdsByItemId = new Map<string, Promise<string[]>>();
   private resolvedServerId: string | undefined;
+  private itemServer:
+    { serverId: Promise<string | undefined>; retryAt: number } | undefined;
   private historyGeneration = 0;
   private sweepPromise: Promise<void> | undefined;
 
@@ -126,6 +137,7 @@ export class TracearrApiService {
     this.activeUsernamesByTracearrUserId = undefined;
     this.episodeIdsByItemId.clear();
     this.resolvedServerId = undefined;
+    this.itemServer = undefined;
     // A sweep already in flight resolves after this, so mark its results stale
     // rather than let them repopulate what was just discarded.
     this.historyGeneration += 1;
@@ -168,20 +180,201 @@ export class TracearrApiService {
     return this.sweepPromise;
   }
 
+  /**
+   * Per-user totals for one item, from its own plays on the bound server. Null
+   * when Tracearr has none, undefined when that could not be read.
+   *
+   * Read from /history by rating key rather than from Tracearr's per-title
+   * statistics: those follow its own media identity, which can merge two items
+   * of one server and credit an unwatched one with the other's plays.
+   */
+  public async getItemStats(
+    itemId: string,
+  ): Promise<MediaWatchStats | null | undefined> {
+    try {
+      const serverId = await this.getItemServerId();
+      const mediaServer = await this.mediaServerFactory.getService();
+      const item = await mediaServer.getMetadata(itemId);
+      if (!serverId || !item) {
+        return undefined;
+      }
+
+      const history = await this.fetchItemHistory(item, serverId);
+      if (!history) {
+        return undefined;
+      }
+      const { mediaId, rows } = history;
+      if (rows.length === 0) {
+        return null;
+      }
+
+      const users = new Map<string, MediaWatchStats['users'][number]>();
+      for (const row of rows) {
+        const user = users.get(row.user.id) ?? {
+          name: row.user.username ?? 'Unknown',
+          plays: 0,
+          watchTime: 0,
+          lastWatched: null,
+        };
+        const playedAt = row.stopped_at ?? row.started_at;
+        user.plays += 1;
+        user.watchTime += Math.round((row.duration_ms ?? 0) / 1000);
+        if (!user.lastWatched || playedAt > user.lastWatched) {
+          user.lastWatched = playedAt;
+        }
+        users.set(row.user.id, user);
+      }
+
+      const stats = [...users.values()].sort(
+        (left, right) => right.plays - left.plays,
+      );
+      return {
+        url: mediaId
+          ? `${stripTrailingSlashes(this.settings.tracearr_url)}/media/${mediaId}`
+          : undefined,
+        plays: rows.length,
+        watchTime: stats.reduce((total, user) => total + user.watchTime, 0),
+        lastWatched:
+          stats
+            .map((user) => user.lastWatched)
+            .sort()
+            .at(-1) ?? null,
+        users: stats,
+      };
+    } catch (error) {
+      this.logger.log("Couldn't fetch Tracearr item stats");
+      this.logger.debug(error);
+      return undefined;
+    }
+  }
+
+  /**
+   * History filters on a play's own rating key, which answers a movie or an
+   * episode directly. A show has to be found by provider id first, so one
+   * Tracearr cannot place that way reads as unwatched, and its plays are then
+   * narrowed to the ones this very show, or season, carries. A season is read
+   * by its own id from the show's children, not through every play of the show.
+   */
+  private async fetchItemHistory(
+    item: MediaItem,
+    serverId: string,
+  ): Promise<
+    { mediaId: string | null; rows: TracearrItemHistoryRow[] } | undefined
+  > {
+    const isLeaf = item.type === 'movie' || item.type === 'episode';
+    const showMediaId = isLeaf ? null : await this.resolveShowMediaId(item);
+    if (!isLeaf && !showMediaId) {
+      return { mediaId: null, rows: [] };
+    }
+    if (item.type === 'season' && item.index === undefined) {
+      return undefined;
+    }
+    const scopeMediaId =
+      item.type === 'season'
+        ? await this.resolveSeasonMediaId(showMediaId, item.index)
+        : showMediaId;
+    if (!isLeaf && !scopeMediaId) {
+      return { mediaId: showMediaId, rows: [] };
+    }
+    const scope = isLeaf ? { rating_key: item.id } : { media_id: scopeMediaId };
+
+    const rows: TracearrItemHistoryRow[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < TRACEARR_ITEM_HISTORY_MAX_PAGES; page += 1) {
+      const response = await this.api.getRawWithoutCache<unknown>('/history', {
+        params: {
+          ...scope,
+          server_id: serverId,
+          pageSize: TRACEARR_PAGE_SIZE,
+          ...(cursor ? { cursor } : {}),
+        },
+      });
+      const parsed = tracearrItemHistoryPageSchema.parse(response.data);
+      const plays = isLeaf
+        ? parsed.data
+        : keepPlaysOfShowOrSeason(parsed.data, item);
+      if (!plays) {
+        return undefined;
+      }
+      rows.push(...plays);
+
+      cursor = parsed.meta.nextCursor ?? undefined;
+      if (!cursor) {
+        // A movie or an episode is only known by the id its own plays carry.
+        return { mediaId: showMediaId ?? rows[0]?.media_id ?? null, rows };
+      }
+    }
+
+    // A partial total would read as a fact, so past the cap there is none.
+    return undefined;
+  }
+
+  private async resolveShowMediaId(item: MediaItem): Promise<string | null> {
+    const mediaServer = await this.mediaServerFactory.getService();
+    const show =
+      item.type === 'season' && item.parentId
+        ? await mediaServer.getMetadata(item.parentId)
+        : item;
+
+    for (const provider of ['tvdb', 'tmdb', 'imdb'] as const) {
+      for (const id of show?.providerIds[provider] ?? []) {
+        const raw = await this.getOrNull(`/media/show:${provider}:${id}`);
+        if (raw) {
+          return tracearrMediaSchema.parse(raw).id;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private async resolveSeasonMediaId(
+    showMediaId: string,
+    seasonNumber: number | null,
+  ): Promise<string | null> {
+    const raw = await this.getOrNull(`/media/${showMediaId}/children`);
+    if (!raw) {
+      return null;
+    }
+
+    return (
+      tracearrMediaChildrenSchema
+        .parse(raw)
+        .data.find((child) => child.season_number === seasonNumber)?.id ?? null
+    );
+  }
+
+  /** Null on a 404, which is how Tracearr answers an item it does not know. */
+  private async getOrNull(path: string): Promise<unknown> {
+    try {
+      return (await this.api.getRawWithoutCache<unknown>(path)).data;
+    } catch (error) {
+      if (isAxiosError(error) && error.response?.status === 404) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
   public async getServers(
     params: ConstructorParameters<typeof TracearrApi>[0],
   ): Promise<TracearrServer[] | undefined> {
     const api = new TracearrApi(params, this.loggerFactory.createLogger());
 
     try {
-      const document = await this.getOpenApiDocument(api);
-      const servers = this.getServersFromOpenApiDocument(document);
-      const sameType = await this.keepServersMatchingMediaServer(api, servers);
+      const { data } = await this.fetchServers(api);
+      // Only the media server Maintainerr manages shares its rating keys, and
+      // offering the others yields rules that silently match nothing.
+      const mediaServerType = this.settings.media_server_type;
+      const sameType = data
+        .filter(
+          (server) =>
+            !mediaServerType || server.server_type === mediaServerType,
+        )
+        .map((server) => ({ id: server.server_id, name: server.server_name }));
       return await this.keepServersSharingLibrary(params, sameType);
     } catch (error) {
-      this.logger.warn(
-        'Could not load Tracearr servers from the public API document.',
-      );
+      this.logger.warn('Could not load Tracearr servers.');
       this.logger.debug(error);
       return undefined;
     }
@@ -323,79 +516,22 @@ export class TracearrApiService {
     return servers?.length === 1 ? servers[0].id : undefined;
   }
 
-  /**
-   * The server list carries no type, so /libraries supplies it. Only the media
-   * server Maintainerr manages shares its rating keys, and offering the others
-   * yields rules that silently match nothing. A server absent from /libraries
-   * has no type to compare and is kept, so it stays selectable.
-   */
-  private async keepServersMatchingMediaServer(
-    api: TracearrApi,
-    servers: TracearrServer[],
-  ): Promise<TracearrServer[]> {
-    const mediaServerType = this.settings.media_server_type;
-    if (!mediaServerType) {
-      return servers;
-    }
-
-    const raw = await api.getWithoutCache<unknown>('/libraries');
-    const parsed = tracearrLibrariesPageSchema.safeParse(raw);
-    if (!parsed.success) {
-      this.logger.warn(
-        'Could not read Tracearr library types. Listing every Tracearr server.',
-      );
-      return servers;
-    }
-
-    const typeByServerId = new Map(
-      parsed.data.data.map((library) => [
-        library.server_id,
-        library.server_type,
-      ]),
-    );
-    return servers.filter((server) => {
-      const serverType = typeByServerId.get(server.id);
-      return serverType === undefined || serverType === mediaServerType;
-    });
-  }
-
   public async testConnection(
     params: ConstructorParameters<typeof TracearrApi>[0],
   ): Promise<BasicResponseDto> {
     const api = new TracearrApi(params, this.loggerFactory.createLogger());
 
     try {
-      const document = await this.getOpenApiDocument(api);
-
-      const version = document.info?.version;
-      if (
-        !document.openapi ||
-        document.info?.title !== 'Tracearr Public API' ||
-        !version
-      ) {
-        return {
-          status: 'NOK',
-          code: 0,
-          message:
-            'Unexpected response from Tracearr. Verify the URL points to a Tracearr v2 instance.',
-        };
-      }
-      if (isBelowMinimumVersion(version, MINIMUM_TRACEARR_VERSION)) {
-        return {
-          status: 'NOK',
-          code: 0,
-          message: `Tracearr ${version} is below the minimum supported version ${MINIMUM_TRACEARR_VERSION}. Please update Tracearr.`,
-        };
-      }
+      assertApiKey(params.apiKey);
+      const { tracearr_version } = await this.fetchServers(api);
 
       return {
         status: 'OK',
         code: 1,
-        message: version,
+        message: tracearr_version,
       };
     } catch (error) {
-      logConnectionTestError(this.logger, 'Tracearr');
-      this.logger.debug(error);
+      logConnectionTestError(this.logger, 'Tracearr', error);
       return {
         status: 'NOK',
         code: 0,
@@ -435,6 +571,54 @@ export class TracearrApiService {
 
     this.resolvedServerId = resolved;
     return this.resolvedServerId;
+  }
+
+  /**
+   * The bound server, confirmed to track the managed media server the way the
+   * rule sweep confirms it: Plex rating keys repeat across servers, so an
+   * unconfirmed one can answer with another server's plays. A confirmed server
+   * is kept until the settings change and an unconfirmed one for a minute; only
+   * a lookup that throws is not kept.
+   */
+  private getItemServerId(): Promise<string | undefined> {
+    if (this.itemServer && Date.now() < this.itemServer.retryAt) {
+      return this.itemServer.serverId;
+    }
+
+    const entry = {
+      serverId: this.confirmItemServerId(),
+      retryAt: Number.POSITIVE_INFINITY,
+    };
+    this.itemServer = entry;
+    entry.serverId.then(
+      (serverId) => {
+        if (!serverId) {
+          entry.retryAt = Date.now() + TRACEARR_ITEM_SERVER_RETRY_MS;
+        }
+      },
+      () => {
+        if (this.itemServer === entry) {
+          this.itemServer = undefined;
+        }
+      },
+    );
+    return entry.serverId;
+  }
+
+  private async confirmItemServerId(): Promise<string | undefined> {
+    const serverId = await this.resolveActiveServerId();
+    if (!serverId) {
+      return undefined;
+    }
+
+    const sharesLibrary = await this.serverSharesLibrary(
+      {
+        url: this.settings.tracearr_url,
+        apiKey: this.settings.tracearr_api_key,
+      },
+      serverId,
+    );
+    return sharesLibrary ? serverId : undefined;
   }
 
   private async prefetchHistoryInternal(): Promise<void> {
@@ -653,76 +837,27 @@ export class TracearrApiService {
     };
   }
 
-  private async getOpenApiDocument(
+  private async fetchServers(
     api: TracearrApi,
-  ): Promise<TracearrOpenApiDocument> {
-    const response = await api.getRawWithoutCache<TracearrOpenApiDocument>(
-      '/docs',
-      { signal: AbortSignal.timeout(CONNECTION_TEST_TIMEOUT_MS) },
-    );
-    return response.data;
-  }
-
-  private getServersFromOpenApiDocument(
-    document: TracearrOpenApiDocument,
-  ): TracearrServer[] {
-    const serverParameter = this.getServerParameter(document);
-    if (!serverParameter?.schema?.enum) {
-      this.logger.warn(
-        'Tracearr public API document does not list any available servers.',
-      );
-      return [];
-    }
-
-    return serverParameter.schema.enum.flatMap((id) => {
-      if (typeof id !== 'string') {
-        return [];
-      }
-
-      const server = tracearrServerSchema.safeParse({
-        id,
-        name: this.getServerName(serverParameter.description, id),
-      });
-      return server.success ? [server.data] : [];
-    });
-  }
-
-  private getServerParameter(
-    document: TracearrOpenApiDocument,
-  ): TracearrOpenApiParameter | undefined {
-    for (const path of Object.values(document.paths ?? {})) {
-      for (const operation of Object.values(path ?? {})) {
-        const serverParameter = operation?.parameters?.find(
-          (parameter) =>
-            parameter.name === 'server_id' && parameter.in === 'query',
-        );
-        if (serverParameter) {
-          return serverParameter;
+  ): Promise<TracearrServersResponse> {
+    const response = await api
+      .getRawWithoutCache<unknown>('/servers', connectionTestConfig())
+      .catch((error: unknown) => {
+        // An older Tracearr answers 404: /servers arrived in 2.7.0.
+        if (isAxiosError(error) && error.response?.status === 404) {
+          throw new Error(
+            `Tracearr ${MINIMUM_TRACEARR_VERSION} or later is required. Update Tracearr, or verify the URL points to it.`,
+          );
         }
-      }
+        throw error;
+      });
+    const parsed = tracearrServersResponseSchema.safeParse(response.data);
+    if (!parsed.success) {
+      throw new Error(
+        'Unexpected response from Tracearr. Verify the URL points to Tracearr.',
+      );
     }
-
-    return undefined;
-  }
-
-  private getServerName(description: string | undefined, id: string): string {
-    if (!description) {
-      return id;
-    }
-
-    const idIndex = description.indexOf(id);
-    if (idIndex === -1) {
-      return id;
-    }
-
-    const nameEnd = description.lastIndexOf('**', idIndex);
-    const nameStart = description.lastIndexOf('**', nameEnd - 1);
-    if (nameStart === -1 || nameEnd === -1 || nameEnd > idIndex) {
-      return id;
-    }
-
-    const name = description.slice(nameStart + 2, nameEnd);
-    return name || id;
+    return parsed.data;
   }
 
   private async fetchUsernamesByTracearrUserId(): Promise<

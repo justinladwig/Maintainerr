@@ -1,6 +1,7 @@
+import { QueryClientProvider } from '@tanstack/react-query'
 import { fireEvent, render, screen, waitFor } from '../../../test-utils/render'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { createDeferred } from '../../../test-utils/createDeferred'
+import { createTestQueryClient } from '../../../test-utils/queryClient'
 import NotificationSettings from './index'
 
 const getApiHandler = vi.fn()
@@ -14,150 +15,190 @@ vi.mock('../../../utils/ApiHandler', () => ({
     postApiHandler(url, payload),
 }))
 
+vi.mock('../../Common/LazyMonacoEditor', () => ({ default: () => null }))
+
+const agents = [
+  {
+    name: 'gotify',
+    friendlyName: 'Gotify',
+    options: [{ field: 'url', type: 'text', required: true }],
+  },
+  {
+    name: 'ntfy',
+    friendlyName: 'Ntfy',
+    options: [
+      { field: 'url', type: 'text', required: true },
+      { field: 'topic', type: 'text', required: true },
+    ],
+  },
+  {
+    name: 'email',
+    friendlyName: 'Email',
+    options: [{ field: 'secure', type: 'checkbox', required: false }],
+  },
+  {
+    name: 'webhook',
+    friendlyName: 'Webhook',
+    options: [
+      { field: 'webhookUrl', type: 'text', required: true },
+      { field: 'jsonPayload', type: 'json', required: true },
+    ],
+  },
+]
+const types = [{ id: 1, title: 'Added' }]
+const existing = {
+  id: 1,
+  name: 'Existing',
+  agent: 'gotify',
+  enabled: false,
+  types: [1],
+  aboutScale: 3,
+  options: { url: 'http://gotify.local' },
+}
+
+const renderNotifications = () =>
+  render(
+    <QueryClientProvider client={createTestQueryClient()}>
+      <NotificationSettings />
+    </QueryClientProvider>,
+  )
+
+const answer = (lists: Record<string, unknown>) =>
+  getApiHandler.mockImplementation((url: string) => {
+    if (url in lists) return Promise.resolve(lists[url])
+    throw new Error(`Unexpected request: ${url}`)
+  })
+
 describe('NotificationSettings', () => {
   beforeEach(() => {
     getApiHandler.mockReset()
     deleteApiHandler.mockReset()
-    postApiHandler.mockReset()
-
-    getApiHandler.mockImplementation((url: string) => {
-      if (url === '/notifications/configurations') {
-        return Promise.resolve([])
-      }
-
-      if (url === '/notifications/agents') {
-        return Promise.resolve([])
-      }
-
-      if (url === '/notifications/types') {
-        return Promise.resolve([])
-      }
-
-      throw new Error(`Unexpected request: ${url}`)
-    })
-
-    postApiHandler.mockImplementation((url: string) => {
-      if (url === '/notifications/configuration/add') {
-        return Promise.resolve({
-          code: 1,
-          status: 'OK',
-          message: 'Success',
-        })
-      }
-
-      if (url === '/notifications/test') {
-        return Promise.resolve('Success')
-      }
-
-      throw new Error(`Unexpected request: ${url}`)
+    postApiHandler
+      .mockReset()
+      .mockResolvedValue({ code: 1, status: 'OK', message: 'Success' })
+    answer({
+      '/notifications/configurations': [existing],
+      '/notifications/agents': agents,
+      '/notifications/types': types,
     })
   })
 
-  it('keeps the modal shell visible while notification agent data is loading', async () => {
-    const agentsRequest = createDeferred<
-      Array<{
-        name: string
-        friendlyName: string
-        options: []
-      }>
-    >()
-    const typesRequest = createDeferred<Array<{ title: string; id: number }>>()
+  it('shows each agent as a collapsed card, labelled when disabled', async () => {
+    renderNotifications()
 
-    getApiHandler.mockImplementation((url: string) => {
-      if (url === '/notifications/configurations') {
-        return Promise.resolve([])
-      }
+    expect(await screen.findByText('Existing')).toBeTruthy()
+    expect(screen.getByText('Disabled')).toBeTruthy()
+    expect(screen.queryByDisplayValue('Existing')).toBeNull()
 
-      if (url === '/notifications/agents') {
-        return agentsRequest.promise
-      }
-
-      if (url === '/notifications/types') {
-        return typesRequest.promise
-      }
-
-      throw new Error(`Unexpected request: ${url}`)
-    })
-
-    render(<NotificationSettings />)
-
-    fireEvent.click(screen.getByRole('button', { name: 'Add Agent' }))
-
-    expect(
-      await screen.findByRole('dialog', { name: 'New Notification Agent' }),
-    ).toBeTruthy()
-
-    expect(
-      screen
-        .getByRole('button', { name: 'Save Changes' })
-        .hasAttribute('disabled'),
-    ).toBe(true)
-    expect(
-      screen
-        .getByRole('button', { name: 'Test Connection' })
-        .hasAttribute('disabled'),
-    ).toBe(true)
-
-    agentsRequest.resolve([{ name: '-', friendlyName: '', options: [] }])
-    typesRequest.resolve([{ id: 1, title: 'Added' }])
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }))
+    expect(screen.getByDisplayValue('http://gotify.local')).toBeTruthy()
   })
 
-  it('shows inline page feedback after saving a notification agent', async () => {
-    getApiHandler.mockImplementation((url: string) => {
-      if (url === '/notifications/configurations') {
-        return Promise.resolve([])
-      }
+  it('says the agents failed to load instead of showing an empty page', async () => {
+    getApiHandler.mockImplementation((url: string) =>
+      url === '/notifications/configurations'
+        ? Promise.reject(new Error('Request failed'))
+        : Promise.resolve(url === '/notifications/types' ? types : agents),
+    )
 
-      if (url === '/notifications/agents') {
-        return Promise.resolve([
-          {
-            name: 'webhook',
-            friendlyName: 'Webhook',
-            options: [],
-          },
-        ])
-      }
-
-      if (url === '/notifications/types') {
-        return Promise.resolve([{ id: 1, title: 'Added' }])
-      }
-
-      throw new Error(`Unexpected request: ${url}`)
-    })
-
-    render(<NotificationSettings />)
-
-    fireEvent.click(screen.getByRole('button', { name: 'Add Agent' }))
+    renderNotifications()
 
     expect(
-      await screen.findByRole('dialog', { name: 'New Notification Agent' }),
+      await screen.findByText('The notification agents could not be loaded.'),
     ).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Add Agent' })).toBeNull()
+  })
 
-    fireEvent.change(await screen.findByLabelText('Name *'), {
-      target: { value: 'Webhook agent' },
+  it('saves a new agent from a draft card and confirms it on the saved card', async () => {
+    renderNotifications()
+    fireEvent.click(await screen.findByRole('button', { name: 'Add Agent' }))
+
+    fireEvent.change(screen.getByLabelText('Name *'), {
+      target: { value: 'New agent' },
     })
     fireEvent.change(screen.getByLabelText('Agent *'), {
-      target: { value: '1' },
+      target: { value: 'gotify' },
     })
-
-    const saveButton = screen.getByRole('button', { name: 'Save Changes' })
-
-    await waitFor(() => {
-      expect(saveButton.hasAttribute('disabled')).toBe(false)
+    fireEvent.change(await screen.findByLabelText('URL *'), {
+      target: { value: 'http://new.local' },
     })
+    answer({
+      '/notifications/configurations': [
+        existing,
+        { ...existing, id: 2, name: 'New agent', enabled: true },
+      ],
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }))
 
-    fireEvent.click(saveButton)
+    expect(await screen.findByText('Saved')).toBeTruthy()
+    expect(postApiHandler).toHaveBeenCalledWith(
+      '/notifications/configuration/add',
+      expect.objectContaining({
+        name: 'New agent',
+        agent: 'gotify',
+        options: { url: 'http://new.local' },
+      }),
+    )
+    expect(screen.getByRole('button', { name: 'Add Agent' })).toBeTruthy()
+  })
 
-    await waitFor(() => {
+  it('saves a new webhook with the payload its editor shows', async () => {
+    renderNotifications()
+    fireEvent.click(await screen.findByRole('button', { name: 'Add Agent' }))
+
+    fireEvent.change(screen.getByLabelText('Name *'), {
+      target: { value: 'Hook' },
+    })
+    fireEvent.change(screen.getByLabelText('Agent *'), {
+      target: { value: 'webhook' },
+    })
+    fireEvent.change(await screen.findByLabelText('Webhook URL *'), {
+      target: { value: 'http://hook.local' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Save Changes' }))
+
+    await waitFor(() =>
       expect(postApiHandler).toHaveBeenCalledWith(
         '/notifications/configuration/add',
         expect.objectContaining({
-          name: 'Webhook agent',
-          agent: 'webhook',
+          options: { webhookUrl: 'http://hook.local', jsonPayload: {} },
         }),
-      )
-    })
+      ),
+    )
+  })
 
-    expect(await screen.findByText('Notification agent saved')).toBeTruthy()
+  it('opens another agent type empty and gives the saved one its values back', async () => {
+    renderNotifications()
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }))
+
+    fireEvent.change(screen.getByLabelText('Agent *'), {
+      target: { value: 'ntfy' },
+    })
+    expect(await screen.findByLabelText('Topic *')).toBeTruthy()
+    expect(screen.getByLabelText('URL *')).toHaveProperty('value', '')
+
+    fireEvent.change(screen.getByLabelText('Agent *'), {
+      target: { value: 'gotify' },
+    })
+    expect(screen.getByLabelText('URL *')).toHaveProperty(
+      'value',
+      'http://gotify.local',
+    )
+  })
+
+  it('deletes an agent only after confirming, and says when it could not', async () => {
+    deleteApiHandler.mockResolvedValue({ code: 0 })
+    renderNotifications()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete' }))
+    expect(deleteApiHandler).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Are you sure?' }))
+
+    expect(deleteApiHandler).toHaveBeenCalledWith(
+      '/notifications/configuration/1',
+    )
+    expect(
+      await screen.findByText('Failed to delete notification agent.'),
+    ).toBeTruthy()
   })
 })

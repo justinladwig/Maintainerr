@@ -46,6 +46,7 @@ export enum Application {
   EMBY = 7,
   STREAMYSTATS = 8,
   TRACEARR = 9,
+  OMBI = 10,
 }
 
 /**
@@ -62,6 +63,7 @@ export const ApplicationNames: Record<Application, string> = {
   [Application.EMBY]: 'Emby',
   [Application.STREAMYSTATS]: 'Streamystats',
   [Application.TRACEARR]: 'Tracearr',
+  [Application.OMBI]: 'Ombi',
 }
 
 /**
@@ -73,6 +75,7 @@ export enum RequestMediaStatus {
   PROCESSING = 3,
   PARTIALLY_AVAILABLE = 4,
   AVAILABLE = 5,
+  DELETED = 7,
 }
 
 export const DISKSPACE_REMAINING_PROPERTY = 'diskspace_remaining_gb'

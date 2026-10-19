@@ -9,6 +9,7 @@ import {
   MediaItemType,
   MediaLibrary,
   MediaServerType,
+  normalizeArrTagLabel,
 } from '@maintainerr/contracts';
 import {
   BadGatewayException,
@@ -31,7 +32,10 @@ import { IMediaServerService } from '../api/media-server/media-server.interface'
 import { TracearrApiService } from '../api/tracearr-api/tracearr-api.service';
 import { CollectionsService } from '../collections/collections.service';
 import { Collection } from '../collections/entities/collection.entities';
-import { CollectionMedia } from '../collections/entities/collection_media.entities';
+import {
+  CollectionMedia,
+  hasCollectionMediaRuleMembership,
+} from '../collections/entities/collection_media.entities';
 import {
   AlterableMediaContext,
   CollectionMediaChange,
@@ -60,6 +64,7 @@ import { CommunityRuleKarma } from './entities/community-rule-karma.entities';
 import { Exclusion } from './entities/exclusion.entities';
 import { RuleGroup } from './entities/rule-group.entities';
 import { Rules } from './entities/rules.entities';
+import { ArrLookupCache } from './helpers/arr-lookup-cache';
 import { unavailableRuleApplications } from './helpers/rule-application-availability.helper';
 import { RuleComparatorServiceFactory } from './helpers/rule.comparator.service';
 import { RuleYamlService } from './helpers/yaml.service';
@@ -74,7 +79,7 @@ export interface ReturnStatus {
 // Each excluded item fans out server-side (child cascade + a live metadata
 // read per traversed id), so this stays below RULE_EVALUATION_CONCURRENCY to
 // avoid over-driving constrained media servers during a bulk run.
-export const BULK_EXCLUSION_CONCURRENCY = 5;
+const BULK_EXCLUSION_CONCURRENCY = 5;
 
 @Injectable()
 export class RulesService {
@@ -493,6 +498,8 @@ export class RulesService {
           // created before it was hidden.
           forceSeerr:
             collectionType !== 'episode' && params.forceSeerr ? true : false,
+          forceOmbi:
+            collectionType !== 'episode' && params.forceOmbi ? true : false,
           tautulliWatchedPercentOverride:
             params.tautulliWatchedPercentOverride ?? null,
           radarrSettingsId: params.radarrSettingsId ?? null,
@@ -726,6 +733,8 @@ export class RulesService {
           // created before it was hidden.
           forceSeerr:
             collectionType !== 'episode' && params.forceSeerr ? true : false,
+          forceOmbi:
+            collectionType !== 'episode' && params.forceOmbi ? true : false,
           tautulliWatchedPercentOverride:
             params.tautulliWatchedPercentOverride ?? null,
           radarrSettingsId: params.radarrSettingsId ?? null,
@@ -815,15 +824,11 @@ export class RulesService {
           await this.collectionService.stopMediaServerSync(savedCollection);
         }
 
-        // Behavior A: one-time *arr membership-tag reconcile on a tagInArr toggle
-        // - enabling tags current members, disabling untags them (ongoing changes
-        // are handled by the executor's per-run deltas). Best-effort; awaited so
-        // the backfill completes before the save returns.
-        if (
-          savedCollection &&
-          (dbCollection?.tagInArr ?? false) !== savedCollection.tagInArr
-        ) {
-          await this.reconcileMembershipTagsOnToggle(
+        // Behavior A: from here on the executor tags adds and the collection
+        // service untags leaves; this moves the tag when the save changed it.
+        // Best-effort; awaited so the backfill completes before the save returns.
+        if (savedCollection) {
+          await this.reconcileMembershipTags(
             dbCollection,
             savedCollection,
             preDeleteMembers,
@@ -897,40 +902,58 @@ export class RulesService {
     };
   }
 
-  // Behavior A: reconcile *arr membership tags after a tagInArr toggle
-  // (best-effort, off the save response path). Enabling tags all current members;
-  // disabling untags them using the previous collection (still tagInArr=true, with
-  // its old title) so the correct label is removed even if renamed in the same save.
-  // `preDeleteMembers` covers the disable case where a crucial-setting change in the
-  // same save already wiped the rows - pass the snapshot taken before the wipe.
-  private async reconcileMembershipTagsOnToggle(
+  // Behavior A: rule-held members carry the tag of the collection holding them,
+  // so a save that turns tagging on or off, renames the group or switches its
+  // *arr server untags them under the previous collection and tags them under
+  // the saved one. `preDeleteMembers` is the snapshot a crucial-setting reset
+  // took before it wiped the rows: those items left, so they only lose the
+  // previous tag.
+  private async reconcileMembershipTags(
     previous: Collection | undefined,
     saved: Collection,
     preDeleteMembers?: CollectionMedia[],
   ): Promise<void> {
     try {
-      if (saved.tagInArr) {
-        const members =
-          (await this.collectionService.getCollectionMedia(saved.id)) ?? [];
-        await this.servarrTagService.syncMembershipTags(
-          saved,
-          members.map((m) => this.toArrTagItem(m)),
-          [],
-        );
-      } else if (previous) {
-        const members =
-          preDeleteMembers ??
-          (await this.collectionService.getCollectionMedia(saved.id)) ??
-          [];
+      const before = previous ? this.membershipTag(previous) : undefined;
+      const after = this.membershipTag(saved);
+      let current: CollectionMedia[] | undefined;
+      const members = async () =>
+        (current ??=
+          (await this.collectionService.getCollectionMedia(saved.id)) ?? []);
+
+      if (previous && before && (preDeleteMembers || before !== after)) {
         await this.servarrTagService.syncMembershipTags(
           previous,
           [],
-          members.map((m) => this.toArrTagItem(m)),
+          (preDeleteMembers ?? (await members())).map((m) =>
+            this.toArrTagItem(m),
+          ),
+        );
+      }
+      if (after && after !== before && !preDeleteMembers) {
+        await this.servarrTagService.syncMembershipTags(
+          saved,
+          (await members())
+            .filter(hasCollectionMediaRuleMembership)
+            .map((m) => this.toArrTagItem(m)),
+          [],
         );
       }
     } catch (error) {
       this.logger.debug(error);
     }
+  }
+
+  // The label a tagging collection writes and the *arr server it writes it on.
+  private membershipTag(collection: Collection): string | undefined {
+    if (!collection.tagInArr) {
+      return undefined;
+    }
+    const settingsId =
+      collection.type === 'show'
+        ? collection.sonarrSettingsId
+        : collection.radarrSettingsId;
+    return `${collection.type}:${settingsId ?? ''}:${normalizeArrTagLabel(collection.title ?? '')}`;
   }
 
   // The provider ids cached on a collection_media row, used as *arr tag
@@ -961,6 +984,7 @@ export class RulesService {
     mode: 'add' | 'remove',
     item: { mediaServerId: string; type: MediaItemType | undefined },
     collectionId: number | undefined,
+    libraryReads?: ArrLookupCache,
   ): Promise<void> {
     let instance:
       | { radarrSettingsId?: number | null; sonarrSettingsId?: number | null }
@@ -997,9 +1021,17 @@ export class RulesService {
     );
     const target = { mediaServerId: item.mediaServerId, type, ...hints };
     if (mode === 'add') {
-      await this.servarrTagService.applyExclusionTag(target, instance);
+      await this.servarrTagService.applyExclusionTag(
+        target,
+        instance,
+        libraryReads,
+      );
     } else {
-      await this.servarrTagService.removeExclusionTag(target, instance);
+      await this.servarrTagService.removeExclusionTag(
+        target,
+        instance,
+        libraryReads,
+      );
     }
   }
 
@@ -1038,6 +1070,7 @@ export class RulesService {
    */
   async setExclusion(
     data: ExclusionContextDto,
+    libraryReads?: ArrLookupCache,
   ): Promise<ReturnStatus & { handledIds?: string[] }> {
     const mediaServer = await this.getMediaServer();
     let handleMedia: CollectionMediaChange[] = [];
@@ -1194,11 +1227,12 @@ export class RulesService {
       // not each traversed season/episode id. Covers both collection-scoped and
       // global exclusions (a global exclusion resolves the single configured *arr
       // instance). Best-effort; never blocks the exclusion.
-      if (this.servarrTagService.anyExclusionTaggingEnabled()) {
+      if (await this.servarrTagService.anyExclusionTaggingEnabled()) {
         await this.syncExclusionTag(
           'add',
           { mediaServerId: String(data.mediaId), type: topLevelType },
           data.collectionId,
+          libraryReads,
         );
       }
 
@@ -1249,16 +1283,17 @@ export class RulesService {
     const resultById = new Map<string, BulkMediaItemResult>();
     const handledByRoot = new Map<string, string[]>();
     const rootIds = uniqueMediaIds.filter((id) => !coveredBy.has(id));
+    // One *arr library read per server for the whole batch, not per item.
+    const libraryReads = new ArrLookupCache();
 
     for (const batch of chunk(rootIds, BULK_EXCLUSION_CONCURRENCY)) {
       await Promise.all(
         batch.map(async (mediaId) => {
           try {
-            const { handledIds, ...result } = await this.setExclusion({
-              mediaId,
-              collectionId,
-              context,
-            });
+            const { handledIds, ...result } = await this.setExclusion(
+              { mediaId, collectionId, context },
+              libraryReads,
+            );
 
             if (handledIds) {
               handledByRoot.set(mediaId, handledIds);
@@ -1299,12 +1334,18 @@ export class RulesService {
       // A global exclusion says the items belong in no collection at all.
       const removed =
         collectionId === undefined
-          ? (await this.collectionService.removeFromAllCollections(members))
-              .code === 1
+          ? (
+              await this.collectionService.removeFromAllCollections(
+                members,
+                libraryReads,
+              )
+            ).code === 1
           : Boolean(
               await this.collectionService.removeFromCollection(
                 collectionId,
                 members,
+                'all',
+                libraryReads,
               ),
             );
 
@@ -1430,6 +1471,7 @@ export class RulesService {
     }
 
     const resultById = new Map<string, BulkMediaItemResult>();
+    const libraryReads = new ArrLookupCache();
 
     for (const batch of chunk(uniqueMediaIds, BULK_EXCLUSION_CONCURRENCY)) {
       await Promise.all(
@@ -1438,7 +1480,10 @@ export class RulesService {
             // Nothing excluding it here already is the requested end state.
             let result: ReturnStatus = { code: 1, message: 'Success' };
             for (const exclusionId of rowIdsByMediaId.get(mediaId) ?? []) {
-              const rowResult = await this.removeExclusion(exclusionId);
+              const rowResult = await this.removeExclusion(
+                exclusionId,
+                libraryReads,
+              );
               if (rowResult.code !== 1) {
                 result = rowResult;
               }
@@ -1472,7 +1517,7 @@ export class RulesService {
     };
   }
 
-  async removeExclusion(id: number) {
+  async removeExclusion(id: number, libraryReads?: ArrLookupCache) {
     try {
       const exclcusion = await this.exclusionRepo.findOne({
         where: {
@@ -1512,11 +1557,12 @@ export class RulesService {
       // exclusions. Conservative by default (off) so a manually-set tag is never
       // stripped; only ever touches the configured label. Runs after the delete so
       // the shared-tag guard can see that no other exclusion still wants the tag.
-      if (this.servarrTagService.anyExclusionUntaggingEnabled()) {
+      if (await this.servarrTagService.anyExclusionUntaggingEnabled()) {
         await this.syncExclusionTag(
           'remove',
           { mediaServerId: exclcusion.mediaServerId, type: exclcusion.type },
           scopedCollectionId,
+          libraryReads,
         );
       }
 
@@ -1647,7 +1693,7 @@ export class RulesService {
       // the protective *arr tag on un-exclude - this is the POST /rules/exclusion
       // remove path used by the media modal. Untag the top-level item once, after
       // its rows are deleted so the shared-tag guard is accurate.
-      if (this.servarrTagService.anyExclusionUntaggingEnabled()) {
+      if (await this.servarrTagService.anyExclusionUntaggingEnabled()) {
         const type =
           topLevelType ??
           (await mediaServer.getMetadata(String(data.mediaId)))?.type;
@@ -1698,7 +1744,7 @@ export class RulesService {
       // the protective *arr tag once every exclusion for the item is cleared.
       // Instance-wide, so a scoped exclusion's tag is cleared too; the guard
       // always passes (no rows remain).
-      if (this.servarrTagService.anyExclusionUntaggingEnabled()) {
+      if (await this.servarrTagService.anyExclusionUntaggingEnabled()) {
         await this.syncExclusionTag(
           'remove',
           { mediaServerId, type: metaData.type },
@@ -2440,6 +2486,7 @@ export class RulesService {
     // Drop the run-scoped Seerr request index too, so a single-item test rebuilds
     // it from a fresh /request sweep and agrees with a full run (#3152).
     cacheManager.getCache('seerrrequests').data.flushAll();
+    cacheManager.getCache('ombirequests').data.flushAll();
     cacheManager.getCache('tautulli').data.flushAll();
     cacheManager.getCache('streamystats').data.flushAll();
     cacheManager
@@ -2467,6 +2514,9 @@ export class RulesService {
         const result = await ruleComparator.executeRulesWithData(
           group as RuleGroupDto,
           [mediaResp],
+          undefined,
+          undefined,
+          new ArrLookupCache(),
         );
         return { code: 1, result: result.stats };
       } catch (error) {

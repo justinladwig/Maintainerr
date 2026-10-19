@@ -2,12 +2,10 @@ import { QueryClientProvider } from '@tanstack/react-query'
 import { render, screen, type RenderResult } from '../../test-utils/render'
 import type { ReactElement } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { createDeferred } from '../../test-utils/createDeferred'
 import { createTestQueryClient } from '../../test-utils/queryClient'
-import RadarrSettings from './Radarr'
-import SonarrSettings from './Sonarr'
+import { ServarrSettings } from './Servarr/ServarrSettings'
 
-// The pages embed ExclusionTagSettings, which reads global settings via
+// The page embeds ExclusionTagSettings, which reads global settings via
 // TanStack Query, so renders need a QueryClient in the tree.
 const renderWithClient = (ui: ReactElement): RenderResult =>
   render(
@@ -19,7 +17,6 @@ const renderWithClient = (ui: ReactElement): RenderResult =>
 const getApiHandler = vi.fn()
 const deleteApiHandler = vi.fn()
 const logClientError = vi.fn()
-const toastError = vi.fn()
 
 vi.mock('../../utils/ApiHandler', () => ({
   default: (url: string) => getApiHandler(url),
@@ -31,82 +28,27 @@ vi.mock('../../utils/ClientLogger', () => ({
   logClientError: (...args: unknown[]) => logClientError(...args),
 }))
 
-vi.mock('react-toastify', () => ({
-  toast: {
-    error: (...args: unknown[]) => toastError(...args),
-  },
-}))
-
-vi.mock('./Radarr/SettingsModal', () => ({
-  default: () => <div>Radarr modal</div>,
-}))
-
-vi.mock('./Sonarr/SettingsModal', () => ({
-  default: () => <div>Sonarr modal</div>,
-}))
-
-describe.each([
-  {
-    label: 'Radarr',
-    path: '/settings/radarr',
-    Component: RadarrSettings,
-  },
-  {
-    label: 'Sonarr',
-    path: '/settings/sonarr',
-    Component: SonarrSettings,
-  },
-])('$label settings loading', ({ label, path, Component }) => {
-  beforeEach(() => {
-    getApiHandler.mockReset()
-    deleteApiHandler.mockReset()
-    logClientError.mockReset()
-    toastError.mockReset()
-  })
-
-  it('does not show transient loading UI while server settings load', async () => {
-    const request = createDeferred<
-      Array<{
-        id: number
-        serverName: string
-        url: string
-        apiKey: string
-      }>
-    >()
-
-    getApiHandler.mockImplementation((url: string) => {
-      if (url === path) {
-        return request.promise
-      }
-
-      // ExclusionTagSettings fetches global settings; answer benignly.
-      if (url === '/settings') {
-        return Promise.resolve({})
-      }
-
-      throw new Error(`Unexpected request: ${url}`)
+// ServarrSettings is one component for every *arr, so one service covers it.
+describe.each([{ label: 'Radarr', service: 'radarr' }] as const)(
+  '$label settings loading',
+  ({ label, service }) => {
+    beforeEach(() => {
+      getApiHandler.mockReset()
+      deleteApiHandler.mockReset()
+      logClientError.mockReset()
     })
 
-    renderWithClient(<Component />)
+    it('says the list failed to load instead of offering only Add', async () => {
+      getApiHandler.mockRejectedValue(new Error('Request failed'))
 
-    expect(
-      screen.getByRole('heading', { name: `${label} Settings` }),
-    ).toBeTruthy()
-    expect(
-      screen.queryByRole('status', { name: `Loading ${label} servers` }),
-    ).toBeNull()
-    expect(screen.queryByRole('button', { name: 'Add server' })).toBeNull()
+      renderWithClient(<ServarrSettings service={service} />)
 
-    request.resolve([
-      {
-        id: 1,
-        serverName: label,
-        url: `http://${label.toLowerCase()}.local`,
-        apiKey: 'token',
-      },
-    ])
-
-    expect(await screen.findByText(label)).toBeTruthy()
-    expect(screen.getByRole('button', { name: 'Add server' })).toBeTruthy()
-  })
-})
+      expect(
+        await screen.findByText('The server list could not be loaded.'),
+      ).toBeTruthy()
+      expect(
+        screen.queryByRole('button', { name: `Add ${label} server` }),
+      ).toBeNull()
+    })
+  },
+)

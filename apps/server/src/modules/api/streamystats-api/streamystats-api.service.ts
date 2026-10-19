@@ -6,12 +6,13 @@ import {
   streamystatsWatchlistsResponseSchema,
 } from '@maintainerr/contracts';
 import { Injectable } from '@nestjs/common';
+import { isAxiosError } from 'axios';
+import { assertApiKey, connectionTestConfig } from '../lib/connectionTest';
 import { SettingsDataService } from '../../../modules/settings/settings-data.service';
 import {
   formatConnectionFailureMessage,
   logConnectionTestError,
 } from '../../../utils/connection-error';
-import { CONNECTION_TEST_TIMEOUT_MS } from '../lib/httpTimeouts';
 import {
   MaintainerrLogger,
   MaintainerrLoggerFactory,
@@ -81,23 +82,9 @@ export class StreamystatsApiService {
     );
   }
 
-  public async info(): Promise<StreamystatsVersionInfo | null> {
-    try {
-      return await this.api.getWithoutCache<StreamystatsVersionInfo>(
-        '/api/version',
-        {
-          signal: AbortSignal.timeout(CONNECTION_TEST_TIMEOUT_MS),
-        },
-      );
-    } catch (error) {
-      this.logger.log("Couldn't fetch Streamystats info");
-      this.logger.debug(error);
-      return null;
-    }
-  }
-
   public async getItemDetails(
     itemId: string,
+    options?: { fresh?: boolean },
   ): Promise<StreamystatsItemDetails | null> {
     // /api/get-item-details/[itemId] only accepts the internal Streamystats
     // serverId (not serverName/serverUrl). Resolve it via /api/servers once
@@ -111,12 +98,11 @@ export class StreamystatsApiService {
     }
 
     try {
-      const raw = await this.api.get<unknown>(
-        `/api/get-item-details/${itemId}`,
-        {
-          params: { serverId: String(serverId) },
-        },
-      );
+      const path = `/api/get-item-details/${itemId}`;
+      const config = { params: { serverId: String(serverId) } };
+      const raw = options?.fresh
+        ? await this.api.getWithoutCache<unknown>(path, config)
+        : await this.api.get<unknown>(path, config);
       if (raw == null) {
         return null;
       }
@@ -220,31 +206,56 @@ export class StreamystatsApiService {
     }
   }
 
-  private mediaBrowserAuthHeader(): string {
-    return `MediaBrowser Token="${this.settings.jellyfin_api_key}"`;
+  private mediaBrowserAuthHeader(
+    apiKey = this.settings.jellyfin_api_key,
+  ): string {
+    return `MediaBrowser Token="${apiKey}"`;
   }
 
   public async testConnection(
     params: ConstructorParameters<typeof StreamystatsApi>[0],
   ): Promise<BasicResponseDto> {
-    const api = new StreamystatsApi(params, this.loggerFactory.createLogger());
+    const api = new StreamystatsApi(
+      { url: params.url },
+      this.loggerFactory.createLogger(),
+    );
 
     try {
+      assertApiKey(params.apiKey);
+      const config = connectionTestConfig();
       const response = await api.getRawWithoutCache<StreamystatsVersionInfo>(
         '/api/version',
-        {
-          signal: AbortSignal.timeout(CONNECTION_TEST_TIMEOUT_MS),
-        },
+        config,
       );
 
       const version = response?.data?.currentVersion;
       if (!version) {
-        return {
-          status: 'NOK',
-          code: 0,
-          message:
-            'Unexpected response from Streamystats. Verify the URL points to a Streamystats instance.',
-        };
+        throw new Error(
+          'Unexpected response from Streamystats. Verify the URL points to a Streamystats instance.',
+        );
+      }
+
+      const watchlists = await api
+        .getRawWithoutCache<unknown>('/api/watchlists', {
+          ...config,
+          headers: {
+            Authorization: this.mediaBrowserAuthHeader(params.apiKey),
+          },
+        })
+        .catch((error: unknown) => {
+          // Before v2.18.1, Streamystats accepts only Jellyfin user tokens here,
+          // so a valid server API key is rejected too.
+          if (isAxiosError(error) && error.response?.status === 401) {
+            throw new Error(
+              'Streamystats rejected the Jellyfin API key. It needs Streamystats v2.18.1 or newer (images on ghcr.io), connected to this Jellyfin server.',
+            );
+          }
+          throw error;
+        });
+      if (
+        !streamystatsWatchlistsResponseSchema.safeParse(watchlists.data).success
+      ) {
+        throw new Error('Unexpected response');
       }
 
       return {
@@ -253,8 +264,7 @@ export class StreamystatsApiService {
         message: version,
       };
     } catch (error) {
-      logConnectionTestError(this.logger, 'Streamystats');
-      this.logger.debug(error);
+      logConnectionTestError(this.logger, 'Streamystats', error);
 
       return {
         status: 'NOK',

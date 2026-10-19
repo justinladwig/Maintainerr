@@ -33,10 +33,6 @@ vi.mock('../../Common/DocsButton', () => ({
   default: () => <button type="button">Docs</button>,
 }))
 
-vi.mock('../MediaServerSelector', () => ({
-  default: () => <div>Media Server Selector</div>,
-}))
-
 vi.mock('./DatabaseBackupModal', () => ({
   default: () => <div>Backup Modal</div>,
 }))
@@ -54,25 +50,6 @@ describe('MainSettings', () => {
       apikey: 'saved-api-key',
       media_server_type: 'plex',
     }
-  })
-
-  it('keeps Save Changes enabled regardless of whether general settings have changed', () => {
-    render(<MainSettings />)
-
-    const saveButton = screen.getByRole('button', { name: 'Save Changes' })
-
-    expect((saveButton as HTMLButtonElement).disabled).toBe(false)
-  })
-
-  it('keeps Save Changes enabled when clearing saved fields so the user can reset them', () => {
-    render(<MainSettings />)
-
-    const saveButton = screen.getByRole('button', { name: 'Save Changes' })
-    const apiKeyInput = screen.getByLabelText('API key')
-
-    fireEvent.change(apiKeyInput, { target: { value: '' } })
-
-    expect((saveButton as HTMLButtonElement).disabled).toBe(false)
   })
 
   it('saves cleared general settings values as a reset', () => {

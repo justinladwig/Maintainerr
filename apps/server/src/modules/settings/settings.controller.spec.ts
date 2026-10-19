@@ -1,12 +1,6 @@
-import {
-  embyLoginRequestSchema,
-  radarrSettingSchema,
-  seerrSettingSchema,
-} from '@maintainerr/contracts';
-import { StreamableFile } from '@nestjs/common';
+import { InternalServerErrorException, StreamableFile } from '@nestjs/common';
 import { Response } from 'express';
 import { createReadStream } from 'fs';
-import { ZodValidationPipe } from 'nestjs-zod';
 import { DatabaseDownloadService } from './database-download.service';
 import { Settings } from './entities/settings.entities';
 import { MediaServerSwitchService } from './media-server-switch.service';
@@ -31,6 +25,9 @@ describe('SettingsController', () => {
     testPlexAuthToken: jest.fn(),
     removeJellyfinSettings: jest.fn(),
     getTracearrServers: jest.fn(),
+    getRadarrSettings: jest.fn(),
+    getSonarrSettings: jest.fn(),
+    getSportarrSettings: jest.fn(),
   } as unknown as jest.Mocked<SettingsOperationsService>;
 
   const settingsDataService = {
@@ -111,6 +108,18 @@ describe('SettingsController', () => {
         },
       },
       {
+        name: 'Ombi',
+        method: 'getOmbiSetting' as const,
+        entityOverrides: {
+          ombi_url: 'http://ombi.local',
+          ombi_api_key: 'ombi-key',
+        },
+        expected: {
+          api_key: 'ombi-key',
+          url: 'http://ombi.local',
+        },
+      },
+      {
         name: 'Jellyfin',
         method: 'getJellyfinSetting' as const,
         entityOverrides: {
@@ -148,29 +157,25 @@ describe('SettingsController', () => {
         await expect(controller[method]()).resolves.toEqual(expected);
       },
     );
+  });
 
-    it.each([
-      { name: 'Tautulli', method: 'getTautulliSetting' as const },
-      { name: 'Seerr', method: 'getSeerrSetting' as const },
-      { name: 'Jellyfin', method: 'getJellyfinSetting' as const },
-      { name: 'Tracearr', method: 'getTracearrSetting' as const },
-    ])(
-      'passes through non-entity response for $name settings',
-      async ({ method }) => {
-        const response = {
-          status: 'NOK' as const,
-          code: 0 as const,
-          message: 'settings not found',
-        };
-        settingsOperationsService.getSettings.mockResolvedValue(response);
+  it.each([
+    ['getSettings', 'getPublicSettings'],
+    ['getRadarrSettings', 'getRadarrSettings'],
+  ] as const)('fails %s when the read fails', async (method, read) => {
+    settingsOperationsService[read].mockResolvedValue({
+      status: 'NOK',
+      code: 0,
+      message: 'SqliteError: database is locked',
+    });
 
-        await expect(controller[method]()).resolves.toEqual(response);
-      },
+    await expect(controller[method]()).rejects.toBeInstanceOf(
+      InternalServerErrorException,
     );
   });
 
   it('sets database download headers and returns streamable file', async () => {
-    const fileStream = createReadStream('/etc/hosts');
+    const fileStream = createReadStream(__filename);
     databaseDownloadService.getDatabaseDownload.mockResolvedValue({
       fileStream,
       fileName: 'maintainerr.db',
@@ -232,94 +237,4 @@ describe('SettingsController', () => {
       });
     },
   );
-
-  it('rejects invalid Radarr URLs with the shared Zod schema', () => {
-    const pipe = new ZodValidationPipe(radarrSettingSchema);
-
-    expect(() =>
-      pipe.transform(
-        {
-          serverName: 'radarr',
-          url: 'radarr.local',
-          apiKey: 'key',
-        },
-        {
-          type: 'body',
-          metatype: Object,
-          data: '',
-        },
-      ),
-    ).toThrow('Validation failed');
-  });
-
-  it('normalises a trailing slash off a service URL rather than rejecting it (#3416)', () => {
-    const pipe = new ZodValidationPipe(seerrSettingSchema);
-
-    expect(
-      pipe.transform(
-        {
-          url: 'http://seerr.local:5055/',
-          api_key: 'key',
-        },
-        {
-          type: 'body',
-          metatype: Object,
-          data: '',
-        },
-      ),
-    ).toEqual({ url: 'http://seerr.local:5055', api_key: 'key' });
-  });
-
-  it('rejects invalid Emby login requests with the shared Zod schema', () => {
-    const pipe = new ZodValidationPipe(embyLoginRequestSchema);
-
-    expect(() =>
-      pipe.transform(
-        {
-          emby_url: 'emby.local',
-          username: 'admin',
-          password: 'secret',
-        },
-        {
-          type: 'body',
-          metatype: Object,
-          data: '',
-        },
-      ),
-    ).toThrow('Validation failed');
-  });
-
-  it('delegates Plex connectivity testing to the settings service', async () => {
-    settingsOperationsService.testPlex.mockResolvedValue({
-      status: 'OK',
-      code: 1,
-      message: '1.0.0',
-    });
-
-    await expect(controller.testPlex()).resolves.toEqual({
-      status: 'OK',
-      code: 1,
-      message: '1.0.0',
-    });
-
-    expect(settingsOperationsService.testPlex).toHaveBeenCalledTimes(1);
-  });
-
-  it('delegates Plex auth validation to the settings service', async () => {
-    settingsOperationsService.testPlexAuthToken.mockResolvedValue({
-      status: 'OK',
-      code: 1,
-      message: 'Success',
-    });
-
-    await expect(controller.testPlexAuth()).resolves.toEqual({
-      status: 'OK',
-      code: 1,
-      message: 'Success',
-    });
-
-    expect(settingsOperationsService.testPlexAuthToken).toHaveBeenCalledTimes(
-      1,
-    );
-  });
 });

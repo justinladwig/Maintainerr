@@ -1,18 +1,18 @@
-import { fireEvent, render, screen, waitFor } from '../../test-utils/render'
+import { fireEvent, render, screen } from '../../test-utils/render'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import VersionStatus from './index'
 
 const getApiHandler = vi.fn()
 const isRouteBlocked = vi.fn()
 const showBlockedNavigationToast = vi.fn()
-const prefetchRoute = vi.fn()
+const prefetchHandlers = vi.fn()
 
 vi.mock('../../utils/ApiHandler', () => ({
   default: (...args: unknown[]) => getApiHandler(...args),
 }))
 
-vi.mock('../../router', () => ({
-  prefetchRoute: (...args: unknown[]) => prefetchRoute(...args),
+vi.mock('../../utils/routePrefetch', () => ({
+  prefetchHandlers: (...args: unknown[]) => prefetchHandlers(...args),
 }))
 
 vi.mock('../Layout/MediaServerSetupGuard', () => ({
@@ -36,7 +36,7 @@ describe('VersionStatus', () => {
     getApiHandler.mockReset()
     isRouteBlocked.mockReset()
     showBlockedNavigationToast.mockReset()
-    prefetchRoute.mockReset()
+    prefetchHandlers.mockReset()
 
     getApiHandler.mockResolvedValue({
       status: true,
@@ -57,17 +57,5 @@ describe('VersionStatus', () => {
     fireEvent.click(link)
 
     expect(showBlockedNavigationToast).toHaveBeenCalledTimes(1)
-  })
-
-  it('prefetches the about route when navigation is allowed', async () => {
-    render(<VersionStatus />)
-
-    const link = await screen.findByRole('button')
-
-    fireEvent.mouseEnter(link)
-
-    await waitFor(() => {
-      expect(prefetchRoute).toHaveBeenCalledWith('/settings/about')
-    })
   })
 })

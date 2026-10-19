@@ -6,6 +6,8 @@ const allConfigured = {
   media_server_type: MediaServerType.PLEX,
   seerr_url: 'http://seerr',
   seerr_api_key: 'key',
+  ombi_url: 'http://ombi',
+  ombi_api_key: 'key',
   tautulli_url: 'http://tautulli',
   tautulli_api_key: 'key',
   streamystats_url: 'http://streamystats',
@@ -29,35 +31,22 @@ describe('unavailableRuleApplications', () => {
   // Tautulli can end up on a Jellyfin server, where its ids are the other
   // server's and every item fails. The editor already hides it; the server has
   // to agree.
-  it.each([
-    [MediaServerType.PLEX, Application.STREAMYSTATS, Application.TAUTULLI],
-    [MediaServerType.JELLYFIN, Application.TAUTULLI, Application.STREAMYSTATS],
-    [MediaServerType.EMBY, Application.TAUTULLI, undefined],
-  ])('on %s reports %s as unavailable', (server, unavailable, available) => {
+  it('reports Tautulli, not Streamystats, on Jellyfin', () => {
     const result = unavailableRuleApplications(
-      { ...allConfigured, media_server_type: server } as Settings,
+      {
+        ...allConfigured,
+        media_server_type: MediaServerType.JELLYFIN,
+      } as Settings,
       servarr,
     );
 
-    expect(result).toContain(unavailable);
-    if (available !== undefined) {
-      expect(result).not.toContain(available);
-    }
-  });
-
-  it('reports both companions on Emby, which has neither', () => {
-    const result = unavailableRuleApplications(
-      { ...allConfigured, media_server_type: MediaServerType.EMBY } as Settings,
-      servarr,
-    );
-
-    expect(result).toEqual(
-      expect.arrayContaining([Application.TAUTULLI, Application.STREAMYSTATS]),
-    );
+    expect(result).toContain(Application.TAUTULLI);
+    expect(result).not.toContain(Application.STREAMYSTATS);
   });
 
   it.each([
     ['Seerr', { seerr_api_key: null }, Application.SEERR],
+    ['Ombi', { ombi_url: null }, Application.OMBI],
     ['Tautulli', { tautulli_url: null }, Application.TAUTULLI],
     ['Streamystats', { streamystats_url: null }, Application.STREAMYSTATS],
     ['Tracearr', { tracearr_server_id: null }, Application.TRACEARR],

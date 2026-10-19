@@ -71,6 +71,12 @@ import {
 // giving up. Long enough to ride out a run that is finishing, short enough to
 // stay within a browser's patience.
 const POSTPONE_LOCK_WAIT_MS = 30000;
+// Multer leaves fieldArrayIndexLimit unbounded unless set (GHSA-535w-7cp7-47q4);
+// Nest's MulterLimits type does not list it yet, hence a named object.
+const POSTER_UPLOAD_LIMITS = {
+  fileSize: COLLECTION_POSTER_MAX_BYTES,
+  fieldArrayIndexLimit: 0,
+};
 
 const collectionMediaSortQuerySchema = z
   .enum(collectionMediaSortFields)
@@ -158,6 +164,7 @@ const collectionBaseShape = {
   listExclusions: z.boolean().optional(),
   cleanupLeftoverFolders: z.boolean().optional(),
   forceSeerr: z.boolean().optional(),
+  forceOmbi: z.boolean().optional(),
   deleteAfterDays: z.coerce
     .number()
     .int()
@@ -185,7 +192,7 @@ const collectionBaseShape = {
   overlayLandscapeTemplateId: z.coerce.number().int().optional().nullable(),
 };
 
-export const collectionBodySchema = z.object({
+const collectionBodySchema = z.object({
   ...collectionBaseShape,
   id: z.coerce.number().int(),
 });
@@ -193,23 +200,23 @@ const newCollectionBodySchema = z.object({
   ...collectionBaseShape,
   id: z.coerce.number().int().optional(),
 });
-export const createCollectionBodySchema = z.object({
+const createCollectionBodySchema = z.object({
   collection: newCollectionBodySchema,
   media: z.array(collectionMediaChangeSchema).optional(),
 });
-export const addToCollectionBodySchema = z.object({
+const addToCollectionBodySchema = z.object({
   collectionId: z.coerce.number().int(),
   media: z.array(collectionMediaChangeSchema),
   manual: z.boolean().optional(),
 });
-export const removeFromCollectionBodySchema = z.object({
+const removeFromCollectionBodySchema = z.object({
   collectionId: z.coerce.number().int(),
   media: z.array(collectionMediaChangeSchema),
 });
-export const removeCollectionBodySchema = z.object({
+const removeCollectionBodySchema = z.object({
   collectionId: z.coerce.number().int(),
 });
-export const updateScheduleBodySchema = z.object({
+const updateScheduleBodySchema = z.object({
   schedule: z
     .string()
     .min(1)
@@ -721,7 +728,7 @@ export class CollectionsController {
   @Post('/:id/poster')
   @UseInterceptors(
     FileInterceptor('poster', {
-      limits: { fileSize: COLLECTION_POSTER_MAX_BYTES },
+      limits: POSTER_UPLOAD_LIMITS,
     }),
   )
   @ApiOperation({

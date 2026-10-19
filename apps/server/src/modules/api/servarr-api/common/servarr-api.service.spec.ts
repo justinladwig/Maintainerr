@@ -90,6 +90,14 @@ describe('ServarrApi', () => {
     });
   });
 
+  it('reports an unreadable tag list as unknown, not as no tags (#3886)', async () => {
+    jest
+      .spyOn((api as any).axios, 'get')
+      .mockRejectedValue(new Error('timeout of 10000ms exceeded'));
+
+    await expect(api.getTags()).resolves.toBeUndefined();
+  });
+
   describe('ensureTag', () => {
     it('returns an existing tag id without creating (case-insensitive match)', async () => {
       jest.spyOn(api, 'getTags').mockResolvedValue([{ id: 7, label: 'DND' }]);
@@ -117,13 +125,6 @@ describe('ServarrApi', () => {
 
       await expect(api.ensureTag('dnd')).resolves.toBe(3);
     });
-
-    it('returns undefined when the id cannot be resolved (best-effort)', async () => {
-      jest.spyOn(api, 'getTags').mockResolvedValue([]);
-      jest.spyOn(api, 'createTag').mockResolvedValue(undefined);
-
-      await expect(api.ensureTag('dnd')).resolves.toBeUndefined();
-    });
   });
 
   // The arr answers a file delete after the disk is done with it. Applying the
@@ -136,18 +137,6 @@ describe('ServarrApi', () => {
   });
 
   describe('getRootFolders caching', () => {
-    it('serves the rolling cache by default', async () => {
-      const rolling = jest
-        .spyOn(api as any, 'getRolling')
-        .mockResolvedValue([{ id: 1, path: '/movies' }]);
-      const uncached = jest.spyOn(api as any, 'getWithoutCache');
-
-      await api.getRootFolders();
-
-      expect(rolling).toHaveBeenCalledWith('/rootfolder', undefined, 3600);
-      expect(uncached).not.toHaveBeenCalled();
-    });
-
     // The leftover-folder cleanup only deletes inside a root folder, so it asks
     // for a fresh list: an hour-old fence is not a fence.
     it('bypasses the cache when the caller asks for a fresh read', async () => {

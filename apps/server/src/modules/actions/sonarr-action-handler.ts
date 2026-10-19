@@ -7,7 +7,9 @@ import { Injectable } from '@nestjs/common';
 import { dirname } from 'path';
 import { DownloadClientApiService } from '../api/download-client-api/download-client-api.service';
 import { MediaServerFactory } from '../api/media-server/media-server.factory';
+import { OmbiApiService } from '../api/ombi-api/ombi-api.service';
 import { SeerrApiService } from '../api/seerr-api/seerr-api.service';
+import { findEpisodeByTvdbId } from '../api/servarr-api/helpers/sonarr.helper';
 import {
   SonarrEpisode,
   SonarrSeries,
@@ -22,6 +24,7 @@ import {
   formatMetadataLookupCandidates,
 } from '../metadata/metadata-lookup.util';
 import { MetadataService } from '../metadata/metadata.service';
+import { ArrLookupCache } from '../rules/helpers/arr-lookup-cache';
 import { SettingsDataService } from '../settings/settings-data.service';
 import {
   LeftoverCleanupInput,
@@ -43,6 +46,7 @@ export class SonarrActionHandler {
     private readonly servarrApi: ServarrService,
     private readonly mediaServerFactory: MediaServerFactory,
     private readonly seerrApi: SeerrApiService,
+    private readonly ombiApi: OmbiApiService,
     private readonly metadataService: MetadataService,
     private readonly settings: SettingsDataService,
     private readonly downloadClient: DownloadClientApiService,
@@ -55,6 +59,7 @@ export class SonarrActionHandler {
   public async handleAction(
     collection: Collection,
     media: CollectionMedia,
+    libraryReads?: ArrLookupCache,
   ): Promise<boolean> {
     const mediaServer = await this.mediaServerFactory.getService();
     const sonarrApiClient = await this.servarrApi.getSonarrApiClient(
@@ -95,6 +100,14 @@ export class SonarrActionHandler {
           tvdb: media.tvdbId,
           tmdb: media.tmdbId,
         },
+        () =>
+          libraryReads
+            ? libraryReads.memoize(
+                `sonarr:${collection.sonarrSettingsId}:library`,
+                () => sonarrApiClient.getSeries(),
+                (entries) => entries === undefined,
+              )
+            : sonarrApiClient.getSeries(),
       );
 
     if (lookupCandidates.length === 0) {
@@ -151,6 +164,33 @@ export class SonarrActionHandler {
           `Couldn't find show in Sonarr using resolved external IDs [${attemptedIds}] for media server item ${media.mediaServerId}. No unmonitor action was taken.`,
         );
         return false;
+      }
+    }
+
+    // A row added through the Sonarr library carries no cached ids, and the
+    // request removal that follows needs the TMDB id. Sonarr reports 0 when it
+    // has none, which must leave the row as it is.
+    if (sonarrMedia.tmdbId) {
+      media.tmdbId ??= sonarrMedia.tmdbId;
+    }
+
+    // A media server can number an episode differently from Sonarr (#3819).
+    // When its TVDB id names one Sonarr episode, everything below acts on
+    // that episode by Sonarr's numbers; otherwise by the media server's.
+    if (collection.type === 'episode' && mediaData?.index !== undefined) {
+      const episode = await this.matchEpisodeByTvdbId(
+        sonarrApiClient,
+        sonarrMedia,
+        mediaData,
+        collection.sonarrSettingsId,
+        libraryReads,
+      );
+      if (episode) {
+        mediaData = {
+          ...mediaData,
+          parentIndex: episode.seasonNumber,
+          index: episode.episodeNumber,
+        };
       }
     }
 
@@ -751,6 +791,33 @@ export class SonarrActionHandler {
     }
   }
 
+  private async matchEpisodeByTvdbId(
+    sonarrApiClient: Awaited<ReturnType<ServarrService['getSonarrApiClient']>>,
+    sonarrMedia: SonarrSeries,
+    mediaData: MediaItem,
+    settingsId: number,
+    libraryReads?: ArrLookupCache,
+  ): Promise<SonarrEpisode | undefined> {
+    if (!mediaData.providerIds?.tvdb?.length) {
+      return undefined;
+    }
+
+    const listEpisodes = () => sonarrApiClient.getEpisodes(sonarrMedia.id);
+    try {
+      const episodes = await (libraryReads
+        ? libraryReads.memoize(
+            `sonarr:${settingsId}:episodes-all:${sonarrMedia.id}`,
+            listEpisodes,
+            (episodes) => episodes === undefined,
+          )
+        : listEpisodes());
+      return findEpisodeByTvdbId(episodes ?? [], mediaData, sonarrMedia.tvdbId);
+    } catch (error) {
+      this.logger.debug(error);
+      return undefined;
+    }
+  }
+
   private getEpisodeLookup(mediaData?: MediaItem):
     | {
         seasonNumber: number;
@@ -817,28 +884,33 @@ export class SonarrActionHandler {
       return false;
     }
 
-    const hasSeerrCheckInputs =
+    const requestServices = [
+      { label: 'Seerr', api: this.seerrApi },
+      { label: 'Ombi', api: this.ombiApi },
+    ].filter(({ api }) => api.isConfigured());
+    const hasRequestCheckInputs =
       tmdbId !== undefined && removedSeasonNumber !== undefined;
 
-    if (this.seerrApi.isConfigured() && hasSeerrCheckInputs) {
-      const hasRemainingRequests =
-        await this.seerrApi.hasRemainingSeasonRequests(
+    if (requestServices.length > 0 && hasRequestCheckInputs) {
+      for (const { label, api } of requestServices) {
+        const hasRemainingRequests = await api.hasRemainingSeasonRequests(
           tmdbId,
           removedSeasonNumber,
         );
 
-      if (hasRemainingRequests === true) {
-        this.logger.debug(
-          `[Sonarr] Show '${series.title}' has other active Seerr season requests - skipping show deletion`,
-        );
-        return false;
-      }
+        if (hasRemainingRequests === true) {
+          this.logger.debug(
+            `[Sonarr] Show '${series.title}' has other active ${label} season requests - skipping show deletion`,
+          );
+          return false;
+        }
 
-      if (hasRemainingRequests === undefined) {
-        this.logger.debug(
-          `[Sonarr] Show '${series.title}' Seerr state could not be determined - skipping show deletion`,
-        );
-        return false;
+        if (hasRemainingRequests === undefined) {
+          this.logger.debug(
+            `[Sonarr] Show '${series.title}' ${label} state could not be determined - skipping show deletion`,
+          );
+          return false;
+        }
       }
 
       if (
@@ -847,12 +919,12 @@ export class SonarrActionHandler {
         return false;
       }
       this.logger.log(
-        `[Sonarr] Show '${series.title}' has no files and no remaining Seerr season requests - deleted from Sonarr`,
+        `[Sonarr] Show '${series.title}' has no files and no remaining season requests - deleted from Sonarr`,
       );
       return true;
     }
 
-    // No-Seerr fallback. The file gate above already proved the show has no
+    // No request-service fallback. The file gate above already proved the show has no
     // episode files; `ended` confirms no further episodes are coming. We do
     // NOT additionally require every season to be unmonitored: Sonarr carries
     // every TVDB season on the series, including ones the user never

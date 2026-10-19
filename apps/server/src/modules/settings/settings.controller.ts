@@ -16,6 +16,8 @@ import {
   MetadataProviderPreference,
   MetadataProviderSetting,
   metadataProviderSettingSchema,
+  OmbiSetting,
+  ombiSettingSchema,
   PlexAuthToken,
   plexAuthTokenSchema,
   RadarrSetting,
@@ -59,6 +61,7 @@ import {
   ForbiddenException,
   Get,
   Header,
+  InternalServerErrorException,
   Param,
   ParseEnumPipe,
   ParseIntPipe,
@@ -93,21 +96,44 @@ export class SettingsController {
   ) {}
 
   @Get()
-  getSettings() {
-    return this.settingsOperationsService.getPublicSettings();
+  async getSettings() {
+    const settings = await this.settingsOperationsService.getPublicSettings();
+    // Read as settings, the error object looks like an unconfigured install
+    // and sends the UI to setup.
+    if (settings && 'status' in settings) {
+      throw new InternalServerErrorException('The settings could not be read');
+    }
+    return settings;
   }
   @Get('/radarr')
-  getRadarrSettings() {
-    return this.settingsOperationsService.getRadarrSettings();
+  async getRadarrSettings() {
+    return this.serverList(
+      await this.settingsOperationsService.getRadarrSettings(),
+    );
   }
   @Get('/sonarr')
-  getSonarrSettings() {
-    return this.settingsOperationsService.getSonarrSettings();
+  async getSonarrSettings() {
+    return this.serverList(
+      await this.settingsOperationsService.getSonarrSettings(),
+    );
   }
 
   @Get('/sportarr')
-  getSportarrSettings() {
-    return this.settingsOperationsService.getSportarrSettings();
+  async getSportarrSettings() {
+    return this.serverList(
+      await this.settingsOperationsService.getSportarrSettings(),
+    );
+  }
+
+  // A list that could not be read comes back as an error object, which a
+  // client would take for the list itself.
+  private serverList<T>(list: T[] | BasicResponseDto): T[] {
+    if (!Array.isArray(list)) {
+      throw new InternalServerErrorException(
+        'The server list could not be read',
+      );
+    }
+    return list;
   }
   @Get('/version')
   getVersion() {
@@ -614,6 +640,41 @@ export class SettingsController {
     payload: SeerrSetting,
   ): Promise<BasicResponseDto> {
     return this.settingsOperationsService.testSeerr(payload);
+  }
+
+  @Get('/ombi')
+  async getOmbiSetting(): Promise<OmbiSetting | BasicResponseDto> {
+    const settings = await this.settingsOperationsService.getSettings();
+
+    if (!(settings instanceof Settings)) {
+      return settings;
+    }
+
+    return {
+      api_key: settings.ombi_api_key,
+      url: settings.ombi_url,
+    };
+  }
+
+  @Post('/ombi')
+  async updateOmbiSetting(
+    @Body(new ZodValidationPipe(ombiSettingSchema))
+    payload: OmbiSetting,
+  ) {
+    return await this.settingsOperationsService.updateOmbiSetting(payload);
+  }
+
+  @Delete('/ombi')
+  async removeOmbiSetting() {
+    return await this.settingsOperationsService.removeOmbiSetting();
+  }
+
+  @Post('/test/ombi')
+  testOmbi(
+    @Body(new ZodValidationPipe(ombiSettingSchema))
+    payload: OmbiSetting,
+  ): Promise<BasicResponseDto> {
+    return this.settingsOperationsService.testOmbi(payload);
   }
 
   @Get('/jellyfin')

@@ -1,9 +1,7 @@
 import { isAxiosError } from 'axios';
+import { assertApiKey, connectionTestConfig } from '../../lib/connectionTest';
 import { MaintainerrLogger } from '../../../logging/logs.service';
-import {
-  CONNECTION_TEST_TIMEOUT_MS,
-  SLOW_INSTANCE_TIMEOUT_MS,
-} from '../../lib/httpTimeouts';
+import { SLOW_INSTANCE_TIMEOUT_MS } from '../../lib/httpTimeouts';
 import { ServarrApi } from '../common/servarr-api.service';
 import {
   RadarrImportListExclusion,
@@ -37,9 +35,9 @@ export class RadarrApi extends ServarrApi<{ movieId: number }> {
   }
 
   /**
-   * Every tracked movie. Uncached: its only caller fences a filesystem delete
-   * on the other movies' folders, and a movie added since the last read would
-   * be missing from a cached snapshot - so the fence would not see it.
+   * Every tracked movie. Uncached: the filesystem-delete fence must see a
+   * movie added since the last read; the id fallback memoizes it per run
+   * or batch itself.
    */
   public getMovies = async (): Promise<RadarrMovie[]> => {
     try {
@@ -345,17 +343,9 @@ export class RadarrApi extends ServarrApi<{ movieId: number }> {
   }
 
   public async info(): Promise<RadarrInfo> {
-    try {
-      const info: RadarrInfo = (
-        await this.axios.get<RadarrInfo>(`system/status`, {
-          signal: AbortSignal.timeout(CONNECTION_TEST_TIMEOUT_MS),
-        })
-      ).data;
-      return info ? info : null;
-    } catch (error) {
-      this.logger.warn("Couldn't fetch Radarr info.. Is Radarr up?");
-      this.logger.debug(error);
-      return null;
-    }
+    assertApiKey(this.axios.defaults.params?.apikey);
+    return (
+      await this.axios.get<RadarrInfo>('system/status', connectionTestConfig())
+    ).data;
   }
 }

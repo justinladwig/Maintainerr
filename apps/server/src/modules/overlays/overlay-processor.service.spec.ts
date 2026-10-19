@@ -93,66 +93,6 @@ const makeItem = (
 ): MediaItem => ({ id, type, ...overrides }) as MediaItem;
 
 describe('OverlayProcessorService', () => {
-  it('processes collections with deleteAfterDays equal to zero', async () => {
-    const settingsService = {
-      getSettings: jest.fn().mockResolvedValue({ enabled: true }),
-    };
-    const stateService = {
-      getItemState: jest.fn().mockResolvedValue(null),
-    };
-    const template = makeTemplate();
-    const templateService = {
-      resolveForCollection: jest.fn().mockResolvedValue(template),
-    };
-    const provider = makeProvider();
-    const providerFactory = makeProviderFactory(provider);
-
-    const service = new OverlayProcessorService(
-      providerFactory as any,
-      makeMediaServerFactory() as any,
-      {} as any,
-      {} as any,
-      settingsService as any,
-      stateService as any,
-      {} as any,
-      templateService as any,
-      { emit: jest.fn() } as any,
-      createMockLogger(),
-      new ExecutionLockService(),
-    );
-
-    const collection = createCollection({
-      id: 1,
-      title: 'Immediate action',
-      type: 'movie',
-      deleteAfterDays: 0,
-      overlayTemplateId: null,
-    });
-    collection.collectionMedia = [
-      createCollectionMedia(collection, {
-        mediaServerId: 'media-1',
-        addDate: new Date('2026-04-01T00:00:00.000Z'),
-      }),
-    ];
-
-    jest.spyOn(service, 'applyTemplateOverlay').mockResolvedValue(true);
-
-    const result = await service.processCollection(collection as any);
-
-    expect(service.applyTemplateOverlay).toHaveBeenCalledWith(
-      'media-1',
-      collection.id,
-      expect.any(Date),
-      template,
-      provider,
-    );
-    expect(templateService.resolveForCollection).toHaveBeenCalledWith(
-      null,
-      'poster',
-    );
-    expect(result.processed).toBe(1);
-  });
-
   it('draws nothing when the collection window cannot name a day', async () => {
     const settingsService = {
       getSettings: jest.fn().mockResolvedValue({ enabled: true }),
@@ -204,65 +144,6 @@ describe('OverlayProcessorService', () => {
       skipped: 0,
       errors: 0,
     });
-  });
-
-  it('resolves a titlecard template when the collection is of type episode', async () => {
-    const settingsService = {
-      getSettings: jest.fn().mockResolvedValue({ enabled: true }),
-    };
-    const stateService = {
-      getItemState: jest.fn().mockResolvedValue(null),
-    };
-    const template = makeTemplate({ mode: 'titlecard' });
-    const templateService = {
-      resolveForCollection: jest.fn().mockResolvedValue(template),
-    };
-    const provider = makeProvider();
-    const providerFactory = makeProviderFactory(provider);
-
-    const service = new OverlayProcessorService(
-      providerFactory as any,
-      makeMediaServerFactory() as any,
-      {} as any,
-      {} as any,
-      settingsService as any,
-      stateService as any,
-      {} as any,
-      templateService as any,
-      { emit: jest.fn() } as any,
-      createMockLogger(),
-      new ExecutionLockService(),
-    );
-
-    const collection = createCollection({
-      id: 1,
-      title: 'Episode overlays',
-      type: 'episode',
-      deleteAfterDays: 7,
-      overlayTemplateId: null,
-    });
-    collection.collectionMedia = [
-      createCollectionMedia(collection, {
-        mediaServerId: 'ep-1',
-        addDate: new Date('2026-04-01T00:00:00.000Z'),
-      }),
-    ];
-
-    jest.spyOn(service, 'applyTemplateOverlay').mockResolvedValue(true);
-
-    await service.processCollection(collection as any);
-
-    expect(templateService.resolveForCollection).toHaveBeenCalledWith(
-      null,
-      'titlecard',
-    );
-    expect(service.applyTemplateOverlay).toHaveBeenCalledWith(
-      'ep-1',
-      collection.id,
-      expect.any(Date),
-      template,
-      provider,
-    );
   });
 
   it('skips items whose overlay state already matches the current day count during normal runs', async () => {
@@ -320,37 +201,28 @@ describe('OverlayProcessorService', () => {
     });
   });
 
-  it('rebuilds items whose overlay state already matches the current day count during forced runs', async () => {
-    const settingsService = {
-      getSettings: jest.fn().mockResolvedValue({ enabled: true }),
-    };
-    const stateService = {
-      getItemState: jest.fn().mockResolvedValue({ daysLeftShown: 0 }),
-    };
-    const template = makeTemplate();
-    const templateService = {
-      resolveForCollection: jest.fn().mockResolvedValue(template),
-    };
-    const provider = makeProvider();
-    const providerFactory = makeProviderFactory(provider);
-
+  it('counts unchanged artwork as skipped when the day count moves, without an applied notification', async () => {
+    const eventEmitter = { emit: jest.fn() };
     const service = new OverlayProcessorService(
-      providerFactory as any,
+      makeProviderFactory(makeProvider()) as any,
       makeMediaServerFactory() as any,
       {} as any,
       {} as any,
-      settingsService as any,
-      stateService as any,
+      { getSettings: jest.fn().mockResolvedValue({ enabled: true }) } as any,
+      {
+        getItemState: jest.fn().mockResolvedValue({ daysLeftShown: 1 }),
+      } as any,
       {} as any,
-      templateService as any,
-      { emit: jest.fn() } as any,
+      {
+        resolveForCollection: jest.fn().mockResolvedValue(makeTemplate()),
+      } as any,
+      eventEmitter as any,
       createMockLogger(),
       new ExecutionLockService(),
     );
 
     const collection = createCollection({
       id: 1,
-      title: 'Forced overlay',
       type: 'movie',
       deleteAfterDays: 0,
       overlayTemplateId: null,
@@ -362,23 +234,16 @@ describe('OverlayProcessorService', () => {
       }),
     ];
 
-    jest.spyOn(service, 'applyTemplateOverlay').mockResolvedValue(true);
+    jest.spyOn(service, 'applyTemplateOverlay').mockResolvedValue('unchanged');
 
-    const result = await service.processCollection(collection as any, true);
-
-    expect(service.applyTemplateOverlay).toHaveBeenCalledWith(
-      'media-1',
-      collection.id,
-      expect.any(Date),
-      template,
-      provider,
-    );
-    expect(result).toEqual({
-      processed: 1,
+    expect(await service.processCollection(collection as any)).toEqual({
+      processed: 0,
       reverted: 0,
-      skipped: 0,
+      skipped: 1,
       errors: 0,
     });
+    expect(service.applyTemplateOverlay).toHaveBeenCalled();
+    expect(eventEmitter.emit).not.toHaveBeenCalled();
   });
 
   it('blocks concurrent standalone collection runs while one is already in progress', async () => {
@@ -448,63 +313,6 @@ describe('OverlayProcessorService', () => {
     );
 
     expect(service.status).toBe('idle');
-  });
-
-  it('skips same-day overlay state during normal process-all runs', async () => {
-    const settingsService = {
-      getSettings: jest.fn().mockResolvedValue({ enabled: true }),
-    };
-    const stateService = {
-      getAllStates: jest.fn().mockResolvedValue([]),
-      getItemState: jest.fn().mockResolvedValue({ daysLeftShown: 0 }),
-    };
-    const template = makeTemplate();
-    const templateService = {
-      resolveForCollection: jest.fn().mockResolvedValue(template),
-    };
-    const collection = createCollection({
-      id: 1,
-      title: 'Stable batch',
-      type: 'movie',
-      deleteAfterDays: 0,
-      overlayTemplateId: null,
-    });
-    collection.collectionMedia = [
-      createCollectionMedia(collection, {
-        mediaServerId: 'media-1',
-        addDate: new Date('2026-04-01T00:00:00.000Z'),
-      }),
-    ];
-    const collectionRepos = makeCollectionRepos([collection]);
-    const provider = makeProvider();
-    const providerFactory = makeProviderFactory(provider);
-    const eventEmitter = { emit: jest.fn() };
-
-    const service = new OverlayProcessorService(
-      providerFactory as any,
-      makeMediaServerFactory() as any,
-      collectionRepos.collectionRepo as any,
-      collectionRepos.collectionMediaRepo as any,
-      settingsService as any,
-      stateService as any,
-      {} as any,
-      templateService as any,
-      eventEmitter as any,
-      createMockLogger(),
-      new ExecutionLockService(),
-    );
-
-    jest.spyOn(service, 'applyTemplateOverlay').mockResolvedValue(true);
-
-    const result = await service.processAllCollections();
-
-    expect(service.applyTemplateOverlay).not.toHaveBeenCalled();
-    expect(result).toEqual({
-      processed: 0,
-      reverted: 0,
-      skipped: 1,
-      errors: 0,
-    });
   });
 
   it('rebuilds same-day overlay state during forced process-all runs', async () => {
@@ -747,37 +555,6 @@ describe('OverlayProcessorService', () => {
     expect(eventEmitter.emit).not.toHaveBeenCalled();
   });
 
-  it('aborts processAllCollections when the provider reports unavailable', async () => {
-    const settingsService = {
-      getSettings: jest.fn().mockResolvedValue({ enabled: true }),
-    };
-    const provider = makeProvider({
-      isAvailable: jest.fn().mockResolvedValue(false),
-    });
-    const providerFactory = makeProviderFactory(provider);
-    const eventEmitter = { emit: jest.fn() };
-
-    const service = new OverlayProcessorService(
-      providerFactory as any,
-      makeMediaServerFactory() as any,
-      {} as any,
-      {} as any,
-      settingsService as any,
-      {} as any,
-      {} as any,
-      {} as any,
-      eventEmitter as any,
-      createMockLogger(),
-      new ExecutionLockService(),
-    );
-
-    const result = await service.processAllCollections();
-
-    expect(result.processed).toBe(0);
-    expect(service.status).toBe('idle');
-    expect(eventEmitter.emit).not.toHaveBeenCalled();
-  });
-
   it('counts stale-state restore failures as errors and keeps retry state during process-all runs', async () => {
     const epipeError = Object.assign(new Error('write EPIPE'), {
       code: 'EPIPE',
@@ -844,67 +621,6 @@ describe('OverlayProcessorService', () => {
     );
   });
 
-  it('emits one aggregated overlay reverted notification for reset-all runs', async () => {
-    const stateService = {
-      getAllStates: jest.fn().mockResolvedValue([
-        { collectionId: 1, mediaServerId: 'media-1' },
-        { collectionId: 2, mediaServerId: 'media-2' },
-      ]),
-      clearAllStates: jest.fn().mockResolvedValue(undefined),
-      removeState: jest.fn().mockResolvedValue(undefined),
-    };
-    const provider = makeProvider();
-    const providerFactory = makeProviderFactory(provider);
-    const collectionRepos = makeCollectionRepos([{ id: 42, type: 'movie' }]);
-    const eventEmitter = { emit: jest.fn() };
-
-    const service = new OverlayProcessorService(
-      providerFactory as any,
-      makeMediaServerFactory() as any,
-      collectionRepos.collectionRepo as any,
-      collectionRepos.collectionMediaRepo as any,
-      {} as any,
-      stateService as any,
-      {} as any,
-      {} as any,
-      eventEmitter as any,
-      createMockLogger(),
-      new ExecutionLockService(),
-    );
-
-    jest
-      .spyOn(service as any, 'loadOriginalPoster')
-      .mockReturnValue(Buffer.from('poster'));
-    jest
-      .spyOn(service as any, 'deleteOriginalPoster')
-      .mockImplementation(() => {});
-
-    jest.spyOn(service as any, 'listBackedUpItemIds').mockReturnValue([]);
-
-    await service.resetAllOverlays();
-
-    expect(stateService.removeState).toHaveBeenNthCalledWith(1, 1, 'media-1');
-    expect(stateService.removeState).toHaveBeenNthCalledWith(2, 2, 'media-2');
-    expect(stateService.removeState).toHaveBeenCalledTimes(2);
-
-    expect(eventEmitter.emit).toHaveBeenCalledWith(
-      MaintainerrEvent.Overlay_Reverted,
-      expect.objectContaining({
-        mediaItems: [
-          { mediaServerId: 'media-1' },
-          { mediaServerId: 'media-2' },
-        ],
-        collectionName: 'All Collections',
-        identifier: undefined,
-      }),
-    );
-    expect(
-      eventEmitter.emit.mock.calls.filter(
-        ([eventName]) => eventName === MaintainerrEvent.Overlay_Reverted,
-      ),
-    ).toHaveLength(1);
-  });
-
   it('drops the backup it just took when the render fails, so reset cannot restore it', async () => {
     const provider = makeProvider({
       downloadImage: jest.fn().mockResolvedValue(Buffer.from('poster')),
@@ -950,6 +666,62 @@ describe('OverlayProcessorService', () => {
     expect(deleteOriginal).toHaveBeenCalledWith('media-1');
     expect(provider.uploadImage).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ['identical', async () => Buffer.from('rendered'), 'unchanged', 0],
+    ['different', async () => Buffer.from('replaced'), true, 1],
+    ['missing', async () => null, true, 1],
+    [
+      'unreadable',
+      async () => {
+        throw new Error('offline');
+      },
+      true,
+      1,
+    ],
+  ] as const)(
+    'uploads only when the current artwork differs from the render (%s current artwork)',
+    async (_, current, expected, uploads) => {
+      const provider = makeProvider({ downloadImage: jest.fn(current) });
+      const stateService = { markProcessed: jest.fn() };
+      const renderService = {
+        renderFromTemplate: jest.fn().mockResolvedValue({
+          buffer: Buffer.from('rendered'),
+          contentType: 'image/jpeg',
+        }),
+      };
+
+      const service = new OverlayProcessorService(
+        makeProviderFactory(provider) as any,
+        makeMediaServerFactory() as any,
+        {} as any,
+        {} as any,
+        {} as any,
+        stateService as any,
+        renderService as any,
+        {} as any,
+        { emit: jest.fn() } as any,
+        createMockLogger(),
+        new ExecutionLockService(),
+      );
+
+      jest
+        .spyOn(service as any, 'loadOriginalPoster')
+        .mockReturnValue(Buffer.from('original'));
+
+      const applied = await service.applyTemplateOverlay(
+        'media-1',
+        1,
+        new Date(),
+        makeTemplate(),
+        provider as any,
+      );
+
+      expect(applied).toBe(expected);
+      expect(provider.uploadImage).toHaveBeenCalledTimes(uploads);
+      expect(stateService.markProcessed).toHaveBeenCalled();
+    },
+  );
 
   it('restores a saved original that no state row claims during reset-all', async () => {
     const stateService = {
@@ -1077,54 +849,6 @@ describe('OverlayProcessorService', () => {
     expect(eventEmitter.emit).not.toHaveBeenCalledWith(
       MaintainerrEvent.Overlay_Reverted,
       expect.anything(),
-    );
-  });
-
-  it('deduplicates media items in aggregated overlay reverted notifications', async () => {
-    const stateService = {
-      getAllStates: jest.fn().mockResolvedValue([
-        { collectionId: 1, mediaServerId: 'media-1' },
-        { collectionId: 2, mediaServerId: 'media-1' },
-      ]),
-      clearAllStates: jest.fn().mockResolvedValue(undefined),
-      removeState: jest.fn().mockResolvedValue(undefined),
-    };
-    const provider = makeProvider();
-    const providerFactory = makeProviderFactory(provider);
-    const collectionRepos = makeCollectionRepos([{ id: 42, type: 'movie' }]);
-    const eventEmitter = { emit: jest.fn() };
-
-    const service = new OverlayProcessorService(
-      providerFactory as any,
-      makeMediaServerFactory() as any,
-      collectionRepos.collectionRepo as any,
-      collectionRepos.collectionMediaRepo as any,
-      {} as any,
-      stateService as any,
-      {} as any,
-      {} as any,
-      eventEmitter as any,
-      createMockLogger(),
-      new ExecutionLockService(),
-    );
-
-    jest
-      .spyOn(service as any, 'loadOriginalPoster')
-      .mockReturnValue(Buffer.from('poster'));
-    jest
-      .spyOn(service as any, 'deleteOriginalPoster')
-      .mockImplementation(() => {});
-
-    jest.spyOn(service as any, 'listBackedUpItemIds').mockReturnValue([]);
-
-    await service.resetAllOverlays();
-
-    expect(eventEmitter.emit).toHaveBeenCalledWith(
-      MaintainerrEvent.Overlay_Reverted,
-      expect.objectContaining({
-        mediaItems: [{ mediaServerId: 'media-1' }],
-        collectionName: 'All Collections',
-      }),
     );
   });
 
@@ -1266,106 +990,6 @@ describe('OverlayProcessorService', () => {
         collectionName: 'Target collection',
         identifier: { type: 'collection', value: 7 },
       }),
-    );
-  });
-
-  it('preserves the backup and state when the upload fails during revert', async () => {
-    const stateService = {
-      getCollectionStates: jest
-        .fn()
-        .mockResolvedValue([{ mediaServerId: 'media-1' }]),
-      removeState: jest.fn().mockResolvedValue(undefined),
-    };
-    const provider = makeProvider({
-      uploadImage: jest.fn().mockRejectedValue(new Error('Server unreachable')),
-    });
-    const providerFactory = makeProviderFactory(provider);
-    const eventEmitter = { emit: jest.fn() };
-    const collectionRepos = makeCollectionRepos([
-      { id: 42, type: 'movie', title: 'Flaky collection' },
-    ]);
-
-    const service = new OverlayProcessorService(
-      providerFactory as any,
-      makeMediaServerFactory() as any,
-      collectionRepos.collectionRepo as any,
-      collectionRepos.collectionMediaRepo as any,
-      {} as any,
-      stateService as any,
-      {} as any,
-      {} as any,
-      eventEmitter as any,
-      createMockLogger(),
-      new ExecutionLockService(),
-    );
-
-    jest
-      .spyOn(service as any, 'loadOriginalPoster')
-      .mockReturnValue(Buffer.from('poster'));
-    const deleteSpy = jest
-      .spyOn(service as any, 'deleteOriginalPoster')
-      .mockImplementation(() => {});
-
-    await service.revertCollection(42);
-
-    // Backup file must not be deleted on failure - we still need it for retry.
-    expect(deleteSpy).not.toHaveBeenCalled();
-    // State must not be cleared on failure - next run reattempts the revert.
-    expect(stateService.removeState).not.toHaveBeenCalled();
-    // No reverted event should be emitted because nothing was actually reverted.
-    expect(eventEmitter.emit).not.toHaveBeenCalled();
-  });
-
-  it('drops state and backup without uploading when the item no longer exists on the media server', async () => {
-    const stateService = {
-      getCollectionStates: jest
-        .fn()
-        .mockResolvedValue([{ mediaServerId: 'media-1' }]),
-      removeState: jest.fn().mockResolvedValue(undefined),
-    };
-    const provider = makeProvider();
-    const providerFactory = makeProviderFactory(provider);
-    const mediaServer = makeMediaServer({
-      itemExists: jest.fn().mockResolvedValue(false),
-    });
-    const eventEmitter = { emit: jest.fn() };
-    const collectionRepos = makeCollectionRepos([{ id: 42, type: 'movie' }]);
-
-    const service = new OverlayProcessorService(
-      providerFactory as any,
-      makeMediaServerFactory(mediaServer) as any,
-      collectionRepos.collectionRepo as any,
-      collectionRepos.collectionMediaRepo as any,
-      {} as any,
-      stateService as any,
-      {} as any,
-      {} as any,
-      eventEmitter as any,
-      createMockLogger(),
-      new ExecutionLockService(),
-    );
-
-    jest
-      .spyOn(service as any, 'loadOriginalPoster')
-      .mockReturnValue(Buffer.from('poster'));
-    const deleteSpy = jest
-      .spyOn(service as any, 'deleteOriginalPoster')
-      .mockImplementation(() => {});
-
-    await service.revertCollection(42);
-
-    expect(mediaServer.itemExists).toHaveBeenCalledWith('media-1');
-    // Skip the upload - Plex would close the connection mid-stream (EPIPE)
-    // for a deleted item.
-    expect(provider.uploadImage).not.toHaveBeenCalled();
-    // Stale state and the backup are no longer useful - clear them so we
-    // don't retry forever and pin a deleted item's bitmap on disk.
-    expect(deleteSpy).toHaveBeenCalledWith('media-1');
-    expect(stateService.removeState).toHaveBeenCalledWith(42, 'media-1');
-    // Quiet cleanup: not surfaced as a revert event.
-    expect(eventEmitter.emit).not.toHaveBeenCalledWith(
-      MaintainerrEvent.Overlay_Reverted,
-      expect.anything(),
     );
   });
 

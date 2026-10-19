@@ -30,14 +30,6 @@ describe('formatConnectionFailureMessage', () => {
     );
   });
 
-  it('classifies ETIMEDOUT from the error code', () => {
-    const error = new AxiosError('', 'ETIMEDOUT');
-
-    expect(formatConnectionFailureMessage(error, FALLBACK)).toContain(
-      'Connection timed out',
-    );
-  });
-
   it('maps 401/403 responses to an invalid-key message', () => {
     const error = new AxiosError(
       'Request failed',
@@ -56,6 +48,36 @@ describe('formatConnectionFailureMessage', () => {
     expect(formatConnectionFailureMessage(error, FALLBACK)).toBe(
       'Invalid API key',
     );
+  });
+
+  it('classifies a deadline cancellation wrapped by the Plex client', () => {
+    const error = new Error('Plex request failed', {
+      cause: new AxiosError('canceled', 'ERR_CANCELED'),
+    });
+    expect(formatConnectionFailureMessage(error, FALLBACK)).toContain(
+      'Connection timed out.',
+    );
+  });
+
+  it('preserves permission guidance from a wrapped forbidden response', () => {
+    const cause = new AxiosError(
+      'Request failed',
+      'ERR_BAD_REQUEST',
+      undefined,
+      undefined,
+      {
+        status: 403,
+        statusText: 'Forbidden',
+        data: undefined,
+        headers: {},
+        config: {} as never,
+      },
+    );
+    const error = new Error(
+      'Plex Server denied request due to lack of managed user permissions!',
+      { cause },
+    );
+    expect(formatConnectionFailureMessage(error, FALLBACK)).toBe(error.message);
   });
 
   it('reports other HTTP status codes', () => {

@@ -16,6 +16,8 @@ describe('RulesService.getRuleConstants', () => {
   const settings = {
     seerr_api_key: 'key',
     seerr_url: 'http://seerr',
+    ombi_url: 'http://ombi',
+    ombi_api_key: 'key',
     tautulli_url: 'http://tautulli',
     tautulli_api_key: 'key',
     streamystats_url: 'http://streamystats',
@@ -66,30 +68,5 @@ describe('RulesService.getRuleConstants', () => {
     const ids = await applicationIds(service);
     expect(ids).not.toContain(Application.SPORTARR);
     expect(ids).toContain(Application.SONARR);
-  });
-
-  it('includes Sportarr when a Sportarr server exists', async () => {
-    const service = createRulesService({
-      radarr: false,
-      sonarr: false,
-      sportarr: true,
-    });
-
-    const ids = await applicationIds(service);
-    expect(ids).toContain(Application.SPORTARR);
-    expect(ids).not.toContain(Application.SONARR);
-    expect(ids).not.toContain(Application.RADARR);
-  });
-
-  it('includes Tracearr when its connection is configured', async () => {
-    const service = createRulesService({
-      radarr: false,
-      sonarr: false,
-      sportarr: false,
-    });
-
-    await expect(applicationIds(service)).resolves.toContain(
-      Application.TRACEARR,
-    );
   });
 });

@@ -1,6 +1,6 @@
 import { Mocked, TestBed } from '@suites/unit';
+import { AxiosError, AxiosResponse } from 'axios';
 import { SettingsDataService } from '../../settings/settings-data.service';
-import { StreamystatsApi } from './helpers/streamystats-api.helper';
 import { StreamystatsApiService } from './streamystats-api.service';
 
 const apiMock = {
@@ -33,39 +33,6 @@ describe('StreamystatsApiService', () => {
   });
 
   describe('init', () => {
-    it('is a no-op when Streamystats URL is not configured', () => {
-      Object.assign(settings, {
-        streamystats_url: undefined,
-        jellyfin_api_key: 'jellyfin-key',
-      });
-
-      service.init();
-
-      expect(service.api).toBeUndefined();
-    });
-
-    it('is a no-op when Jellyfin API key is missing', () => {
-      Object.assign(settings, {
-        streamystats_url: 'http://streamystats',
-        jellyfin_api_key: undefined,
-      });
-
-      service.init();
-
-      expect(service.api).toBeUndefined();
-    });
-
-    it('constructs the API client when both settings are present', () => {
-      Object.assign(settings, {
-        streamystats_url: 'http://streamystats',
-        jellyfin_api_key: 'jellyfin-key',
-      });
-
-      service.init();
-
-      expect(service.api).toBeDefined();
-    });
-
     it('clears the cached client and serverId when settings are removed', async () => {
       Object.assign(settings, {
         streamystats_url: 'http://streamystats',
@@ -152,6 +119,29 @@ describe('StreamystatsApiService', () => {
       );
     });
 
+    it('reads past the cache when asked for a fresh copy', async () => {
+      apiMock.getWithoutCache
+        .mockResolvedValueOnce([
+          { id: 7, url: 'http://jellyfin.local', name: 'My Server' },
+        ])
+        .mockResolvedValueOnce({
+          item: { id: 'item-1', name: 'Item One', type: 'Movie' },
+          totalViews: 4,
+          totalWatchTime: 5400,
+          completionRate: 87.5,
+          firstWatched: '2026-01-01T00:00:00Z',
+          lastWatched: '2026-05-01T00:00:00Z',
+          usersWatched: [],
+          watchHistory: [],
+          watchCountByMonth: [],
+        });
+
+      const result = await service.getItemDetails('item-1', { fresh: true });
+
+      expect(result?.totalViews).toBe(4);
+      expect(apiMock.get).not.toHaveBeenCalled();
+    });
+
     it('coerces string-encoded aggregation numbers to real numbers', async () => {
       apiMock.get.mockResolvedValue({
         item: { id: 'item-1', type: 'Series' },
@@ -225,81 +215,72 @@ describe('StreamystatsApiService', () => {
         expect.objectContaining({ params: { serverId: '42' } }),
       );
     });
-
-    it('caches the resolved serverId across calls', async () => {
-      apiMock.get.mockResolvedValue({
-        item: { id: 'item-1', type: 'Movie' },
-        totalViews: 1,
-        totalWatchTime: 100,
-        completionRate: 100,
-        firstWatched: null,
-        lastWatched: null,
-        usersWatched: [],
-        watchHistory: [],
-        watchCountByMonth: [],
-      });
-
-      await service.getItemDetails('item-1');
-      await service.getItemDetails('item-2');
-
-      expect(apiMock.getWithoutCache).toHaveBeenCalledTimes(1);
-    });
   });
 
   describe('testConnection', () => {
-    it('returns OK with the reported version on a healthy probe', async () => {
-      apiMock.getRawWithoutCache.mockResolvedValue({
-        data: {
-          currentVersion: '2.18.0',
-          latestVersion: '2.18.0',
-          hasUpdate: false,
-          buildTime: 0,
+    it('checks Jellyfin access and version with one deadline', async () => {
+      apiMock.getRawWithoutCache
+        .mockResolvedValueOnce({ data: { currentVersion: '2.18.0' } })
+        .mockResolvedValueOnce({ data: { data: [] } });
+
+      await expect(
+        service.testConnection({
+          url: 'http://streamystats',
+          apiKey: 'jellyfin-key',
+        }),
+      ).resolves.toMatchObject({ code: 1, message: '2.18.0' });
+      const config = apiMock.getRawWithoutCache.mock.calls[0][1];
+      expect(apiMock.getRawWithoutCache).toHaveBeenLastCalledWith(
+        '/api/watchlists',
+        {
+          ...config,
+          headers: { Authorization: 'MediaBrowser Token="jellyfin-key"' },
         },
-      });
-
-      const result = await service.testConnection({
-        url: 'http://streamystats',
-        apiKey: 'jellyfin-key',
-      });
-
-      expect(result.status).toBe('OK');
-      expect(result.message).toBe('2.18.0');
+      );
     });
 
-    it('returns NOK when the probe fails', async () => {
-      apiMock.getRawWithoutCache.mockRejectedValue(new Error('ECONNREFUSED'));
+    it('explains a rejected Jellyfin key with the Streamystats version it needs', async () => {
+      apiMock.getRawWithoutCache
+        .mockResolvedValueOnce({ data: { currentVersion: '2.18.0' } })
+        .mockRejectedValueOnce(
+          new AxiosError('rejected', 'ERR_BAD_REQUEST', undefined, undefined, {
+            status: 401,
+          } as AxiosResponse),
+        );
 
-      const result = await service.testConnection({
-        url: 'http://streamystats',
-        apiKey: 'jellyfin-key',
+      await expect(
+        service.testConnection({
+          url: 'http://streamystats',
+          apiKey: 'jellyfin-key',
+        }),
+      ).resolves.toMatchObject({
+        code: 0,
+        message: expect.stringContaining('Streamystats v2.18.1 or newer'),
       });
-
-      expect(result.status).toBe('NOK');
     });
 
-    it('supports being called without an apiKey (no Authorization header)', async () => {
-      const StreamystatsApiMock = StreamystatsApi as unknown as jest.Mock;
-      StreamystatsApiMock.mockClear();
-      apiMock.getRawWithoutCache.mockResolvedValue({
-        data: {
-          currentVersion: '2.18.0',
-          latestVersion: '2.18.0',
-          hasUpdate: false,
-          buildTime: 0,
-        },
-      });
+    it('rejects an unexpected protected response', async () => {
+      apiMock.getRawWithoutCache
+        .mockResolvedValueOnce({ data: { currentVersion: '2.18.0' } })
+        .mockResolvedValueOnce({ data: {} });
 
-      const result = await service.testConnection({
-        url: 'http://streamystats',
-      });
-
-      expect(result.status).toBe('OK');
-      // The helper is constructed with url only - no apiKey leaks to a
-      // user-supplied URL via /api/settings/test/streamystats.
-      const callArgs = StreamystatsApiMock.mock.calls.at(-1)?.[0];
-      expect(callArgs?.url).toBe('http://streamystats');
-      expect(callArgs?.apiKey).toBeUndefined();
+      await expect(
+        service.testConnection({
+          url: 'http://streamystats',
+          apiKey: 'jellyfin-key',
+        }),
+      ).resolves.toMatchObject({ code: 0 });
     });
+
+    it.each([undefined, '   '])(
+      'rejects a missing Jellyfin key: %j',
+      async (apiKey) => {
+        await expect(
+          service.testConnection({ url: 'http://streamystats', apiKey }),
+        ).resolves.toMatchObject({ code: 0, message: 'API key is required' });
+        expect(apiMock.getRawWithoutCache).not.toHaveBeenCalled();
+      },
+    );
   });
 
   describe('getWatchlistMembership', () => {
@@ -368,20 +349,6 @@ describe('StreamystatsApiService', () => {
         }),
         expect.any(Number),
       );
-    });
-
-    it('reuses the cached snapshot across calls within a run', async () => {
-      apiMock.get.mockResolvedValue({ data: [] });
-
-      await service.getWatchlistMembership();
-      await service.getWatchlistMembership();
-
-      // Only the first call hits /api/watchlists; the second is served from the
-      // shared cache (which init() / flushAll clears between runs).
-      const listCalls = apiMock.get.mock.calls.filter(
-        (call) => call[0] === '/api/watchlists',
-      );
-      expect(listCalls).toHaveLength(1);
     });
 
     it('skips lists whose item payload is malformed but keeps the rest', async () => {

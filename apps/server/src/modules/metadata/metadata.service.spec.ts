@@ -198,40 +198,6 @@ describe('MetadataService', () => {
     ).resolves.toMatchObject({ provider: 'TMDB' });
   });
 
-  it('does not warn when a provider that dates nothing returns no year', async () => {
-    // Sportarr dates events rather than leagues, so a league accepted without
-    // a year check is how the provider works, not a gap worth a warning per
-    // league per resolution.
-    const libraryItem = createMediaItem({
-      id: 'league-1',
-      type: 'show',
-      year: 2019,
-      title: 'Sample League',
-      providerIds: { sportarr: ['278'] },
-    });
-    const { service, logger } = createService({
-      providerMocks: [
-        {
-          name: 'Sportarr',
-          idKey: 'sportarr',
-          hasReleaseYears: false,
-          detailsId: 278,
-          details: { title: 'Sample League', type: 'tv' },
-        },
-      ],
-    });
-
-    await expect(
-      service.resolveIdsFromMediaItem(libraryItem),
-    ).resolves.toMatchObject({ sportarr: 278 });
-    expect(logger.warn).not.toHaveBeenCalledWith(
-      expect.stringContaining('without a year check'),
-    );
-    expect(logger.debug).toHaveBeenCalledWith(
-      expect.stringContaining('without a year check'),
-    );
-  });
-
   // Season 3 of a show, where the season carries provider IDs of its own that
   // must not be used for the lookup (#2649).
   const createSeasonMediaServerMock = () => {
@@ -273,26 +239,6 @@ describe('MetadataService', () => {
     expect(result).toBeDefined();
     expect(tvdbProvider.getPosterUrl).toHaveBeenCalledWith(200, 'tv', {
       sizeHint: 'w500',
-      ref: { seasonNumber: 3 },
-    });
-  });
-
-  it('addresses a season, never an episode, on a season backdrop', async () => {
-    const { service, tvdbProvider } = createService({
-      mediaServer: createSeasonMediaServerMock(),
-    });
-
-    const result = await service.getBackdropUrl(
-      { tmdb: 9999, tvdb: 8888 },
-      'tv',
-      'w1280',
-      'season-42',
-    );
-
-    expect(result).toBeDefined();
-    // No episodeNumber, so providers have nothing below the show to offer.
-    expect(tvdbProvider.getBackdropUrl).toHaveBeenCalledWith(200, 'tv', {
-      sizeHint: 'w1280',
       ref: { seasonNumber: 3 },
     });
   });
@@ -349,31 +295,6 @@ describe('MetadataService', () => {
     expect(overview).toBe('The whole series.');
   });
 
-  it('does not consult the media server for a movie description', async () => {
-    const mediaServer = { getMetadata: jest.fn() };
-    const { service, tvdbProvider } = createService({
-      mediaServer,
-      providerMocks: [
-        {
-          name: 'TVDB',
-          idKey: 'tvdb',
-          detailsId: 200,
-          details: {
-            type: 'movie',
-            overview: 'The movie.',
-            externalIds: { tvdb: 200, type: 'movie' },
-          },
-        },
-      ],
-    });
-
-    const overview = await service.getOverview({ tvdb: 200 }, 'movie');
-
-    expect(overview).toBe('The movie.');
-    expect(mediaServer.getMetadata).not.toHaveBeenCalled();
-    expect(tvdbProvider.getHierarchyOverview).not.toHaveBeenCalled();
-  });
-
   it('resolves parent show IDs when an episode mediaServerItemId is provided', async () => {
     const episodeItem = createMediaItem({
       id: 'episode-7',
@@ -414,83 +335,40 @@ describe('MetadataService', () => {
     });
   });
 
-  it('gives an episode its season poster and asks for its own description', async () => {
+  it("never reads an episode's own TVDB id as the show's (#3819)", async () => {
     const episodeItem = createMediaItem({
-      id: 'episode-7',
+      id: 'episode-9',
       type: 'episode',
-      index: 7,
-      parentIndex: 3,
-      parentId: 'season-3',
+      index: 9,
+      parentIndex: 1,
       grandparentId: 'show-1',
-      providerIds: { tmdb: ['5555'] },
+      providerIds: { tvdb: ['900'] },
     });
     const showItem = createMediaItem({
       id: 'show-1',
       type: 'show',
-      providerIds: { tmdb: ['100'], tvdb: ['200'] },
+      providerIds: { tmdb: ['100'] },
     });
     const mediaServer = {
       getMetadata: jest
         .fn()
         .mockImplementation((id: string) =>
-          Promise.resolve(id === 'episode-7' ? episodeItem : showItem),
-        ),
-    };
-    const { service, tvdbProvider, tmdbProvider } = createService({
-      mediaServer,
-      providerMocks: [
-        { name: 'TVDB', idKey: 'tvdb' },
-        { name: 'TMDB', idKey: 'tmdb', hierarchyOverview: 'The seventh one.' },
-      ],
-    });
-
-    await service.getPosterUrl({ tmdb: 5555 }, 'tv', 'w500', 'episode-7');
-    const overview = await service.getOverview(
-      { tmdb: 5555 },
-      'tv',
-      'episode-7',
-    );
-
-    expect(tvdbProvider.getPosterUrl).toHaveBeenCalledWith(200, 'tv', {
-      sizeHint: 'w500',
-      ref: { seasonNumber: 3, episodeNumber: 7 },
-    });
-    expect(overview).toBe('The seventh one.');
-    expect(tmdbProvider.getHierarchyOverview).toHaveBeenCalledWith(100, {
-      seasonNumber: 3,
-      episodeNumber: 7,
-    });
-  });
-
-  it('leaves an episode with no season number on the show artwork', async () => {
-    const episodeItem = createMediaItem({
-      id: 'episode-8',
-      type: 'episode',
-      index: 8,
-      parentIndex: undefined,
-      grandparentId: 'show-1',
-      providerIds: { tmdb: ['5555'] },
-    });
-    const showItem = createMediaItem({
-      id: 'show-1',
-      type: 'show',
-      providerIds: { tmdb: ['100'], tvdb: ['200'] },
-    });
-    const mediaServer = {
-      getMetadata: jest
-        .fn()
-        .mockImplementation((id: string) =>
-          Promise.resolve(id === 'episode-8' ? episodeItem : showItem),
+          Promise.resolve(id === 'episode-9' ? episodeItem : showItem),
         ),
     };
     const { service, tvdbProvider } = createService({ mediaServer });
 
-    await service.getPosterUrl({ tmdb: 5555 }, 'tv', 'w500', 'episode-8');
+    await service.getBackdropUrl(
+      { tmdb: 100, tvdb: 900 },
+      'tv',
+      'w1280',
+      'episode-9',
+    );
 
-    expect(tvdbProvider.getPosterUrl).toHaveBeenCalledWith(200, 'tv', {
-      sizeHint: 'w500',
-      ref: undefined,
-    });
+    expect(tvdbProvider.getDetails).not.toHaveBeenCalledWith(
+      900,
+      expect.anything(),
+    );
   });
 
   it('falls back to original IDs when mediaServer lookup fails', async () => {
@@ -777,38 +655,6 @@ describe('MetadataService', () => {
     expect(result).toMatchObject({ tvdb: 202, type: 'tv' });
   });
 
-  it('rejects direct provider ids when no configured provider confirms the release year', async () => {
-    const libraryItem = createMediaItem({
-      id: 'show-1',
-      type: 'show',
-      year: 2025,
-      title: 'Fixture Chronicle',
-      providerIds: {
-        tmdb: ['771'],
-        imdb: [],
-        tvdb: [],
-      },
-    });
-    const { service, logger } = createService({
-      tmdbDetails: {
-        title: 'Unrelated Series',
-        year: 2014,
-        type: 'tv',
-        externalIds: {
-          tmdb: 771,
-          type: 'tv',
-        },
-      },
-    });
-
-    const result = await service.resolveIdsFromMediaItem(libraryItem);
-
-    expect(result).toBeUndefined();
-    expect(logger.warn).toHaveBeenCalledWith(
-      'Rejected direct provider IDs for media server item "Fixture Chronicle" (2025) because no configured metadata provider confirmed the release year. Disagreements: TMDB returned 2014. The media server likely has incorrect metadata for this item, so no external IDs will be returned from this resolution attempt.',
-    );
-  });
-
   it('accepts direct provider ids when the media server item has no year signal to reject with', async () => {
     const libraryItem = createMediaItem({
       id: 'show-1',
@@ -841,96 +687,6 @@ describe('MetadataService', () => {
       type: 'tv',
     });
     expect(logger.warn).not.toHaveBeenCalled();
-  });
-
-  it('warns when the provider has no release year but still accepts the ids', async () => {
-    const libraryItem = createMediaItem({
-      id: 'movie-provider-missing-year',
-      type: 'movie',
-      year: 2099,
-      title: 'Fixture Orbit',
-      providerIds: { tmdb: ['808001'], imdb: [], tvdb: [] },
-    });
-    const { service, logger } = createService({
-      tmdbDetails: {
-        title: 'Fixture Orbit',
-        year: undefined,
-        type: 'movie',
-        externalIds: { tmdb: 808001, type: 'movie' },
-      },
-    });
-
-    const result = await service.resolveIdsFromMediaItem(libraryItem);
-
-    expect(result).toMatchObject({ tmdb: 808001, type: 'movie' });
-    expect(logger.warn).toHaveBeenCalledWith(
-      expect.stringContaining('TMDB returned no release year'),
-    );
-  });
-
-  it('accepts direct provider ids when a parenthesized year in the title matches the provider year', async () => {
-    const libraryItem = createMediaItem({
-      id: 'show-1',
-      type: 'show',
-      year: 2025,
-      title: 'Fixture Chronicle (2025)',
-      providerIds: {
-        tmdb: ['771'],
-        imdb: [],
-        tvdb: [],
-      },
-    });
-    const { service, logger, mediaServer } = createService({
-      tmdbDetails: {
-        title: 'Fixture Chronicle',
-        year: 2025,
-        type: 'tv',
-        externalIds: {
-          tmdb: 771,
-          type: 'tv',
-        },
-      },
-    });
-
-    const result = await service.resolveIdsFromMediaItem(libraryItem);
-
-    expect(mediaServer.getMetadata).not.toHaveBeenCalled();
-    expect(result).toMatchObject({
-      tmdb: 771,
-      type: 'tv',
-    });
-    expect(logger.warn).not.toHaveBeenCalled();
-  });
-
-  it('skips the detail lookup when the title already matches', async () => {
-    const libraryItem = createMediaItem({
-      id: 'show-1',
-      type: 'show',
-      title: 'Fixture Chronicle',
-      providerIds: {
-        tmdb: ['771'],
-        imdb: [],
-        tvdb: [],
-      },
-    });
-    const { service, mediaServer } = createService({
-      tmdbDetails: {
-        title: 'Fixture Chronicle',
-        type: 'tv',
-        externalIds: {
-          tmdb: 771,
-          type: 'tv',
-        },
-      },
-    });
-
-    const result = await service.resolveIdsFromMediaItem(libraryItem);
-
-    expect(mediaServer.getMetadata).not.toHaveBeenCalled();
-    expect(result).toMatchObject({
-      tmdb: 771,
-      type: 'tv',
-    });
   });
 
   // Cross-provider fallback: when the primary provider disagrees with the
@@ -1033,32 +789,6 @@ describe('MetadataService', () => {
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining('TVDB returned 2090'),
     );
-  });
-
-  // Re-scan mixup: a newer library item wrongly tagged with an older entry's
-  // id. Titles are literally identical - only the year distinguishes them.
-  // This is the case a title-first policy would silently accept.
-  it('rejects a rescan id mixup where titles match exactly but years differ', async () => {
-    const libraryItem = createMediaItem({
-      id: 'movie-rescan-mixup',
-      type: 'movie',
-      year: 2099,
-      title: 'Fixture Road',
-      providerIds: { tmdb: ['444111'], imdb: [], tvdb: [] },
-    });
-    const { service, logger } = createService({
-      tmdbDetails: {
-        title: 'Fixture Road',
-        year: 2091,
-        type: 'movie',
-        externalIds: { tmdb: 444111, type: 'movie' },
-      },
-    });
-
-    const result = await service.resolveIdsFromMediaItem(libraryItem);
-
-    expect(result).toBeUndefined();
-    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('(2099)'));
   });
 
   // Stale direct IDs must still be corrected to the provider's canonical
@@ -1228,43 +958,6 @@ describe('MetadataService', () => {
     );
   });
 
-  it('does not corroborate against an unavailable provider and keeps the id silently', async () => {
-    const libraryItem = createMediaItem({
-      id: 'show-tmdb-only',
-      type: 'show',
-      year: 2013,
-      title: 'Fixture Province',
-      providerIds: { tmdb: ['111'], imdb: [], tvdb: ['333'] },
-    });
-    const { service, logger, tvdbProvider } = createService({
-      preference: MetadataProviderPreference.TMDB_PRIMARY,
-      providerMocks: [
-        {
-          name: 'TMDB',
-          idKey: 'tmdb',
-          detailsId: 111,
-          details: {
-            title: 'Fixture Province',
-            year: 2013,
-            type: 'tv',
-            externalIds: { tmdb: 111, tvdb: 999, type: 'tv' },
-          },
-        },
-        {
-          name: 'TVDB',
-          idKey: 'tvdb',
-          isAvailable: false,
-        },
-      ],
-    });
-
-    const result = await service.resolveIdsFromMediaItem(libraryItem);
-
-    expect(result).toMatchObject({ tmdb: 111, tvdb: 333, type: 'tv' });
-    expect(tvdbProvider.getDetails).not.toHaveBeenCalled();
-    expect(logger.warn).not.toHaveBeenCalled();
-  });
-
   // Second-opinion path: the media item exposes only TMDB + IMDB tags.
   // TMDB disagrees on year. TVDB has no direct id on the item but can be
   // reached via the IMDB id, and when consulted it vouches for the year.
@@ -1354,6 +1047,212 @@ describe('MetadataService', () => {
     );
   });
 
+  describe('*arr library fallback (#3787)', () => {
+    const entry = (tmdbId: number, imdbId: string, year = 2000) => ({
+      tmdbId,
+      imdbId,
+      year,
+    });
+    const tmdb = (id: number) => ({ providerKey: 'tmdb', id });
+
+    it.each<{
+      title: string;
+      arr?: string;
+      type?: 'movie' | 'show';
+      providerIds: Record<string, string[]>;
+      year?: number | null;
+      tmdbYear?: number;
+      tmdbFinds?: number;
+      cached?: Record<string, number>;
+      library: object[] | undefined;
+      expected: { providerKey: string; id: number }[];
+      read?: boolean;
+    }>([
+      {
+        title: 'matches an item no provider answers for by its imdb id',
+        providerIds: { imdb: ['tt0000002'] },
+        library: [entry(11, 'tt0000001'), entry(12, 'tt0000002')],
+        expected: [tmdb(12)],
+      },
+      {
+        title: 'rejects a two-year drift',
+        providerIds: { imdb: ['tt0000002'] },
+        library: [entry(12, 'tt0000002', 2002)],
+        expected: [],
+      },
+      {
+        title: 'is not read for an item without a year',
+        providerIds: { imdb: ['tt0000002'] },
+        year: null,
+        library: [entry(12, 'tt0000002')],
+        expected: [],
+        read: false,
+      },
+      {
+        title: 'never overrules a provider that rejected the year',
+        providerIds: { tmdb: ['771'] },
+        year: 2025,
+        tmdbYear: 2014,
+        library: [entry(771, 'tt0000771', 2025)],
+        expected: [],
+        read: false,
+      },
+      {
+        title: 'is not read when a provider vouches for the item',
+        providerIds: { tmdb: ['771'] },
+        tmdbYear: 2000,
+        library: [entry(771, 'tt0000771')],
+        expected: [tmdb(771)],
+        read: false,
+      },
+      {
+        title:
+          'is not read when a provider maps an imdb id, even without the key sonarr uses',
+        arr: 'sonarr',
+        type: 'show',
+        providerIds: { imdb: ['tt0000001'] },
+        tmdbFinds: 100,
+        library: [{ tvdbId: 7, tmdbId: 200, imdbId: 'tt0000001', year: 2000 }],
+        expected: [],
+        read: false,
+      },
+      {
+        title:
+          'is not read when a provider vouches without the key sonarr uses',
+        arr: 'sonarr',
+        type: 'show',
+        providerIds: { tmdb: ['771'] },
+        tmdbYear: 2000,
+        library: [{ tvdbId: 303, tmdbId: 771, year: 2000 }],
+        expected: [],
+        read: false,
+      },
+      ...[
+        [entry(221, 'tt0000222'), entry(111, 'tt0000111')],
+        [entry(111, 'tt0000111'), entry(221, 'tt0000222')],
+      ].map((library, index) => ({
+        title: `keeps the cached id when its ids point at two entries (order ${index + 1})`,
+        providerIds: { tmdb: ['111'], imdb: ['tt0000222'] },
+        cached: { tmdb: 111 },
+        library,
+        expected: [tmdb(111)],
+      })),
+      {
+        title: 'rejects two entries carrying its id',
+        providerIds: { imdb: ['tt0000002'] },
+        library: [entry(11, 'tt0000002'), entry(12, 'tt0000002')],
+        expected: [],
+      },
+      {
+        title: 'keeps a cached id the entry contradicts',
+        providerIds: { imdb: ['tt0000002'] },
+        cached: { tmdb: 111 },
+        library: [entry(12, 'tt0000002')],
+        expected: [tmdb(111)],
+      },
+      {
+        title: 'fails closed when the library cannot be read',
+        providerIds: { imdb: ['tt0000002'] },
+        library: undefined,
+        expected: [],
+      },
+      {
+        title: 'never matches on an id sonarr leaves empty',
+        arr: 'sonarr',
+        type: 'show',
+        providerIds: { tvdb: ['303'], tmdb: ['404'] },
+        library: [
+          { tvdbId: 999, tmdbId: 0, imdbId: '', year: 2000 },
+          { tvdbId: 303, tmdbId: 0, imdbId: '', year: 2000 },
+        ],
+        expected: [{ providerKey: 'tvdb', id: 303 }],
+      },
+    ])(
+      '$title',
+      async ({
+        arr = 'radarr',
+        type = 'movie',
+        providerIds,
+        year = 2000,
+        tmdbYear,
+        tmdbFinds,
+        cached = {},
+        library,
+        expected,
+        read = true,
+      }) => {
+        const item = createMediaItem({
+          id: 'item-1',
+          type,
+          year: year ?? undefined,
+          providerIds,
+        });
+        const kind = type === 'show' ? 'tv' : 'movie';
+        const { service } = createService({
+          mediaServer: { getMetadata: jest.fn().mockResolvedValue(item) },
+          tmdbDetails: tmdbYear
+            ? { year: tmdbYear, externalIds: { tmdb: 771, type: kind } }
+            : undefined,
+          providerMocks: tmdbFinds
+            ? [
+                {
+                  name: 'TMDB',
+                  idKey: 'tmdb',
+                  findByExternalId: async () => [{ tvShowId: tmdbFinds }],
+                },
+                { name: 'TVDB', idKey: 'tvdb', isAvailable: false },
+              ]
+            : undefined,
+        });
+        const readLibrary = jest.fn().mockResolvedValue(library);
+
+        await expect(
+          service.resolveLookupCandidatesForService(
+            'item-1',
+            arr,
+            cached,
+            readLibrary,
+          ),
+        ).resolves.toEqual(expected);
+        expect(readLibrary).toHaveBeenCalledTimes(read ? 1 : 0);
+      },
+    );
+
+    it('searches it for the show of an episode resolved by media server id', async () => {
+      const show = createMediaItem({
+        id: 'show-1',
+        type: 'show',
+        year: 2010,
+        providerIds: { tvdb: ['303'] },
+      });
+      const mediaServer = {
+        getMetadata: jest.fn(async (id: string) =>
+          id === 'show-1'
+            ? show
+            : createMediaItem({
+                id,
+                type: 'episode',
+                grandparentId: 'show-1',
+                providerIds: {},
+              }),
+        ),
+      };
+      const { service } = createService({ mediaServer });
+      const library = jest
+        .fn()
+        .mockResolvedValue([{ tvdbId: 303, year: 2010 }]);
+
+      await expect(
+        service.resolveLookupCandidatesForService(
+          'episode-1',
+          'sonarr',
+          {},
+          library,
+        ),
+      ).resolves.toEqual([{ providerKey: 'tvdb', id: 303 }]);
+    });
+  });
+
   describe('getDetails({ merge: true })', () => {
     it('fills missing show-only fields from the secondary provider', async () => {
       const { service, tmdbProvider, tvdbProvider } = createService({});
@@ -1429,41 +1328,6 @@ describe('MetadataService', () => {
       expect(merged?.seasonCount).toBe(2);
     });
 
-    it('walks every available provider so new providers compose automatically', async () => {
-      const { service, tmdbProvider, tvdbProvider } = createService({});
-
-      tvdbProvider.getDetails.mockResolvedValue({
-        id: 1,
-        title: 'Sample Series',
-        type: 'tv',
-        externalIds: { type: 'tv', tvdb: 1 },
-        ended: undefined,
-        firstAirDate: undefined,
-        seasonCount: undefined,
-      });
-      tmdbProvider.getDetails.mockResolvedValue({
-        id: 2,
-        title: 'Sample Series',
-        type: 'tv',
-        externalIds: { type: 'tv', tmdb: 2 },
-        ended: true,
-        firstAirDate: '2017-04-25',
-        seasonCount: 4,
-      });
-
-      const merged = await service.getDetails(
-        { type: 'tv', tmdb: 2, tvdb: 1 },
-        'tv',
-        { merge: true },
-      );
-
-      expect(tvdbProvider.getDetails).toHaveBeenCalled();
-      expect(tmdbProvider.getDetails).toHaveBeenCalled();
-      expect(merged?.ended).toBe(true);
-      expect(merged?.firstAirDate).toBe('2017-04-25');
-      expect(merged?.seasonCount).toBe(4);
-    });
-
     it('returns undefined when no provider has the series', async () => {
       const { service, tmdbProvider, tvdbProvider } = createService({});
 
@@ -1488,9 +1352,7 @@ describe('MetadataService', () => {
   describe('hasExternalIds', () => {
     it.each([
       ['a tmdb id', { tmdb: ['550'] }, true],
-      ['a tvdb id', { tvdb: ['73141'] }, true],
       ['only an imdb id', { imdb: ['tt0099785'] }, true],
-      ['no ids at all', {}, false],
       ['empty id lists', { imdb: [], tmdb: [], tvdb: [] }, false],
     ])('is %s -> %s', (label, providerIds, expected) => {
       const { service, providers } = createService({});

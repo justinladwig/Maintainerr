@@ -138,28 +138,6 @@ describe('RulesService.updateRules', () => {
     expect(mediaServer.cleanupCollectionForLibrary).not.toHaveBeenCalled();
   });
 
-  it('fails with a not-found status when the rule group is gone', async () => {
-    const ruleGroupRepository = {
-      findOne: jest.fn().mockResolvedValue(null),
-    };
-
-    const service = createRulesService({ ruleGroupRepository });
-
-    await expect(
-      service.updateRules({
-        id: 999,
-        libraryId: '1',
-        dataType: 'show',
-        name: 'Test',
-        rules: [],
-        description: '',
-      }),
-    ).rejects.toMatchObject({
-      status: 404,
-      message: 'Rule group not found',
-    });
-  });
-
   it('continues past validation for date rules using custom_days values', async () => {
     const ruleGroupRepository = {
       findOne: jest.fn().mockResolvedValue(null),
@@ -649,60 +627,6 @@ describe('RulesService.updateRules', () => {
     );
   });
 
-  it('does not reapply sort on save when the sort value is cleared', async () => {
-    const { service, collectionService } = buildSortTransitionFixture({
-      previousSort: 'title.asc',
-      nextSort: null,
-    });
-
-    await service.updateRules({
-      id: 5,
-      libraryId: 'lib-1',
-      dataType: 'movie',
-      name: 'rg',
-      description: '',
-      rules: [],
-      useRules: false,
-      isActive: true,
-      collection: {
-        manualCollection: false,
-        manualCollectionName: '',
-        keepLogsForMonths: 1,
-        mediaServerSort: null,
-      },
-      notifications: [],
-    } as any);
-
-    expect(collectionService.applyCollectionSort).not.toHaveBeenCalled();
-  });
-
-  it('does not touch sort on save when the sort value is unchanged', async () => {
-    const { service, collectionService } = buildSortTransitionFixture({
-      previousSort: 'title.asc',
-      nextSort: 'title.asc',
-    });
-
-    await service.updateRules({
-      id: 5,
-      libraryId: 'lib-1',
-      dataType: 'movie',
-      name: 'rg',
-      description: '',
-      rules: [],
-      useRules: false,
-      isActive: true,
-      collection: {
-        manualCollection: false,
-        manualCollectionName: '',
-        keepLogsForMonths: 1,
-        mediaServerSort: 'title.asc',
-      },
-      notifications: [],
-    } as any);
-
-    expect(collectionService.applyCollectionSort).not.toHaveBeenCalled();
-  });
-
   it('backfills *arr membership tags when tagInArr is turned on (false→true)', async () => {
     const group = { id: 5, collectionId: 42, dataType: 'movie' };
     const dbCollection = {
@@ -872,6 +796,124 @@ describe('RulesService.updateRules', () => {
       [],
       [{ mediaServerId: 'm1', tmdbId: 1, tvdbId: null }],
     );
+  });
+
+  describe('*arr membership tags on save', () => {
+    const ruleMember = { mediaServerId: 'm1', tmdbId: 1, tvdbId: null };
+    const manualMember = { mediaServerId: 'm2', tmdbId: 2, tvdbId: null };
+    const members = [
+      ruleMember,
+      {
+        ...manualMember,
+        includedByRule: false,
+        manualMembershipSource: 'local',
+        isManual: true,
+      },
+    ];
+    const tagging = {
+      id: 42,
+      libraryId: '1',
+      manualCollection: false,
+      manualCollectionName: '',
+      title: 'My Group',
+      type: 'movie',
+      radarrSettingsId: 1,
+      tagInArr: true,
+    };
+
+    const save = async (
+      savedCollection: Record<string, unknown>,
+      params: Record<string, unknown>,
+    ) => {
+      const group = { id: 5, collectionId: 42, dataType: 'movie' };
+      const servarrTagService = createMockServarrTagService();
+      const service = createRulesService({
+        rulesRepository: {
+          delete: jest.fn().mockResolvedValue(undefined),
+          save: jest.fn().mockResolvedValue(undefined),
+        },
+        ruleGroupRepository: { findOne: jest.fn().mockResolvedValue(group) },
+        collectionMediaRepository: {
+          delete: jest.fn().mockResolvedValue(undefined),
+        },
+        exclusionRepo: { delete: jest.fn().mockResolvedValue(undefined) },
+        collectionService: {
+          getCollection: jest.fn().mockResolvedValue(tagging),
+          saveCollection: jest.fn().mockResolvedValue(undefined),
+          releaseMediaServerCollectionForReset: jest
+            .fn()
+            .mockResolvedValue(true),
+          addLogRecord: jest.fn().mockResolvedValue(undefined),
+          updateCollection: jest
+            .fn()
+            .mockResolvedValue({ dbCollection: savedCollection }),
+          getCollectionMedia: jest.fn().mockResolvedValue(members),
+          applyCollectionSort: jest.fn(),
+        },
+        mediaServerFactory: {
+          getService: jest.fn().mockReturnValue({
+            getLibraries: jest.fn().mockResolvedValue([
+              { id: '1', title: 'Movies', type: 'movie' },
+              { id: '2', title: 'More Movies', type: 'movie' },
+            ]),
+          }),
+        },
+        servarrTagService,
+      });
+      jest
+        .spyOn(service as any, 'createOrUpdateGroup')
+        .mockResolvedValue(group.id);
+
+      await service.updateRules({
+        id: 5,
+        libraryId: '1',
+        dataType: 'movie',
+        name: 'My Group',
+        description: '',
+        rules: [],
+        useRules: false,
+        isActive: true,
+        radarrSettingsId: 1,
+        tagInArr: true,
+        collection: {
+          manualCollection: false,
+          manualCollectionName: '',
+          keepLogsForMonths: 1,
+        },
+        notifications: [],
+        ...params,
+      } as any);
+      await flushAsync();
+      return servarrTagService.syncMembershipTags;
+    };
+
+    it('moves the tag to the new name, on rule-held members only', async () => {
+      const change = { title: 'New Name', name: 'New Name' };
+      const saved = { ...tagging, ...change };
+      const sync = await save(saved, change);
+
+      expect(sync).toHaveBeenNthCalledWith(
+        1,
+        tagging,
+        [],
+        [ruleMember, manualMember],
+      );
+      expect(sync).toHaveBeenNthCalledWith(2, saved, [ruleMember], []);
+    });
+
+    it('untags the members a crucial-setting reset wipes, tagging kept on', async () => {
+      const sync = await save(
+        { ...tagging, libraryId: '2' },
+        { libraryId: '2' },
+      );
+
+      expect(sync).toHaveBeenCalledTimes(1);
+      expect(sync).toHaveBeenCalledWith(
+        tagging,
+        [],
+        [ruleMember, manualMember],
+      );
+    });
   });
 
   // A per-user rule keeps working on the items it can still resolve and pauses

@@ -21,6 +21,7 @@ export interface ICollection {
   listExclusions?: boolean
   cleanupLeftoverFolders?: boolean
   forceSeerr?: boolean
+  forceOmbi?: boolean
   type: MediaItemType
   arrAction: number
   media: ICollectionMedia[]

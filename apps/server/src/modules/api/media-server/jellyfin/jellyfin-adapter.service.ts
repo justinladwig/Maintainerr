@@ -47,8 +47,16 @@ import { Injectable } from '@nestjs/common';
 // while this server compiles to CommonJS and gets axios's CJS build - two
 // module instances, two error classes, so an instanceof check against the
 // imported class silently never matches an SDK failure.
-import { isAxiosError } from 'axios';
-import { formatConnectionFailureMessage } from '../../../../utils/connection-error';
+import {
+  isAxiosError,
+  type AxiosInstance,
+  type AxiosRequestConfig,
+} from 'axios';
+import { assertApiKey, connectionTestConfig } from '../../lib/connectionTest';
+import {
+  formatConnectionFailureMessage,
+  logConnectionTestError,
+} from '../../../../utils/connection-error';
 import { delay } from '../../../../utils/delay';
 import { MaintainerrLogger } from '../../../logging/logs.service';
 import { SettingsDataService } from '../../../settings/settings-data.service';
@@ -89,10 +97,14 @@ import { readMetadataInBatches } from '../metadata-batch.util';
 import { JellyfinMapper } from './jellyfin.mapper';
 import type { JellyfinWatchSnapshot } from './jellyfin.types';
 
+const retryingSdkInstances = new WeakSet<object>();
+
 const toJellyfinSortBy = (sort?: MediaLibrarySortField): ItemSortBy => {
   switch (sort) {
     case 'airDate':
       return ItemSortBy.PremiereDate;
+    case 'addedAt':
+      return ItemSortBy.DateCreated;
     case 'rating':
       return ItemSortBy.CommunityRating;
     case 'watchCount':
@@ -190,8 +202,15 @@ export class JellyfinAdapterService implements IMediaServerService {
 
     // Retry transient failures with exponential backoff, like every other
     // outbound client (e.g. so a momentary blip doesn't surface as a null
-    // active-sessions lookup that would defer deletions).
-    applyHttpRetry(api.axiosInstance);
+    // active-sessions lookup that would defer deletions). The SDK hands every
+    // client its one module-wide axios instance, so the policy goes on once
+    // rather than stacking another interceptor per client.
+    if (!retryingSdkInstances.has(api.axiosInstance)) {
+      // Typed by axios's ESM declarations (see the axios import), which no
+      // longer match the CJS ones since axios 1.19 (axios/axios#11151).
+      applyHttpRetry(api.axiosInstance as AxiosInstance);
+      retryingSdkInstances.add(api.axiosInstance);
+    }
 
     return api;
   }
@@ -199,7 +218,11 @@ export class JellyfinAdapterService implements IMediaServerService {
   /**
    * Verify connection to a Jellyfin server and return server info.
    */
-  private async verifyConnection(api: Api): Promise<{
+  private async verifyConnection(
+    api: Api,
+    apiKey: string,
+    config?: AxiosRequestConfig,
+  ): Promise<{
     success: boolean;
     serverName?: string;
     version?: string;
@@ -208,26 +231,12 @@ export class JellyfinAdapterService implements IMediaServerService {
     users?: Array<{ id: string; name: string }>;
   }> {
     try {
-      // First get public system info to check if server is reachable
-      const systemInfo = await getSystemApi(api).getPublicSystemInfo();
-
-      // Then verify API key by calling an authenticated endpoint
-      let users: Array<{ id: string; name: string }> = [];
-      try {
-        const usersResponse = await getUserApi(api).getUsers();
-        users = (usersResponse.data || [])
-          .filter((u) => u.Policy?.IsAdministrator)
-          .map((u) => ({
-            id: u.Id || '',
-            name: u.Name || '',
-          }));
-      } catch (authError) {
-        return {
-          success: false,
-          error: 'Invalid API key',
-          cause: authError,
-        };
-      }
+      assertApiKey(apiKey);
+      const systemInfo = await getSystemApi(api).getPublicSystemInfo(config);
+      const usersResponse = await getUserApi(api).getUsers({}, config);
+      const users = (usersResponse.data || [])
+        .filter((u) => u.Policy?.IsAdministrator)
+        .map((u) => ({ id: u.Id || '', name: u.Name || '' }));
 
       return {
         success: true,
@@ -264,7 +273,7 @@ export class JellyfinAdapterService implements IMediaServerService {
       settings.clientId || 'default',
     );
 
-    const result = await this.verifyConnection(api);
+    const result = await this.verifyConnection(api, settings.jellyfin_api_key);
 
     if (!result.success) {
       this.initialized = false;
@@ -301,6 +310,7 @@ export class JellyfinAdapterService implements IMediaServerService {
   async testConnection(
     url: string,
     apiKey: string,
+    timeoutMs?: number,
   ): Promise<{
     success: boolean;
     serverName?: string;
@@ -309,15 +319,22 @@ export class JellyfinAdapterService implements IMediaServerService {
     users?: Array<{ id: string; name: string }>;
   }> {
     const api = this.createApiClient(url, apiKey, 'test');
-    const result = await this.verifyConnection(api);
+    const result = await this.verifyConnection(
+      api,
+      apiKey,
+      connectionTestConfig(timeoutMs),
+    );
 
     if (result.success) {
       this.logger.debug(
         `Jellyfin connection test successful: ${result.serverName} (${result.version})`,
       );
     } else {
-      this.logger.error('Jellyfin connection test failed');
-      this.logger.debug(result.cause ?? result.error);
+      logConnectionTestError(
+        this.logger,
+        'Jellyfin',
+        result.cause ?? result.error,
+      );
     }
 
     return result;

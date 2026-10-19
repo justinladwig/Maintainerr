@@ -1,18 +1,27 @@
 import { MediaItemType, normalizeArrTagLabel } from '@maintainerr/contracts';
 import { Injectable } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { In, Repository } from 'typeorm';
 import { RadarrApi } from '../api/servarr-api/helpers/radarr.helper';
 import { SonarrApi } from '../api/servarr-api/helpers/sonarr.helper';
 import { ServarrService } from '../api/servarr-api/servarr.service';
 import { Collection } from '../collections/entities/collection.entities';
+import { CollectionMedia } from '../collections/entities/collection_media.entities';
 import { MaintainerrLogger } from '../logging/logs.service';
+import { ArrLibrary } from '../metadata/interfaces/metadata-lookup-policy.interface';
 import {
   findMetadataLookupMatch,
   MetadataLookupCandidate,
 } from '../metadata/metadata-lookup.util';
 import { MetadataService } from '../metadata/metadata.service';
+import { Exclusion } from '../rules/entities/exclusion.entities';
+import { ArrLookupCache } from '../rules/helpers/arr-lookup-cache';
+import { RadarrSettings } from '../settings/entities/radarr_settings.entities';
+import { SonarrSettings } from '../settings/entities/sonarr_settings.entities';
 import { SettingsDataService } from '../settings/settings-data.service';
 
 type ArrService = 'radarr' | 'sonarr';
+type ArrServer = RadarrSettings | SonarrSettings;
 
 interface ArrInstanceRef {
   radarrSettingsId?: number | null;
@@ -40,6 +49,8 @@ const RESOLVE_CONCURRENCY = 5;
 // The *arr editor accepts a single batch, but cap the id list per request so a
 // huge membership change can't build an unbounded body.
 const EDITOR_BATCH_SIZE = 100;
+// Ids per repository lookup, under SQLite's bound-parameter cap.
+const ID_LOOKUP_CHUNK = 500;
 
 /**
  * Applies/removes Radarr & Sonarr tags as a side effect of Maintainerr state -
@@ -47,12 +58,18 @@ const EDITOR_BATCH_SIZE = 100;
  *
  * - **Membership (Behavior A):** while a `tagInArr` collection holds an item, the
  *   matching *arr entity carries a tag whose label is the collection / rule group
- *   name. Driven from the rule executor's per-run membership deltas.
+ *   name. Adds come from the rule executor's per-run delta; removals from
+ *   `CollectionsService.removeFromCollectionInternal`, which every leave passes
+ *   through (rule run, exclusion, handling action, manual and global removal),
+ *   and from the paths that drop rows wholesale (deactivation, stale cleanup,
+ *   a crucial-setting reset). A save that turns tagging on or off, renames the
+ *   group or switches its *arr server moves the tag.
  * - **Exclusion (Behavior B,
  *   https://features.maintainerr.info/posts/81):** when an item is excluded, the
  *   matching *arr entity gets a protective tag (default "dnd"); removal on
- *   un-exclude is opt-in. A collection exclusion targets that collection's
- *   instance, a global one every configured instance that tracks the item.
+ *   un-exclude is opt-in. Both are set per server. A collection exclusion
+ *   targets that collection's server, a global one every configured server that
+ *   tracks the item.
  *
  * Everything here is strictly best-effort: it logs and swallows failures, never
  * throws, never mutates collection membership, and resolves items with the #3125
@@ -62,14 +79,13 @@ const EDITOR_BATCH_SIZE = 100;
  * v1 is gated to movie (Radarr) and show (Sonarr) - Sonarr has no per-season tag,
  * so season/episode collections are skipped with a debug log.
  *
- * Known edge cases (v1 behaviour):
- * - **Rename:** the membership tag is the *current* rule group name, so renaming a
- *   group leaves the old (renamed-from) tag orphaned on the *arr items until they
- *   churn or the user clears it; the new name is applied on the next membership
- *   change. Re-tagging the whole collection on rename is deferred.
- * - **Two groups sharing a name** share one tag (labels are case-insensitive);
- *   untagging from one can strip a tag the other still wants, but the other group
- *   re-adds it on its next run.
+ * Known edge cases:
+ * - **Manual-only members** are not tagged; only rule-held ones are.
+ * - **Two groups sharing a name** on one server share one tag (labels are
+ *   case-insensitive); a leave from one keeps it on items the other still holds
+ *   (`withoutStillHeld`).
+ * - **A group named like the exclusion label** shares the protective tag; a
+ *   removal keeps it on items that are still excluded (`withoutExcluded`).
  * - **Stale id in an editor batch** (an item deleted from *arr between resolve and
  *   write) can't error the run: `resolveArrId` already drops not-tracked items
  *   (null), and `writeTags` goes through the best-effort `runPut` (returns false,
@@ -81,6 +97,12 @@ export class ServarrTagService {
     private readonly servarrService: ServarrService,
     private readonly metadataService: MetadataService,
     private readonly settings: SettingsDataService,
+    @InjectRepository(Exclusion)
+    private readonly exclusionRepo: Repository<Exclusion>,
+    @InjectRepository(Collection)
+    private readonly collectionRepo: Repository<Collection>,
+    @InjectRepository(CollectionMedia)
+    private readonly collectionMediaRepo: Repository<CollectionMedia>,
     private readonly logger: MaintainerrLogger,
   ) {
     logger.setContext(ServarrTagService.name);
@@ -88,15 +110,16 @@ export class ServarrTagService {
 
   /**
    * Behavior A - reconcile *arr tags for the items that just entered/left a
-   * collection this run. `added`/`removed` are the executor's rule-scope deltas
-   * (manual / co-owned members are already excluded from `removed`), each
-   * carrying the item's cached provider ids. The tag label is the collection
-   * title (== rule group name).
+   * collection. `added` is the executor's per-run delta, `removed` the rows a
+   * removal deleted (a co-owned row that only lost its rule membership stays
+   * and is not in it), each carrying the item's cached provider ids. The tag
+   * label is the collection title (== rule group name).
    */
   public async syncMembershipTags(
     collection: Collection,
     added: ArrTagItem[],
     removed: ArrTagItem[],
+    libraryReads?: ArrLookupCache,
   ): Promise<void> {
     try {
       if (!collection?.tagInArr) {
@@ -140,17 +163,36 @@ export class ServarrTagService {
         );
         return;
       }
-      const tagId = await client.ensureTag(label);
+      // Created only when there is something to add: a removal-only sync on an
+      // instance without the label has nothing to strip.
+      const tagId =
+        added.length > 0
+          ? await client.ensureTag(label)
+          : await this.findTagId(client, label);
       if (tagId === undefined) {
-        this.logger.warn(
-          `Couldn't ensure ${service} tag '${label}'; skipping tag sync for '${collection.title}'.`,
-        );
+        if (added.length > 0) {
+          this.logger.warn(
+            `Couldn't ensure ${service} tag '${label}'; skipping tag sync for '${collection.title}'.`,
+          );
+        }
         return;
       }
 
+      const library = this.libraryOf(client, service, settingsId, libraryReads);
       const [addIds, removeIds] = await Promise.all([
-        this.resolveArrIds(client, service, added),
-        this.resolveArrIds(client, service, removed),
+        this.resolveArrIds(client, service, added, library),
+        this.resolveArrIds(
+          client,
+          service,
+          await this.withoutExcluded(
+            (await this.servers(service)).find(
+              (server) => server.id === settingsId,
+            ),
+            label,
+            await this.withoutStillHeld(collection, settingsId, label, removed),
+          ),
+          library,
+        ),
       ]);
 
       const tagged = await this.writeTags(
@@ -181,100 +223,71 @@ export class ServarrTagService {
     }
   }
 
-  /**
-   * Per-service exclusion-tag settings. Radarr and Sonarr are configured
-   * independently; only the apply/remove logic below is shared.
-   */
-  private serviceSettings(service: ArrService): {
-    enabled: boolean;
-    label: string;
-    untag: boolean;
-  } {
-    return service === 'radarr'
-      ? {
-          enabled: this.settings.radarr_tag_exclusions,
-          label: this.settings.radarr_exclusion_tag,
-          untag: this.settings.radarr_untag_on_unexclude,
-        }
-      : {
-          enabled: this.settings.sonarr_tag_exclusions,
-          label: this.settings.sonarr_exclusion_tag,
-          untag: this.settings.sonarr_untag_on_unexclude,
-        };
+  /** Every configured server of the service, with its exclusion-tag settings. */
+  private async servers(service: ArrService): Promise<ArrServer[]> {
+    const configured =
+      service === 'radarr'
+        ? await this.settings.getRadarrSettings()
+        : await this.settings.getSonarrSettings();
+    // The getters answer with an error DTO instead of throwing.
+    return Array.isArray(configured) ? configured : [];
   }
 
-  /** True if either *arr has exclusion tagging on - lets callers skip the
-   * collection lookup entirely when both are off. */
-  public anyExclusionTaggingEnabled(): boolean {
-    return (
-      this.settings.radarr_tag_exclusions || this.settings.sonarr_tag_exclusions
+  /** True if any Radarr or Sonarr server tags exclusions - lets callers skip
+   * the collection lookup entirely when none does. */
+  public async anyExclusionTaggingEnabled(): Promise<boolean> {
+    const all = [
+      ...(await this.servers('radarr')),
+      ...(await this.servers('sonarr')),
+    ];
+    return all.some((server) => server.tagExclusions);
+  }
+
+  /** True if any server has the opt-in un-exclude removal on. */
+  public async anyExclusionUntaggingEnabled(): Promise<boolean> {
+    const all = [
+      ...(await this.servers('radarr')),
+      ...(await this.servers('sonarr')),
+    ];
+    return all.some(
+      (server) => server.tagExclusions && server.untagOnUnexclude,
     );
-  }
-
-  /** True if either *arr has opt-in un-exclude removal on. */
-  public anyExclusionUntaggingEnabled(): boolean {
-    return (
-      (this.settings.radarr_tag_exclusions &&
-        this.settings.radarr_untag_on_unexclude) ||
-      (this.settings.sonarr_tag_exclusions &&
-        this.settings.sonarr_untag_on_unexclude)
-    );
-  }
-
-  /** Cheap gate (by item type) so callers can skip the collection lookup. */
-  public exclusionTaggingEnabled(type: MediaItemType | undefined): boolean {
-    const service = this.serviceForType(type);
-    return service ? this.serviceSettings(service).enabled : false;
-  }
-
-  /** Cheap gate (by item type) for the opt-in un-exclude removal. */
-  public exclusionUntaggingEnabled(type: MediaItemType | undefined): boolean {
-    const service = this.serviceForType(type);
-    if (!service) {
-      return false;
-    }
-    const s = this.serviceSettings(service);
-    return s.enabled && s.untag;
   }
 
   /**
    * Behavior B - apply the protective exclusion tag to the excluded item's *arr
-   * entity. No-ops unless exclusion tagging is enabled. `instance` scopes a
-   * collection exclusion to its rule group's instance; omitting it (a global
-   * exclusion) covers every configured instance. Adding on exclude is
-   * unconditional when enabled.
+   * entity, on each server that tags exclusions. `instance` scopes a collection
+   * exclusion to its rule group's server; omitting it (a global exclusion)
+   * covers every configured server.
    */
   public async applyExclusionTag(
     target: ExclusionTagTarget,
     instance?: ArrInstanceRef,
+    libraryReads?: ArrLookupCache,
   ): Promise<void> {
-    if (!this.exclusionTaggingEnabled(target.type)) {
-      return;
-    }
-    await this.tagExclusionTarget(target, instance, 'add');
+    await this.tagExclusionTarget(target, instance, 'add', libraryReads);
   }
 
   /**
    * Behavior B - remove the protective exclusion tag on un-exclude. This is
-   * conservative on purpose (Zipties' "second dnd source" pain): it only runs
-   * when the user opts in via `<service>_untag_on_unexclude`, and even then only
-   * ever touches the configured label - never the user's other tags. With the
-   * default (opt-in OFF) a manually-set "dnd" is never stripped by Maintainerr.
+   * conservative on purpose (Zipties' "second dnd source" pain): it only runs on
+   * a server whose `untagOnUnexclude` the user turned on, and even then only
+   * ever touches that server's label - never the user's other tags. With the
+   * default (off) a manually-set "dnd" is never stripped by Maintainerr.
    */
   public async removeExclusionTag(
     target: ExclusionTagTarget,
     instance?: ArrInstanceRef,
+    libraryReads?: ArrLookupCache,
   ): Promise<void> {
-    if (!this.exclusionUntaggingEnabled(target.type)) {
-      return;
-    }
-    await this.tagExclusionTarget(target, instance, 'remove');
+    await this.tagExclusionTarget(target, instance, 'remove', libraryReads);
   }
 
   private async tagExclusionTarget(
     target: ExclusionTagTarget,
     instance: ArrInstanceRef | undefined,
     mode: 'add' | 'remove',
+    libraryReads?: ArrLookupCache,
   ): Promise<void> {
     try {
       const service = this.serviceForType(target.type);
@@ -285,27 +298,27 @@ export class ServarrTagService {
         return;
       }
 
-      const label = normalizeArrTagLabel(
-        this.serviceSettings(service).label ?? '',
-      );
-      if (!label) {
-        this.logger.debug(
-          `Skipping ${service} exclusion tagging: no usable exclusion tag label configured.`,
-        );
-        return;
-      }
-
-      const instances = await this.exclusionInstances(service, instance);
+      const instances = (await this.exclusionInstances(service, instance))
+        .filter(
+          (server) =>
+            server.tagExclusions && (mode === 'add' || server.untagOnUnexclude),
+        )
+        .map((server) => ({
+          ...server,
+          label: normalizeArrTagLabel(server.exclusionTag ?? ''),
+        }))
+        .filter((server) => server.label !== '');
       if (instances.length === 0) {
         this.logger.debug(
-          `Skipping *arr exclusion tagging for item ${target.mediaServerId}: no ${service} instance associated with the exclusion.`,
+          `Skipping *arr exclusion tag ${mode} for item ${target.mediaServerId}: no ${service} server for this exclusion has it turned on.`,
         );
         return;
       }
 
-      // Resolved once and reused: the candidate ids describe the item, not the
-      // instance, so a fan-out must not re-read its metadata per instance.
-      const candidates = await this.lookupCandidates(target, service);
+      // Provider ids describe the item, so one resolution serves every
+      // instance. An id read out of an instance's library names that
+      // instance's entry only, so that lookup runs per instance.
+      const shared = await this.lookupCandidates(target, service);
 
       const tagged: string[] = [];
       let matched = false;
@@ -315,6 +328,14 @@ export class ServarrTagService {
           continue;
         }
 
+        const candidates =
+          shared.length > 0
+            ? shared
+            : await this.lookupCandidates(
+                target,
+                service,
+                this.libraryOf(client, service, settings.id, libraryReads),
+              );
         const arrId = await this.matchArrId(client, service, candidates);
         if (arrId == null) {
           // undefined = transient (retried on the next exclude/un-exclude),
@@ -329,25 +350,25 @@ export class ServarrTagService {
         // label up instead: an instance without it has nothing to strip.
         const tagId =
           mode === 'add'
-            ? await client.ensureTag(label)
-            : await this.findTagId(client, label);
+            ? await client.ensureTag(settings.label)
+            : await this.findTagId(client, settings.label);
         if (tagId === undefined) {
           if (mode === 'add') {
             this.logger.warn(
-              `Couldn't ensure ${service} tag '${label}' on '${settings.serverName}'; skipping exclusion add for item ${target.mediaServerId}.`,
+              `Couldn't ensure ${service} tag '${settings.label}' on '${settings.serverName}'; skipping exclusion add for item ${target.mediaServerId}.`,
             );
           }
           continue;
         }
 
         if ((await this.writeTags(client, service, [arrId], tagId, mode)) > 0) {
-          tagged.push(settings.serverName);
+          tagged.push(`'${settings.label}' on ${settings.serverName}`);
         }
       }
 
       if (tagged.length > 0) {
         this.logger.log(
-          `${mode === 'add' ? 'Applied' : 'Removed'} ${service} exclusion tag '${label}' ${mode === 'add' ? 'to' : 'from'} item ${target.mediaServerId} on ${tagged.join(', ')}.`,
+          `${mode === 'add' ? 'Applied' : 'Removed'} ${service} exclusion tag ${tagged.join(', ')} ${mode === 'add' ? 'to' : 'from'} item ${target.mediaServerId}.`,
         );
       } else if (!matched) {
         // The write failing is already reported by the *arr client, so only the
@@ -370,27 +391,109 @@ export class ServarrTagService {
     label: string,
   ): Promise<number | undefined> {
     const target = label.toLowerCase();
-    return (await client.getTags()).find(
+    return (await client.getTags())?.find(
       (tag) => tag.label?.toLowerCase() === target,
     )?.id;
   }
 
   /**
-   * The instances an exclusion tags: the one its collection is bound to, or -
+   * Groups whose names normalize to one label share its tag on a server, so a
+   * leave from one keeps it on items another of them still holds.
+   */
+  private async withoutStillHeld(
+    collection: Collection,
+    settingsId: number,
+    label: string,
+    removed: ArrTagItem[],
+  ): Promise<ArrTagItem[]> {
+    if (removed.length === 0) {
+      return removed;
+    }
+
+    const siblingIds = (
+      await this.collectionRepo.find({
+        select: { id: true, title: true },
+        where: {
+          tagInArr: true,
+          type: collection.type,
+          ...(collection.type === 'show'
+            ? { sonarrSettingsId: settingsId }
+            : { radarrSettingsId: settingsId }),
+        },
+      })
+    )
+      .filter(
+        (other) =>
+          other.id !== collection.id &&
+          normalizeArrTagLabel(other.title) === label,
+      )
+      .map((other) => other.id);
+    if (siblingIds.length === 0) {
+      return removed;
+    }
+
+    const held = new Set<string>();
+    for (const ids of this.chunk(
+      removed.map((item) => item.mediaServerId),
+      ID_LOOKUP_CHUNK,
+    )) {
+      const rows = await this.collectionMediaRepo.find({
+        select: { mediaServerId: true },
+        where: { collectionId: In(siblingIds), mediaServerId: In(ids) },
+      });
+      for (const row of rows) {
+        held.add(row.mediaServerId);
+      }
+    }
+    return removed.filter((item) => !held.has(item.mediaServerId));
+  }
+
+  /**
+   * A group name can normalize to the exclusion label of the server it tags on.
+   * An item that is still excluded needs that label as its protective tag, so a
+   * removal leaves it alone. Any exclusion counts: keeping protection is the
+   * safe side.
+   */
+  private async withoutExcluded(
+    server: ArrServer | undefined,
+    label: string,
+    removed: ArrTagItem[],
+  ): Promise<ArrTagItem[]> {
+    if (
+      removed.length === 0 ||
+      !server?.tagExclusions ||
+      normalizeArrTagLabel(server.exclusionTag ?? '') !== label
+    ) {
+      return removed;
+    }
+
+    const excluded = new Set<string>();
+    for (const ids of this.chunk(
+      removed.map((item) => item.mediaServerId),
+      ID_LOOKUP_CHUNK,
+    )) {
+      const rows = await this.exclusionRepo.find({
+        select: { mediaServerId: true },
+        where: { mediaServerId: In(ids) },
+      });
+      for (const row of rows) {
+        excluded.add(row.mediaServerId);
+      }
+    }
+    return removed.filter((item) => !excluded.has(item.mediaServerId));
+  }
+
+  /**
+   * The servers an exclusion tags: the one its collection is bound to, or -
    * for a global exclusion, which has no collection to inherit from - every
-   * configured instance of the service, so the item is tagged wherever it is
+   * configured server of the service, so the item is tagged wherever it is
    * actually tracked.
    */
   private async exclusionInstances(
     service: ArrService,
     instance: ArrInstanceRef | undefined,
-  ): Promise<{ id: number; serverName: string }[]> {
-    const configured =
-      service === 'radarr'
-        ? await this.settings.getRadarrSettings()
-        : await this.settings.getSonarrSettings();
-    // The getters answer with an error DTO instead of throwing.
-    const all = Array.isArray(configured) ? configured : [];
+  ): Promise<ArrServer[]> {
+    const all = await this.servers(service);
 
     if (!instance) {
       return all;
@@ -443,11 +546,12 @@ export class ServarrTagService {
     client: RadarrApi | SonarrApi,
     service: ArrService,
     items: ArrTagItem[],
+    library: ArrLibrary,
   ): Promise<number[]> {
     const resolved = new Set<number>();
     for (const batch of this.chunk(items, RESOLVE_CONCURRENCY)) {
       const ids = await Promise.all(
-        batch.map((item) => this.resolveArrId(client, service, item)),
+        batch.map((item) => this.resolveArrId(client, service, item, library)),
       );
       for (const id of ids) {
         if (id != null) {
@@ -471,11 +575,12 @@ export class ServarrTagService {
     client: RadarrApi | SonarrApi,
     service: ArrService,
     item: ArrTagItem,
+    library: ArrLibrary,
   ): Promise<number | null | undefined> {
     return this.matchArrId(
       client,
       service,
-      await this.lookupCandidates(item, service),
+      await this.lookupCandidates(item, service, library),
     );
   }
 
@@ -483,6 +588,7 @@ export class ServarrTagService {
   private lookupCandidates(
     item: ArrTagItem,
     service: ArrService,
+    library?: ArrLibrary,
   ): Promise<MetadataLookupCandidate[]> {
     return this.metadataService.resolveLookupCandidatesForService(
       item.mediaServerId,
@@ -491,7 +597,27 @@ export class ServarrTagService {
         ...(item.tmdbId != null ? { tmdb: item.tmdbId } : {}),
         ...(item.tvdbId != null ? { tvdb: item.tvdbId } : {}),
       },
+      library,
     );
+  }
+
+  /** Reads the instance's library once per `reads`; a failed read is retried. */
+  private libraryOf(
+    client: RadarrApi | SonarrApi,
+    service: ArrService,
+    settingsId: number,
+    reads = new ArrLookupCache(),
+  ): ArrLibrary {
+    const read: ArrLibrary = () =>
+      service === 'radarr'
+        ? (client as RadarrApi).getMovies()
+        : (client as SonarrApi).getSeries();
+    return () =>
+      reads.memoize(
+        `${service}:${settingsId}:library`,
+        read,
+        (entries) => entries === undefined,
+      );
   }
 
   /** Match resolved candidates against one instance; see `resolveArrId`. */

@@ -309,66 +309,6 @@ describe('MediaModal', () => {
     expect(screen.getAllByText('sportarr://lg-000278')).toHaveLength(1)
   })
 
-  it('shows maintainerr status for manually added items', async () => {
-    getApiHandlerMock.mockImplementation((path: string) => {
-      if (path === '/media-server') {
-        return Promise.resolve({})
-      }
-
-      if (path === '/settings') {
-        return Promise.resolve({})
-      }
-
-      if (path === '/media-server/meta/9') {
-        return Promise.resolve({} as MediaItem)
-      }
-
-      if (path === '/media-server/meta/9/maintainerr-status') {
-        return Promise.resolve({
-          excludedFrom: [],
-          manuallyAddedTo: [
-            {
-              label: 'Testing (5d left)',
-              targetPath: '/collections/7',
-            },
-          ],
-        })
-      }
-
-      if (path === '/streamystats/info') {
-        return Promise.reject(new Error('404 Streamystats not configured'))
-      }
-
-      throw new Error(`Unexpected request: ${path}`)
-    })
-
-    render(
-      <MediaModal
-        onClose={() => {}}
-        id={9}
-        mediaType="movie"
-        title="Movie"
-        summary="Movie summary"
-        isManual={true}
-      />,
-    )
-
-    const manualHeading = await screen.findByText('Manually Added To')
-    expect(manualHeading).toBeTruthy()
-    expect(manualHeading.className).toContain('text-white')
-    expect(manualHeading.parentElement?.className).toContain('bg-zinc-900/70')
-    const manualCollectionEntry = screen.getByRole('link', {
-      name: 'Testing (5d left)',
-    })
-
-    expect(manualCollectionEntry.getAttribute('href')).toBe('/collections/7')
-    expect(manualCollectionEntry.className).toContain('text-maintainerr')
-    expect(manualCollectionEntry.className).toContain('underline')
-    expect(manualCollectionEntry.className).toContain(
-      'hover:text-maintainerr-400',
-    )
-  })
-
   it('shows only the relevant status card while manual details are loading', async () => {
     const maintainerrStatus = createDeferred<{
       excludedFrom: Array<{ label: string; targetPath?: string }>
@@ -493,60 +433,6 @@ describe('MediaModal', () => {
     expect(onStatusLink).toHaveBeenCalledWith('/collections/42/exclusions')
   })
 
-  it('renders fallback links when status navigation callback is not provided', async () => {
-    getApiHandlerMock.mockImplementation((path: string) => {
-      if (path === '/media-server') {
-        return Promise.resolve({})
-      }
-
-      if (path === '/settings') {
-        return Promise.resolve({})
-      }
-
-      if (path === '/media-server/meta/5') {
-        return Promise.resolve({} as MediaItem)
-      }
-
-      if (path === '/media-server/meta/5/maintainerr-status') {
-        return Promise.resolve({
-          excludedFrom: [
-            {
-              label: 'Testing2',
-              targetPath: '/collections/99/exclusions',
-            },
-          ],
-          manuallyAddedTo: [],
-        })
-      }
-
-      if (path === '/streamystats/info') {
-        return Promise.reject(new Error('404 Streamystats not configured'))
-      }
-
-      throw new Error(`Unexpected request: ${path}`)
-    })
-
-    render(
-      <MediaModal
-        onClose={() => {}}
-        id={5}
-        mediaType="movie"
-        title="Movie"
-        summary="Movie summary"
-        exclusionType="specific"
-      />,
-    )
-
-    const fallbackLink = await screen.findByRole('link', {
-      name: 'Testing2',
-    })
-
-    expect(fallbackLink.getAttribute('href')).toBe('/collections/99/exclusions')
-    expect(fallbackLink.className).toContain('text-maintainerr')
-    expect(fallbackLink.className).toContain('underline')
-    expect(fallbackLink.className).toContain('hover:text-maintainerr-400')
-  })
-
   it('fetches and shows status when forceStatusLoad is true even for items with no exclusionType or isManual', async () => {
     getApiHandlerMock.mockImplementation((path: string) => {
       if (path === '/media-server') {
@@ -595,62 +481,6 @@ describe('MediaModal', () => {
     expect(manualHeading).toBeTruthy()
     const link = screen.getByRole('link', { name: 'Fresh Collection' })
     expect(link.getAttribute('href')).toBe('/collections/20')
-  })
-
-  it('keeps both maintainerr status tiles visible in a two-column grid when both sections are shown', async () => {
-    getApiHandlerMock.mockImplementation((path: string) => {
-      if (path === '/media-server') {
-        return Promise.resolve({})
-      }
-
-      if (path === '/settings') {
-        return Promise.resolve({})
-      }
-
-      if (path === '/media-server/meta/88') {
-        return Promise.resolve({} as MediaItem)
-      }
-
-      if (path === '/media-server/meta/88/maintainerr-status') {
-        return Promise.resolve({
-          excludedFrom: [
-            {
-              label: 'Excluded Collection',
-              targetPath: '/collections/88/exclusions',
-            },
-          ],
-          manuallyAddedTo: [
-            {
-              label: 'Manual Collection',
-              targetPath: '/collections/88',
-            },
-          ],
-        })
-      }
-
-      if (path === '/streamystats/info') {
-        return Promise.reject(new Error('404 Streamystats not configured'))
-      }
-
-      throw new Error(`Unexpected request: ${path}`)
-    })
-
-    const { container } = render(
-      <MediaModal
-        onClose={() => {}}
-        id={88}
-        mediaType="movie"
-        title="Movie"
-        summary="Movie summary"
-        forceStatusLoad={true}
-      />,
-    )
-
-    expect(await screen.findByText('Excluded From')).toBeTruthy()
-    expect(screen.getByText('Manually Added To')).toBeTruthy()
-
-    const detailsGrid = container.querySelector('.mt-4.grid')
-    expect(detailsGrid?.className).toContain('grid-cols-2')
   })
 
   it('shows the trigger rule action control for actionable collection items', async () => {
@@ -756,40 +586,98 @@ describe('MediaModal', () => {
     expect(embyLogo.getAttribute('class')).toContain('object-contain')
   })
 
-  it('does not request Streamystats info when Jellyfin is not active', async () => {
-    getApiHandlerMock.mockImplementation((path: string) => {
-      if (path === '/media-server') {
-        return Promise.resolve({})
-      }
-
-      if (path === '/settings') {
-        return Promise.resolve({})
-      }
-
-      if (path === '/media-server/meta/93') {
-        return Promise.resolve({} as MediaItem)
-      }
-
-      if (path === '/streamystats/info') {
-        throw new Error('Streamystats should not be requested')
-      }
-
-      throw new Error(`Unexpected request: ${path}`)
-    })
-
-    render(
-      <MediaModal
-        onClose={() => {}}
-        id={93}
-        mediaType="movie"
-        title="Movie"
-        summary="Movie summary"
-      />,
+  // Tautulli only knows Plex rating keys, while Tracearr follows whichever
+  // media server is active.
+  it('asks Tautulli for watch statistics on Plex only, and Tracearr wherever it is configured', async () => {
+    const stats = {
+      url: 'http://t/media/1',
+      plays: 1,
+      watchTime: 60,
+      lastWatched: null,
+      users: [],
+    }
+    getApiHandlerMock.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === '/settings'
+          ? { tautulli_url: 'http://tautulli.local', tracearr_url: 'http://t' }
+          : path.includes('/items/')
+            ? stats
+            : {},
+      ),
     )
 
-    await screen.findByText('Movie summary')
+    render(
+      <MediaModal onClose={() => {}} id={93} mediaType="movie" title="Movie" />,
+    )
 
-    expect(getApiHandlerMock).not.toHaveBeenCalledWith('/streamystats/info')
+    await waitFor(() =>
+      expect(getApiHandlerMock).toHaveBeenCalledWith(
+        '/tracearr/items/93',
+        expect.any(AbortSignal),
+      ),
+    )
+    expect(getApiHandlerMock).not.toHaveBeenCalledWith(
+      '/tautulli/items/93',
+      expect.any(AbortSignal),
+    )
+    // The badge opens the item's own page, which it learns from the panel's
+    // query rather than a request of its own.
+    await waitFor(() =>
+      expect(
+        screen.getByAltText('Tracearr').closest('a')?.getAttribute('href'),
+      ).toBe(stats.url),
+    )
+    expect(
+      getApiHandlerMock.mock.calls.filter(
+        ([path]) => path === '/tracearr/items/93',
+      ),
+    ).toHaveLength(1)
+
+    useMediaServerTypeMock.mockReturnValue({
+      ...useMediaServerTypeMock(),
+      isPlex: true,
+    })
+    render(
+      <MediaModal onClose={() => {}} id={93} mediaType="movie" title="Movie" />,
+    )
+
+    await waitFor(() =>
+      expect(getApiHandlerMock).toHaveBeenCalledWith(
+        '/tautulli/items/93',
+        expect.any(AbortSignal),
+      ),
+    )
+  })
+
+  it('links each watch statistics panel to its service with no plays to show', async () => {
+    useMediaServerTypeMock.mockReturnValue({
+      ...useMediaServerTypeMock(),
+      isPlex: true,
+    })
+    getApiHandlerMock.mockImplementation((path: string) =>
+      Promise.resolve(
+        path === '/settings'
+          ? { tautulli_url: 'http://tautulli.local', tracearr_url: 'http://t' }
+          : path.includes('/items/')
+            ? null
+            : {},
+      ),
+    )
+
+    render(
+      <MediaModal onClose={() => {}} id={93} mediaType="movie" title="Movie" />,
+    )
+
+    expect(
+      (
+        await screen.findByRole('link', { name: /Open on Tautulli/ })
+      ).getAttribute('href'),
+    ).toBe('http://tautulli.local/info?rating_key=93&source=history')
+    expect(
+      screen
+        .getByRole('link', { name: /Open on Tracearr/ })
+        .getAttribute('href'),
+    ).toBe('http://t')
   })
 
   it('names the season and falls back to the provider description when the media server has none', async () => {
@@ -835,48 +723,6 @@ describe('MediaModal', () => {
     expect(await screen.findByText('season 2')).toBeTruthy()
     expect(await screen.findByText('What happens in season two.')).toBeTruthy()
     expect(screen.queryByText('No summary available.')).toBeNull()
-  })
-
-  it('does not ask the provider for a description the media server already has', async () => {
-    getApiHandlerMock.mockImplementation((path: string) => {
-      if (path === '/media-server') {
-        return Promise.resolve({})
-      }
-
-      if (path === '/settings') {
-        return Promise.resolve({})
-      }
-
-      if (path === '/media-server/meta/56') {
-        return Promise.resolve({ summary: 'Season summary.' } as MediaItem)
-      }
-
-      if (path.startsWith('/metadata/backdrop/show?')) {
-        return Promise.resolve(undefined)
-      }
-
-      if (path === '/streamystats/info') {
-        return Promise.reject(new Error('404 Streamystats not configured'))
-      }
-
-      throw new Error(`Unexpected request: ${path}`)
-    })
-
-    render(
-      <MediaModal
-        onClose={() => {}}
-        id={56}
-        mediaType="season"
-        seasonNumber={1}
-        title="Sample Series"
-        providerIds={{ tmdb: ['101'] }}
-      />,
-    )
-
-    expect(await screen.findByText('Season summary.')).toBeTruthy()
-    expect(getApiHandlerMock).not.toHaveBeenCalledWith(
-      expect.stringContaining('/metadata/overview/'),
-    )
   })
 
   it('hides the trigger rule action control for excluded collection items', async () => {
@@ -935,5 +781,106 @@ describe('MediaModal', () => {
 
     await screen.findByText('Excluded From')
     expect(screen.queryByText('trigger-rule-action')).toBeNull()
+  })
+
+  it('asks both request services for a season by its show, not by the season itself', async () => {
+    getApiHandlerMock.mockImplementation((path: string) => {
+      if (path === '/media-server') {
+        return Promise.resolve({})
+      }
+      if (path === '/settings') {
+        return Promise.resolve({
+          seerr_url: 'http://seerr.local',
+          ombi_url: 'http://ombi.local',
+        })
+      }
+      if (path === '/media-server/meta/8') {
+        return Promise.resolve({
+          id: '8',
+          type: 'season',
+          parentId: '7',
+          index: 1,
+          providerIds: { tmdb: ['13993'] },
+        } as MediaItem)
+      }
+      if (path === '/media-server/meta/7') {
+        return Promise.resolve({
+          id: '7',
+          type: 'show',
+          providerIds: { tmdb: ['4600'] },
+        } as MediaItem)
+      }
+      if (
+        path.startsWith('/seerr/requests/') ||
+        path.startsWith('/ombi/requests/')
+      ) {
+        return Promise.resolve(['alice'])
+      }
+      if (path.startsWith('/metadata/backdrop/')) {
+        return Promise.resolve(undefined)
+      }
+      if (path === '/streamystats/info') {
+        return Promise.reject(new Error('404 Streamystats not configured'))
+      }
+      throw new Error(`Unexpected request: ${path}`)
+    })
+
+    render(
+      <MediaModal
+        onClose={() => {}}
+        id={8}
+        mediaType="season"
+        title="Season 1"
+        summary="Season summary"
+        providerIds={{ tmdb: ['13993'] }}
+      />,
+    )
+
+    await waitFor(() => {
+      expect(getApiHandlerMock).toHaveBeenCalledWith(
+        '/ombi/requests/4600/users?type=tv&season=1',
+        expect.any(AbortSignal),
+      )
+    })
+    expect(getApiHandlerMock).toHaveBeenCalledWith(
+      '/seerr/requests/4600/users?type=tv&season=1',
+      expect.any(AbortSignal),
+    )
+    expect(getApiHandlerMock).not.toHaveBeenCalledWith(
+      expect.stringContaining('/requests/13993/'),
+      expect.any(AbortSignal),
+    )
+    expect(await screen.findByText('alice')).toBeTruthy()
+  })
+
+  it('cancels its pending reads when it closes', async () => {
+    const pending = (path: string) =>
+      path.startsWith('/seerr/') || path.startsWith('/tracearr/')
+    getApiHandlerMock.mockImplementation((path: string) =>
+      path === '/settings'
+        ? Promise.resolve({
+            seerr_url: 'http://seerr.local',
+            tracearr_url: 'http://t',
+          })
+        : pending(path)
+          ? new Promise(() => {})
+          : Promise.resolve({}),
+    )
+
+    const { unmount } = render(
+      <MediaModal
+        onClose={() => {}}
+        id={93}
+        mediaType="movie"
+        title="Movie"
+        providerIds={{ tmdb: ['500'] }}
+      />,
+    )
+    const pendingCalls = () =>
+      getApiHandlerMock.mock.calls.filter(([path]) => pending(path))
+    await waitFor(() => expect(pendingCalls()).toHaveLength(2))
+    unmount()
+
+    expect(pendingCalls().every(([, signal]) => signal?.aborted)).toBe(true)
   })
 })

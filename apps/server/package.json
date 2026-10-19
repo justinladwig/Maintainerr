@@ -1,6 +1,6 @@
 {
   "name": "@maintainerr/server",
-  "version": "3.29.0",
+  "version": "3.30.2",
   "private": true,
   "scripts": {
     "dev": "nest start --watch",
@@ -11,7 +11,7 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "check-types": "tsc --noEmit -p tsconfig.json",
-    "test": "yarn test:runtime:jellyfin-sdk && jest --shard=1/3 && jest --shard=2/3 && jest --shard=3/3",
+    "test": "yarn test:runtime:jellyfin-sdk && jest",
     "test:runtime:jellyfin-sdk": "node ./test/jellyfin-sdk-runtime-smoke.cjs",
     "test:clear": "jest --clearCache",
     "test:watch": "jest --watch",
@@ -27,20 +27,20 @@
   "dependencies": {
     "@jellyfin/sdk": "^1.0.0",
     "@maintainerr/contracts": "workspace:^",
-    "@nestjs/common": "^12.0.1",
-    "@nestjs/core": "^12.0.1",
-    "@nestjs/event-emitter": "^12.0.0",
-    "@nestjs/platform-express": "^12.0.1",
-    "@nestjs/schedule": "^12.0.1",
+    "@nestjs/common": "^12.1.3",
+    "@nestjs/core": "^12.1.3",
+    "@nestjs/event-emitter": "^12.0.1",
+    "@nestjs/platform-express": "^12.1.3",
+    "@nestjs/schedule": "^12.0.2",
     "@nestjs/serve-static": "^12.0.0",
-    "@nestjs/swagger": "^12.0.1",
-    "@nestjs/typeorm": "^12.0.1",
+    "@nestjs/swagger": "^12.0.2",
+    "@nestjs/typeorm": "^12.0.2",
     "@octokit/core": "^5.2.0",
     "@octokit/plugin-throttling": "^8.2.0",
     "@tygra/nestjs-graceful-shutdown": "^2.0.0",
     "@types/compression": "^1.8.1",
     "@types/express": "^5.0.6",
-    "axios": "^1.18.1",
+    "axios": "^1.20.0",
     "axios-retry": "^4.5.0",
     "better-sqlite3": "^13.0.3",
     "canvas": "^3.2.3",
@@ -53,89 +53,46 @@
     "mime-types": "^3.0.2",
     "nestjs-zod": "^5.5.0",
     "node-cache": "^5.1.2",
-    "nodemailer": "10.0.9",
+    "nodemailer": "10.1.0",
     "octokit": "^3.2.2",
-    "openpgp": "^6.3.1",
+    "openpgp": "^6.3.2",
     "read-last-lines": "^1.10.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2",
-    "sharp": "^0.35.4",
-    "typeorm": "^1.1.1",
+    "sharp": "^0.35.5",
+    "typeorm": "^1.1.2",
     "winston": "^3.19.0",
     "winston-daily-rotate-file": "^5.0.0",
     "xml2js": "^0.6.2",
     "yaml": "^2.9.1",
-    "zod": "^4.6.2"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3.3.7",
     "@eslint/js": "^10.0.1",
     "@faker-js/faker": "^10.6.0",
-    "@nestjs/cli": "^12.0.0",
-    "@nestjs/schematics": "^12.0.1",
-    "@nestjs/testing": "^12.0.1",
+    "@nestjs/cli": "^12.0.8",
+    "@nestjs/schematics": "^12.0.7",
+    "@nestjs/testing": "^12.1.3",
     "@suites/di.nestjs": "^3.1.0",
     "@suites/doubles.jest": "^3.1.0",
     "@suites/unit": "^3.1.1",
-    "@swc/core": "^1.16.2",
+    "@swc/core": "^1.16.18",
     "@swc/jest": "^0.2.39",
     "@types/email-templates": "^10.0.4",
     "@types/jest": "^30.0.0",
-    "@types/lodash": "^4.17.25",
+    "@types/lodash": "^4.17.26",
     "@types/mime-types": "^3",
     "@types/node": "^26",
     "@types/xml2js": "^0.4.14",
-    "@typescript-eslint/eslint-plugin": "^8.70.0",
-    "@typescript-eslint/parser": "^8.70.0",
-    "eslint": "^10.10.0",
+    "@typescript-eslint/eslint-plugin": "^8.71.2",
+    "@typescript-eslint/parser": "^8.71.1",
+    "eslint": "^10.12.0",
     "eslint-config-prettier": "^10.1.8",
-    "eslint-plugin-jest": "^29.16.6",
-    "jest": "^30.5.1",
-    "prettier": "^3.9.6",
+    "eslint-plugin-jest": "^29.17.0",
+    "jest": "^30.5.2",
+    "prettier": "^3.9.10",
     "ts-node": "^10.9.2",
     "typescript": "^6.0.3"
-  },
-  "jest": {
-    "moduleFileExtensions": [
-      "js",
-      "json",
-      "ts"
-    ],
-    "rootDir": "src",
-    "testRegex": ".*\\.spec\\.ts$",
-    "transform": {
-      "^.+\\.(t|j)s$": [
-        "@swc/jest",
-        {
-          "jsc": {
-            "target": "es2022",
-            "parser": {
-              "syntax": "typescript",
-              "decorators": true
-            },
-            "transform": {
-              "legacyDecorator": true,
-              "decoratorMetadata": true
-            },
-            "keepClassNames": true
-          },
-          "module": {
-            "type": "commonjs"
-          }
-        }
-      ]
-    },
-    "transformIgnorePatterns": [
-      "node_modules/(?!(@nestjs|@octokit|octokit|bottleneck|@jellyfin/sdk|@faker-js/faker)/)",
-      "/packages/contracts/dist/"
-    ],
-    "collectCoverageFrom": [
-      "**/*.ts"
-    ],
-    "coverageDirectory": "./coverage",
-    "testEnvironment": "node",
-    "setupFilesAfterEnv": [
-      "<rootDir>/../test/jest.setup.ts"
-    ]
   }
 }

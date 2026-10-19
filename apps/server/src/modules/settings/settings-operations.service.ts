@@ -5,7 +5,10 @@ import {
   DownloadClientSetting,
   MediaServerType,
   MINIMUM_SPORTARR_VERSION,
+  OmbiSetting,
+  RadarrSetting,
   SeerrSetting,
+  SonarrSetting,
   StreamystatsSetting,
   TautulliSetting,
   TracearrConnection,
@@ -21,9 +24,11 @@ import {
   logConnectionTestError,
 } from '../../utils/connection-error';
 import { InternalApiService } from '../api/internal-api/internal-api.service';
+import { BACKGROUND_CONNECTION_TEST_TIMEOUT_MS } from '../api/lib/httpTimeouts';
 import { MediaServerFactory } from '../api/media-server/media-server.factory';
 import { DownloadClientApiService } from '../api/download-client-api/download-client-api.service';
 import { PlexApiService } from '../api/plex-api/plex-api.service';
+import { OmbiApiService } from '../api/ombi-api/ombi-api.service';
 import { SeerrApiService } from '../api/seerr-api/seerr-api.service';
 import { isBelowMinimumVersion } from '../../utils/required-version-helper';
 import { ServarrService } from '../api/servarr-api/servarr.service';
@@ -60,6 +65,7 @@ export class SettingsOperationsService {
     private readonly mediaServerFactory: MediaServerFactory,
     private readonly servarr: ServarrService,
     private readonly seerr: SeerrApiService,
+    private readonly ombi: OmbiApiService,
     private readonly tautulli: TautulliApiService,
     private readonly streamystats: StreamystatsApiService,
     private readonly tracearr: TracearrApiService,
@@ -100,6 +106,10 @@ export class SettingsOperationsService {
 
   public seerrConfigured(): boolean {
     return this.settingsDataService.seerrConfigured();
+  }
+
+  public ombiConfigured(): boolean {
+    return this.settingsDataService.ombiConfigured();
   }
 
   public tautulliConfigured(): boolean {
@@ -174,7 +184,7 @@ export class SettingsOperationsService {
   // ==========================================================================
 
   public async addRadarrSetting(
-    settings: Omit<RadarrSettings, 'id' | 'collections'>,
+    settings: RadarrSetting,
   ): Promise<RadarrSettingResponseDto> {
     try {
       settings.url = settings.url.toLowerCase();
@@ -196,7 +206,7 @@ export class SettingsOperationsService {
   }
 
   public async updateRadarrSetting(
-    settings: Omit<RadarrSettings, 'collections'>,
+    settings: RadarrSetting & { id: number },
   ): Promise<RadarrSettingResponseDto> {
     try {
       settings.url = settings.url.toLowerCase();
@@ -401,6 +411,9 @@ export class SettingsOperationsService {
           apiKey: settings.api_key,
         }));
       if (!serverId) {
+        this.logger.warn(
+          'No single Tracearr server matches the managed media server',
+        );
         return {
           status: 'NOK',
           code: 0,
@@ -415,6 +428,9 @@ export class SettingsOperationsService {
         serverId,
       );
       if (sharesLibrary === false) {
+        this.logger.warn(
+          'The chosen Tracearr server tracks a different media server',
+        );
         return {
           status: 'NOK',
           code: 0,
@@ -589,10 +605,57 @@ export class SettingsOperationsService {
     }
   }
 
+  public async removeOmbiSetting() {
+    try {
+      const settingsDb = await this.settingsRepo.findOne({ where: {} });
+
+      await this.settingsDataService.saveSettings({
+        ...settingsDb,
+        ombi_url: null,
+        ombi_api_key: null,
+      });
+
+      await this.settingsDataService.init();
+      this.ombi.init();
+
+      return { status: 'OK', code: 1, message: 'Success' };
+    } catch (error) {
+      this.logger.error('Error removing Ombi settings');
+      this.logger.debug(error);
+      return { status: 'NOK', code: 0, message: 'Failed' };
+    }
+  }
+
+  public async updateOmbiSetting(
+    settings: OmbiSetting,
+  ): Promise<BasicResponseDto> {
+    try {
+      const settingsDb = await this.settingsRepo.findOne({ where: {} });
+
+      await this.settingsDataService.saveSettings({
+        ...settingsDb,
+        ombi_url: settings.url,
+        ombi_api_key: settings.api_key,
+      });
+
+      await this.settingsDataService.init();
+      this.ombi.init();
+
+      return { status: 'OK', code: 1, message: 'Success' };
+    } catch (error) {
+      this.logger.error('Error while updating Ombi settings');
+      this.logger.debug(error);
+      return { status: 'NOK', code: 0, message: 'Failed' };
+    }
+  }
+
   /**
    * Test connection to a Jellyfin server
    */
-  public async testJellyfin(settings: JellyfinSetting): Promise<
+  public async testJellyfin(
+    settings: JellyfinSetting,
+    timeoutMs?: number,
+  ): Promise<
     BasicResponseDto & {
       serverName?: string;
       version?: string;
@@ -603,6 +666,7 @@ export class SettingsOperationsService {
       const result = await this.mediaServerFactory.testJellyfinConnection(
         settings.jellyfin_url,
         settings.jellyfin_api_key,
+        timeoutMs,
       );
 
       if (result.success) {
@@ -625,7 +689,7 @@ export class SettingsOperationsService {
         ),
       };
     } catch (error) {
-      logConnectionTestError(this.logger, 'Jellyfin');
+      logConnectionTestError(this.logger, 'Jellyfin', error);
       return {
         status: 'NOK',
         code: 0,
@@ -673,6 +737,7 @@ export class SettingsOperationsService {
       if (userId && testResult.users && testResult.users.length > 0) {
         const selectedUser = testResult.users.find((u) => u.id === userId);
         if (!selectedUser) {
+          this.logger.warn('Selected Jellyfin user is not an admin');
           return {
             status: 'NOK',
             code: 0,
@@ -758,7 +823,10 @@ export class SettingsOperationsService {
   /**
    * Test connection to an Emby server using the API-key flow.
    */
-  public async testEmby(settings: EmbySetting): Promise<
+  public async testEmby(
+    settings: EmbySetting,
+    timeoutMs?: number,
+  ): Promise<
     BasicResponseDto & {
       serverName?: string;
       version?: string;
@@ -769,6 +837,7 @@ export class SettingsOperationsService {
       const result = await this.mediaServerFactory.testEmbyConnection(
         settings.emby_url,
         settings.emby_api_key,
+        timeoutMs,
       );
 
       if (result.success) {
@@ -791,7 +860,7 @@ export class SettingsOperationsService {
         ),
       };
     } catch (error) {
-      logConnectionTestError(this.logger, 'Emby');
+      logConnectionTestError(this.logger, 'Emby', error);
       return {
         status: 'NOK',
         code: 0,
@@ -878,6 +947,7 @@ export class SettingsOperationsService {
       if (userId && testResult.users && testResult.users.length > 0) {
         const selectedUser = testResult.users.find((u) => u.id === userId);
         if (!selectedUser) {
+          this.logger.warn('Selected Emby user is not an admin');
           return {
             status: 'NOK',
             code: 0,
@@ -947,7 +1017,7 @@ export class SettingsOperationsService {
   }
 
   public async addSonarrSetting(
-    settings: Omit<SonarrSettings, 'id' | 'collections'>,
+    settings: SonarrSetting,
   ): Promise<SonarrSettingResponseDto> {
     try {
       settings.url = settings.url.toLowerCase();
@@ -969,7 +1039,7 @@ export class SettingsOperationsService {
   }
 
   public async updateSonarrSetting(
-    settings: Omit<SonarrSettings, 'collections'>,
+    settings: SonarrSetting & { id: number },
   ): Promise<SonarrSettingResponseDto> {
     try {
       settings.url = settings.url.toLowerCase();
@@ -1321,6 +1391,7 @@ export class SettingsOperationsService {
       this.logger.log('Settings updated');
       await this.mediaServerFactory.initialize();
       this.seerr.init();
+      this.ombi.init();
       this.tautulli.init();
       this.downloadClient.init();
       this.internalApi.init();
@@ -1364,71 +1435,30 @@ export class SettingsOperationsService {
     );
   }
 
+  public async testOmbi(setting?: OmbiSetting): Promise<BasicResponseDto> {
+    return await this.ombi.testConnection(
+      setting ? { apiKey: setting.api_key, url: setting.url } : undefined,
+    );
+  }
+
   public async testTautulli(
     setting?: TautulliSetting,
   ): Promise<BasicResponseDto> {
-    if (setting) {
-      return await this.tautulli.testConnection({
-        apiKey: setting.api_key,
-        url: setting.url,
-      });
-    }
-
-    try {
-      const resp = await this.tautulli.info();
-      return resp?.response && resp?.response.result == 'success'
-        ? {
-            status: 'OK',
-            code: 1,
-            message: resp.response.data?.tautulli_version,
-          }
-        : { status: 'NOK', code: 0, message: 'Failure' };
-    } catch (error) {
-      logConnectionTestError(this.logger, 'Tautulli');
-      return {
-        status: 'NOK',
-        code: 0,
-        message: formatConnectionFailureMessage(
-          error,
-          'Failed to connect to Tautulli. Verify URL and API key.',
-        ),
-      };
-    }
+    return this.tautulli.testConnection({
+      apiKey: setting
+        ? setting.api_key
+        : this.settingsDataService.tautulli_api_key,
+      url: setting ? setting.url : this.settingsDataService.tautulli_url,
+    });
   }
 
   public async testStreamystats(
     setting?: StreamystatsSetting,
   ): Promise<BasicResponseDto> {
-    if (setting) {
-      // testConnection only hits Streamystats's unauthenticated /api/version
-      // endpoint, so we deliberately do not send the stored Jellyfin API key
-      // here. This avoids handing the stored credential to a URL the caller
-      // just supplied via the test endpoint.
-      return await this.streamystats.testConnection({
-        url: setting.url,
-      });
-    }
-
-    try {
-      const info = await this.streamystats.info();
-      return info?.currentVersion
-        ? {
-            status: 'OK',
-            code: 1,
-            message: info.currentVersion,
-          }
-        : { status: 'NOK', code: 0, message: 'Failure' };
-    } catch (error) {
-      logConnectionTestError(this.logger, 'Streamystats');
-      return {
-        status: 'NOK',
-        code: 0,
-        message: formatConnectionFailureMessage(
-          error,
-          'Failed to connect to Streamystats. Verify URL and that the service is running.',
-        ),
-      };
-    }
+    return this.streamystats.testConnection({
+      apiKey: this.settingsDataService.jellyfin_api_key,
+      url: setting ? setting.url : this.settingsDataService.streamystats_url,
+    });
   }
 
   public testDownloadClient(
@@ -1451,17 +1481,16 @@ export class SettingsOperationsService {
       const resp = await apiClient.info();
       //Make sure it's actually Radarr and not Sonarr
       if (resp?.appName && resp.appName.toLowerCase() !== 'radarr') {
-        return {
-          status: 'NOK',
-          code: 0,
-          message: `Unexpected application name returned: ${resp.appName}`,
-        };
+        throw new Error(
+          `Unexpected application name returned: ${resp.appName}`,
+        );
       }
-      return resp?.version != null
-        ? { status: 'OK', code: 1, message: resp.version }
-        : { status: 'NOK', code: 0, message: 'Failure' };
+      if (resp?.version == null) {
+        throw new Error('Failure');
+      }
+      return { status: 'OK', code: 1, message: resp.version };
     } catch (error) {
-      logConnectionTestError(this.logger, 'Radarr');
+      logConnectionTestError(this.logger, 'Radarr', error);
       return {
         status: 'NOK',
         code: 0,
@@ -1482,17 +1511,16 @@ export class SettingsOperationsService {
       const resp = await apiClient.info();
       //Make sure it's actually Sonarr and not Radarr
       if (resp?.appName && resp.appName.toLowerCase() !== 'sonarr') {
-        return {
-          status: 'NOK',
-          code: 0,
-          message: `Unexpected application name returned: ${resp.appName}`,
-        };
+        throw new Error(
+          `Unexpected application name returned: ${resp.appName}`,
+        );
       }
-      return resp?.version != null
-        ? { status: 'OK', code: 1, message: resp.version }
-        : { status: 'NOK', code: 0, message: 'Failure' };
+      if (resp?.version == null) {
+        throw new Error('Failure');
+      }
+      return { status: 'OK', code: 1, message: resp.version };
     } catch (error) {
-      logConnectionTestError(this.logger, 'Sonarr');
+      logConnectionTestError(this.logger, 'Sonarr', error);
       return {
         status: 'NOK',
         code: 0,
@@ -1513,27 +1541,24 @@ export class SettingsOperationsService {
       const resp = await apiClient.info();
       // Make sure it's actually Sportarr and not another *arr behind the URL
       if (resp?.appName && resp.appName.toLowerCase() !== 'sportarr') {
-        return {
-          status: 'NOK',
-          code: 0,
-          message: `Unexpected application name returned: ${resp.appName}`,
-        };
+        throw new Error(
+          `Unexpected application name returned: ${resp.appName}`,
+        );
       }
       if (
         resp?.version != null &&
         isBelowMinimumVersion(resp.version, MINIMUM_SPORTARR_VERSION)
       ) {
-        return {
-          status: 'NOK',
-          code: 0,
-          message: `Sportarr ${resp.version} is below the minimum supported version ${MINIMUM_SPORTARR_VERSION}. Please update Sportarr.`,
-        };
+        throw new Error(
+          `Sportarr ${resp.version} is below the minimum supported version ${MINIMUM_SPORTARR_VERSION}. Please update Sportarr.`,
+        );
       }
-      return resp?.version != null
-        ? { status: 'OK', code: 1, message: resp.version }
-        : { status: 'NOK', code: 0, message: 'Failure' };
+      if (resp?.version == null) {
+        throw new Error('Failure');
+      }
+      return { status: 'OK', code: 1, message: resp.version };
     } catch (error) {
-      logConnectionTestError(this.logger, 'Sportarr');
+      logConnectionTestError(this.logger, 'Sportarr', error);
       return {
         status: 'NOK',
         code: 0,
@@ -1545,7 +1570,7 @@ export class SettingsOperationsService {
     }
   }
 
-  public async testPlex(): Promise<BasicResponseDto> {
+  public async testPlex(timeoutMs?: number): Promise<BasicResponseDto> {
     if (!this.settingsDataService.plex_auth_token) {
       return {
         status: 'NOK',
@@ -1555,12 +1580,13 @@ export class SettingsOperationsService {
     }
 
     try {
-      const resp = await this.plexApi.getStatus();
-      return resp?.version != null
-        ? { status: 'OK', code: 1, message: resp.version }
-        : { status: 'NOK', code: 0, message: 'Failure' };
+      const resp = await this.plexApi.testConnection(timeoutMs);
+      if (resp?.version == null) {
+        throw new Error('Failure');
+      }
+      return { status: 'OK', code: 1, message: resp.version };
     } catch (error) {
-      logConnectionTestError(this.logger, 'Plex');
+      logConnectionTestError(this.logger, 'Plex', error);
       return {
         status: 'NOK',
         code: 0,
@@ -1606,7 +1632,7 @@ export class SettingsOperationsService {
           };
       }
     } catch (error) {
-      logConnectionTestError(this.logger, 'Plex auth');
+      logConnectionTestError(this.logger, 'Plex auth', error);
       return {
         status: 'NOK',
         code: 0,
@@ -1632,11 +1658,14 @@ export class SettingsOperationsService {
 
         return (
           (
-            await this.testJellyfin({
-              jellyfin_url: this.settingsDataService.jellyfin_url,
-              jellyfin_api_key: this.settingsDataService.jellyfin_api_key,
-              jellyfin_user_id: this.settingsDataService.jellyfin_user_id,
-            })
+            await this.testJellyfin(
+              {
+                jellyfin_url: this.settingsDataService.jellyfin_url,
+                jellyfin_api_key: this.settingsDataService.jellyfin_api_key,
+                jellyfin_user_id: this.settingsDataService.jellyfin_user_id,
+              },
+              BACKGROUND_CONNECTION_TEST_TIMEOUT_MS,
+            )
           ).status === 'OK'
         );
       }
@@ -1649,16 +1678,22 @@ export class SettingsOperationsService {
         }
         return (
           (
-            await this.testEmby({
-              emby_url: this.settingsDataService.emby_url,
-              emby_api_key: this.settingsDataService.emby_api_key,
-              emby_user_id: this.settingsDataService.emby_user_id,
-            })
+            await this.testEmby(
+              {
+                emby_url: this.settingsDataService.emby_url,
+                emby_api_key: this.settingsDataService.emby_api_key,
+                emby_user_id: this.settingsDataService.emby_user_id,
+              },
+              BACKGROUND_CONNECTION_TEST_TIMEOUT_MS,
+            )
           ).status === 'OK'
         );
       }
       case MediaServerType.PLEX:
-        return (await this.testPlex()).status === 'OK';
+        return (
+          (await this.testPlex(BACKGROUND_CONNECTION_TEST_TIMEOUT_MS))
+            .status === 'OK'
+        );
       default:
         return false;
     }
@@ -1682,6 +1717,7 @@ export class SettingsOperationsService {
         radarrResults,
         sonarrResults,
         seerrState,
+        ombiState,
         tautulliState,
       ] = await Promise.all([
         this.testMediaServerConnection(),
@@ -1698,6 +1734,9 @@ export class SettingsOperationsService {
         this.seerrConfigured()
           ? this.testSeerr().then((r) => r.status === 'OK')
           : true,
+        this.ombiConfigured()
+          ? this.testOmbi().then((r) => r.status === 'OK')
+          : true,
         this.tautulliConfigured()
           ? this.testTautulli().then((r) => r.status === 'OK')
           : true,
@@ -1708,6 +1747,7 @@ export class SettingsOperationsService {
         radarrResults.every(Boolean) &&
         sonarrResults.every(Boolean) &&
         seerrState &&
+        ombiState &&
         tautulliState
       );
     } catch (error) {

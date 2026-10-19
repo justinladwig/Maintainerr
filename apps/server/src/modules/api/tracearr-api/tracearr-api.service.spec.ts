@@ -1,5 +1,6 @@
 import { MediaServerType, TracearrHistoryItem } from '@maintainerr/contracts';
 import { Mocked, TestBed } from '@suites/unit';
+import { AxiosError, AxiosResponse } from 'axios';
 import { MediaServerFactory } from '../media-server/media-server.factory';
 import { SettingsDataService } from '../../settings/settings-data.service';
 import { TracearrApiService } from './tracearr-api.service';
@@ -15,6 +16,7 @@ const apiMock = {
 };
 
 jest.mock('./helpers/tracearr-api.helper', () => ({
+  ...jest.requireActual('./helpers/tracearr-api.helper'),
   TracearrApi: jest.fn().mockImplementation(() => apiMock),
 }));
 
@@ -45,6 +47,19 @@ const CONFIRMING_LIBRARY = {
     added_at: '2026-01-01T00:00:00.000Z',
   })),
 };
+
+const serversResponse = (
+  ...servers: { id: string; name: string; type: string }[]
+) => ({
+  data: {
+    data: servers.map(({ id, name, type }) => ({
+      server_id: id,
+      server_name: name,
+      server_type: type,
+    })),
+    tracearr_version: 'v2.8.3',
+  },
+});
 
 const usersPage = {
   data: [
@@ -279,27 +294,6 @@ describe('TracearrApiService', () => {
     ).toEqual(['Unknown']);
   });
 
-  it('invalidates a prefetched history snapshot', async () => {
-    apiMock.getWithoutCache.mockImplementation(async (endpoint: string) => {
-      if (endpoint === '/recently-added') {
-        return CONFIRMING_LIBRARY;
-      }
-      if (endpoint === '/history') {
-        return {
-          data: [historyRow('33333333-3333-4333-8333-333333333333', 'movie-1')],
-          meta: { nextCursor: null, pageSize: 100 },
-        };
-      }
-      return usersPage;
-    });
-
-    await service.prefetchHistory();
-    service.invalidateHistory();
-
-    expect(service.getHistoryIndex()).toBeUndefined();
-    expect(service.getUsernamesByTracearrUserId()).toBeUndefined();
-  });
-
   it('stops an incremental sweep after it reaches a previously indexed chain', async () => {
     const known = historyRow('33333333-3333-4333-8333-333333333333', 'movie-1');
     const newer = historyRow('44444444-4444-4444-8444-444444444444', 'movie-2');
@@ -418,25 +412,6 @@ describe('TracearrApiService', () => {
     expect(service.getHistoryIndex()?.rowsById.has(unfinished.id)).toBe(false);
   });
 
-  it('memoizes each show episode catalog for a run', async () => {
-    const mediaServer = {
-      getUsers: jest
-        .fn()
-        .mockResolvedValue([{ id: 'account-1', name: 'alice' }]),
-      getChildrenMetadata: jest
-        .fn()
-        .mockResolvedValueOnce([{ id: 'season-1', type: 'season' }])
-        .mockResolvedValueOnce([{ id: 'episode-1', type: 'episode' }]),
-    };
-    mediaServerFactory.getService.mockResolvedValue(mediaServer as never);
-    const show = { id: 'show-1', type: 'show' } as never;
-
-    await expect(service.getEpisodeIds(show)).resolves.toEqual(['episode-1']);
-    await expect(service.getEpisodeIds(show)).resolves.toEqual(['episode-1']);
-
-    expect(mediaServer.getChildrenMetadata).toHaveBeenCalledTimes(2);
-  });
-
   it('does not expose an index after a later cursor page fails', async () => {
     const first = historyRow('33333333-3333-4333-8333-333333333333', 'movie-1');
     apiMock.getWithoutCache.mockImplementation(async (endpoint: string) => {
@@ -491,79 +466,26 @@ describe('TracearrApiService', () => {
     expect(service.getHistoryIndex()).toBeUndefined();
   });
 
-  it('tests a Tracearr v2 OpenAPI document', async () => {
-    apiMock.getRawWithoutCache.mockResolvedValue({
-      data: {
-        openapi: '3.1.0',
-        info: { title: 'Tracearr Public API', version: '2.0.0-beta.1' },
-      },
-    });
+  it('tests the connection with the Tracearr version it reports', async () => {
+    apiMock.getRawWithoutCache.mockResolvedValue(serversResponse());
 
     await expect(
       service.testConnection({
         url: 'http://tracearr.local',
         apiKey: 'trr_pub_token',
       }),
-    ).resolves.toEqual({ status: 'OK', code: 1, message: '2.0.0-beta.1' });
-  });
-
-  it('reads Tracearr servers from the public API document', async () => {
-    apiMock.getRawWithoutCache.mockResolvedValue({
-      data: {
-        paths: {
-          '/api/v2/public/history': {
-            get: {
-              parameters: [
-                {
-                  name: 'server_id',
-                  in: 'query',
-                  schema: {
-                    enum: [SERVER_ID],
-                  },
-                  description: `Available servers: **Dev Plex**: \`${SERVER_ID}\``,
-                },
-              ],
-            },
-          },
-        },
-      },
-    });
-
-    await expect(
-      service.getServers({
-        url: 'http://tracearr.local',
-        apiKey: 'trr_pub_token',
-      }),
-    ).resolves.toEqual([{ id: SERVER_ID, name: 'Dev Plex' }]);
+    ).resolves.toEqual({ status: 'OK', code: 1, message: 'v2.8.3' });
   });
 
   it('offers only the Tracearr server matching the configured media server', async () => {
     const jellyfinServerId = '66666666-6666-4666-8666-666666666666';
     Object.assign(settings, { media_server_type: MediaServerType.PLEX });
-    apiMock.getRawWithoutCache.mockResolvedValue({
-      data: {
-        paths: {
-          '/api/v2/public/history': {
-            get: {
-              parameters: [
-                {
-                  name: 'server_id',
-                  in: 'query',
-                  schema: { enum: [SERVER_ID, jellyfinServerId] },
-                  description: `Available servers: **Dev Plex**: \`${SERVER_ID}\` **Dev Jellyfin**: \`${jellyfinServerId}\``,
-                },
-              ],
-            },
-          },
-        },
-      },
-    });
-    apiMock.getWithoutCache.mockResolvedValue({
-      data: [
-        { server_id: SERVER_ID, server_type: 'plex' },
-        { server_id: jellyfinServerId, server_type: 'jellyfin' },
-      ],
-    });
+    apiMock.getRawWithoutCache.mockResolvedValue(
+      serversResponse(
+        { id: SERVER_ID, name: 'Dev Plex', type: 'plex' },
+        { id: jellyfinServerId, name: 'Dev Jellyfin', type: 'jellyfin' },
+      ),
+    );
 
     await expect(
       service.getServers({
@@ -576,28 +498,10 @@ describe('TracearrApiService', () => {
   it('resolves the server itself when a media server switch cleared it', async () => {
     Object.assign(settings, { tracearr_server_id: undefined });
     service.init();
-    apiMock.getRawWithoutCache.mockResolvedValue({
-      data: {
-        paths: {
-          '/api/v2/public/history': {
-            get: {
-              parameters: [
-                {
-                  name: 'server_id',
-                  in: 'query',
-                  schema: { enum: [SERVER_ID] },
-                  description: `Available servers: **Dev Plex**: \`${SERVER_ID}\``,
-                },
-              ],
-            },
-          },
-        },
-      },
-    });
+    apiMock.getRawWithoutCache.mockResolvedValue(
+      serversResponse({ id: SERVER_ID, name: 'Dev Plex', type: 'plex' }),
+    );
     apiMock.getWithoutCache.mockImplementation(async (endpoint: string) => {
-      if (endpoint === '/libraries') {
-        return { data: [{ server_id: SERVER_ID, server_type: 'plex' }] };
-      }
       if (endpoint === '/recently-added') {
         return CONFIRMING_LIBRARY;
       }
@@ -643,34 +547,14 @@ describe('TracearrApiService', () => {
               },
       ),
     } as never);
-    apiMock.getRawWithoutCache.mockResolvedValue({
-      data: {
-        paths: {
-          '/api/v2/public/history': {
-            get: {
-              parameters: [
-                {
-                  name: 'server_id',
-                  in: 'query',
-                  schema: { enum: [SERVER_ID, otherPlexId] },
-                  description: `Available servers: **Ours**: \`${SERVER_ID}\` **Theirs**: \`${otherPlexId}\``,
-                },
-              ],
-            },
-          },
-        },
-      },
-    });
+    apiMock.getRawWithoutCache.mockResolvedValue(
+      serversResponse(
+        { id: SERVER_ID, name: 'Ours', type: 'plex' },
+        { id: otherPlexId, name: 'Theirs', type: 'plex' },
+      ),
+    );
     apiMock.getWithoutCache.mockImplementation(
       async (endpoint: string, config: { params: { server_id: string } }) => {
-        if (endpoint === '/libraries') {
-          return {
-            data: [
-              { server_id: SERVER_ID, server_type: 'plex' },
-              { server_id: otherPlexId, server_type: 'plex' },
-            ],
-          };
-        }
         return config.params.server_id === SERVER_ID
           ? {
               data: [
@@ -734,14 +618,6 @@ describe('TracearrApiService', () => {
     } as never);
     apiMock.getWithoutCache.mockImplementation(
       async (endpoint: string, config: { params: { server_id: string } }) => {
-        if (endpoint === '/libraries') {
-          return {
-            data: [
-              { server_id: SERVER_ID, server_type: 'jellyfin' },
-              { server_id: foreignId, server_type: 'jellyfin' },
-            ],
-          };
-        }
         const own = config.params.server_id === SERVER_ID;
         return {
           data: Array.from({ length: 6 }, (_unused, i) => ({
@@ -961,13 +837,12 @@ describe('TracearrApiService', () => {
     ).resolves.toBeUndefined();
   });
 
-  it('rejects Tracearr versions below 2.0.0-beta.1', async () => {
-    apiMock.getRawWithoutCache.mockResolvedValue({
-      data: {
-        openapi: '3.1.0',
-        info: { title: 'Tracearr Public API', version: '2.0.0-beta.0' },
-      },
-    });
+  it('asks for Tracearr 2.7.0 when /servers is missing', async () => {
+    apiMock.getRawWithoutCache.mockRejectedValue(
+      new AxiosError('Not Found', 'ERR_BAD_REQUEST', undefined, undefined, {
+        status: 404,
+      } as AxiosResponse),
+    );
 
     await expect(
       service.testConnection({
@@ -978,23 +853,145 @@ describe('TracearrApiService', () => {
       status: 'NOK',
       code: 0,
       message:
-        'Tracearr 2.0.0-beta.0 is below the minimum supported version 2.0.0-beta.1. Please update Tracearr.',
+        'Tracearr 2.7.0 or later is required. Update Tracearr, or verify the URL points to it.',
     });
   });
 
-  it('accepts the stable release after 2.0.0-beta.1', async () => {
-    apiMock.getRawWithoutCache.mockResolvedValue({
-      data: {
-        openapi: '3.1.0',
-        info: { title: 'Tracearr Public API', version: '2.0.0' },
-      },
+  describe('getItemStats', () => {
+    const MEDIA_ID = '55555555-5555-4555-8555-555555555555';
+    const SHOW_MEDIA_ID = '66666666-6666-4666-8666-666666666666';
+    const play = (overrides: Record<string, unknown> = {}) => ({
+      media_id: MEDIA_ID,
+      grandparent_rating_key: null,
+      season_number: null,
+      duration_ms: 600_000,
+      started_at: '2026-01-01T00:00:00.000Z',
+      stopped_at: '2026-01-01T00:10:00.000Z',
+      user: { id: USER_ID, username: 'alice' },
+      ...overrides,
+    });
+    const SEASON_MEDIA_ID = '77777777-7777-4777-8777-777777777777';
+    const confirmingItem = {
+      title: 'Confirming Title',
+      addedAt: new Date('2026-01-01T00:00:00.000Z'),
+    };
+    const useItem = (item: Record<string, unknown>) =>
+      mediaServerFactory.getService.mockResolvedValue({
+        getMetadata: jest.fn(async (id: string) =>
+          id.startsWith('confirm-') ? confirmingItem : item,
+        ),
+      } as never);
+    const answerHistory = (rows: unknown[]) =>
+      apiMock.getRawWithoutCache.mockImplementation(async (path: string) =>
+        path === '/history'
+          ? { data: { data: rows, meta: { nextCursor: null } } }
+          : path === `/media/${SHOW_MEDIA_ID}/children`
+            ? { data: { data: [{ id: SEASON_MEDIA_ID, season_number: 2 }] } }
+            : { data: { id: SHOW_MEDIA_ID } },
+      );
+    const recentlyAddedCalls = () =>
+      apiMock.getWithoutCache.mock.calls.filter(
+        ([endpoint]) => endpoint === '/recently-added',
+      ).length;
+
+    beforeEach(() => {
+      apiMock.getWithoutCache.mockImplementation(async (endpoint: string) =>
+        endpoint === '/recently-added' ? CONFIRMING_LIBRARY : undefined,
+      );
     });
 
-    await expect(
-      service.testConnection({
-        url: 'http://tracearr.local',
-        apiKey: 'trr_pub_token',
-      }),
-    ).resolves.toEqual({ status: 'OK', code: 1, message: '2.0.0' });
+    it('totals a movie from the plays carrying its rating key', async () => {
+      useItem({ id: 'movie-1', type: 'movie' });
+      answerHistory([
+        play(),
+        play({ stopped_at: null, started_at: '2026-02-01T00:00:00.000Z' }),
+      ]);
+
+      await expect(service.getItemStats('movie-1')).resolves.toEqual({
+        url: `http://tracearr.local/media/${MEDIA_ID}`,
+        plays: 2,
+        watchTime: 1200,
+        lastWatched: '2026-02-01T00:00:00.000Z',
+        users: [
+          {
+            name: 'alice',
+            plays: 2,
+            watchTime: 1200,
+            lastWatched: '2026-02-01T00:00:00.000Z',
+          },
+        ],
+      });
+      expect(apiMock.getRawWithoutCache).toHaveBeenCalledWith('/history', {
+        params: { rating_key: 'movie-1', server_id: SERVER_ID, pageSize: 100 },
+      });
+    });
+
+    // Tracearr can file two items of one server under one title, so a season
+    // only counts the plays that name its own show and number.
+    it('keeps a season to the plays of its own show and number', async () => {
+      useItem({
+        id: 'season-2',
+        type: 'season',
+        parentId: 'show-1',
+        index: 2,
+        providerIds: { tvdb: ['1234'] },
+      });
+      answerHistory([
+        play({ grandparent_rating_key: 'show-1', season_number: 2 }),
+        play({ grandparent_rating_key: 'show-1', season_number: 1 }),
+        play({ grandparent_rating_key: 'other-show', season_number: 2 }),
+      ]);
+
+      await expect(service.getItemStats('season-2')).resolves.toMatchObject({
+        url: `http://tracearr.local/media/${SHOW_MEDIA_ID}`,
+        plays: 1,
+      });
+      expect(apiMock.getRawWithoutCache).toHaveBeenCalledWith(
+        '/media/show:tvdb:1234',
+      );
+      expect(apiMock.getRawWithoutCache).toHaveBeenCalledWith('/history', {
+        params: {
+          media_id: SEASON_MEDIA_ID,
+          server_id: SERVER_ID,
+          pageSize: 100,
+        },
+      });
+    });
+
+    it('confirms the server once, and reads nothing from an unconfirmed one for a while', async () => {
+      useItem({ id: 'movie-1', type: 'movie' });
+      answerHistory([play()]);
+
+      await service.getItemStats('movie-1');
+      await service.getItemStats('movie-1');
+      expect(recentlyAddedCalls()).toBe(1);
+
+      service.invalidateHistory();
+      apiMock.getWithoutCache.mockClear();
+      apiMock.getWithoutCache.mockResolvedValue(undefined);
+      apiMock.getRawWithoutCache.mockClear();
+      const now = jest.spyOn(Date, 'now').mockReturnValue(1_000_000);
+      try {
+        await expect(service.getItemStats('movie-1')).resolves.toBeUndefined();
+        await expect(service.getItemStats('movie-1')).resolves.toBeUndefined();
+        expect(recentlyAddedCalls()).toBe(1);
+        expect(apiMock.getRawWithoutCache).not.toHaveBeenCalled();
+
+        now.mockReturnValue(1_000_000 + 60_000);
+        await service.getItemStats('movie-1');
+        expect(recentlyAddedCalls()).toBe(2);
+      } finally {
+        now.mockRestore();
+      }
+    });
+
+    it('answers null for an item nobody played and undefined when unreadable', async () => {
+      useItem({ id: 'movie-1', type: 'movie' });
+      answerHistory([]);
+      await expect(service.getItemStats('movie-1')).resolves.toBeNull();
+
+      apiMock.getRawWithoutCache.mockRejectedValue(new Error('timeout'));
+      await expect(service.getItemStats('movie-1')).resolves.toBeUndefined();
+    });
   });
 });

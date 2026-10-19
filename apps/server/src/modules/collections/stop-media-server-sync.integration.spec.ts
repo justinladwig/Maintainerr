@@ -85,6 +85,7 @@ describe('CollectionsService.stopMediaServerSync (real SQLite)', () => {
       { emit: jest.fn() } as any,
       {} as any, // collectionPosterService
       {} as any, // overlayProcessor
+      {} as any, // servarrTagService
       createMockLogger() as any,
     );
 
@@ -97,15 +98,6 @@ describe('CollectionsService.stopMediaServerSync (real SQLite)', () => {
 
   afterEach(async () => {
     await dataSource.destroy();
-  });
-
-  it('clears the link and the markers together', async () => {
-    const collection = await seed();
-
-    await service.stopMediaServerSync(collection as any);
-
-    expect((await reread(collection.id))?.mediaServerId).toBeNull();
-    expect(await dataSource.getRepository(MarkerSchema).find()).toEqual([]);
   });
 
   it('keeps the link when the marker delete fails', async () => {

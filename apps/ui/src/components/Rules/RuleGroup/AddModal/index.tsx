@@ -56,7 +56,7 @@ import { getCollectionMediaSortConfig } from '../../../Common/MediaLibrarySortCo
 import SaveButton from '../../../Common/SaveButton'
 import { Input } from '../../../Forms/Input'
 import { Select } from '../../../Forms/Select'
-import type { AgentConfiguration } from '../../../Settings/Notifications/CreateNotificationModal'
+import type { AgentConfiguration } from '../../../../api/notifications'
 import RuleCreator, { IRule } from '../../Rule/RuleCreator'
 import ArrAction from './ArrAction'
 import CollectionPosterPicker from './CollectionPosterPicker'
@@ -406,6 +406,7 @@ export const ruleGroupFormSchema = z
     listExclusions: z.boolean(),
     cleanupLeftoverFolders: z.boolean(),
     forceSeerr: z.boolean(),
+    forceOmbi: z.boolean(),
     manualCollection: z.boolean(),
     manualCollectionName: z.string().optional(),
     sortTitle: z.string().optional(),
@@ -510,6 +511,7 @@ const buildFormDefaults = (editData?: IRuleGroup): RuleGroupFormValues => ({
   listExclusions: editData?.collection?.listExclusions ?? true,
   cleanupLeftoverFolders: editData?.collection?.cleanupLeftoverFolders ?? false,
   forceSeerr: editData?.collection?.forceSeerr ?? false,
+  forceOmbi: editData?.collection?.forceOmbi ?? false,
   manualCollection: editData?.collection?.manualCollection ?? false,
   manualCollectionName: editData?.collection?.manualCollectionName ?? '',
   sortTitle: editData?.collection?.sortTitle ?? '',
@@ -808,6 +810,8 @@ const AddModal = (props: AddModal) => {
     constants?.applications?.some((x) => x.id == Application.TAUTULLI) ?? false
   const seerrEnabled =
     constants?.applications?.some((x) => x.id == Application.SEERR) ?? false
+  const ombiEnabled =
+    constants?.applications?.some((x) => x.id == Application.OMBI) ?? false
 
   // Only surface the Sportarr manager option once a Sportarr server exists, so
   // the existing Sonarr/Radarr collection flow is unchanged for everyone else.
@@ -1095,6 +1099,7 @@ const AddModal = (props: AddModal) => {
       listExclusions: data.listExclusions,
       cleanupLeftoverFolders: data.cleanupLeftoverFolders,
       forceSeerr: data.forceSeerr,
+      forceOmbi: data.forceOmbi,
       tautulliWatchedPercentOverride: data.tautulliWatchedPercentOverride,
       radarrSettingsId: data.radarrSettingsId ?? undefined,
       sonarrSettingsId: data.sonarrSettingsId ?? undefined,
@@ -1936,6 +1941,31 @@ const AddModal = (props: AddModal) => {
                               id="force_seerr"
                               className="checkbox"
                               {...register('forceSeerr')}
+                            />
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {ombiEnabled && selectedType !== 'episode' && (
+                      <div className="flex flex-row items-center justify-between py-4">
+                        <label htmlFor="force_ombi" className="text-label">
+                          <Trans>Force delete Ombi request</Trans>
+                          <p className="text-xs font-normal">
+                            <Trans>
+                              Removes the related Ombi request immediately.
+                              Otherwise, Ombi keeps listing the request as
+                              available.
+                            </Trans>
+                          </p>
+                        </label>
+                        <div className="form-input">
+                          <div className="form-input-field">
+                            <input
+                              type="checkbox"
+                              id="force_ombi"
+                              className="checkbox"
+                              {...register('forceOmbi')}
                             />
                           </div>
                         </div>
